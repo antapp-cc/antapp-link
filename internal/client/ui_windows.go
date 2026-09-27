@@ -250,8 +250,8 @@ func (u *UI) buildTray() error {
 	ni.ContextMenu().Actions().Add(mImport)
 
 	mOpenDir := walk.NewAction()
-	_ = mOpenDir.SetText("打开数据目录")
-	mOpenDir.Triggered().Attach(u.onOpenDataDir)
+	_ = mOpenDir.SetText("打开配置目录")
+	mOpenDir.Triggered().Attach(u.onOpenConfigDir)
 	ni.ContextMenu().Actions().Add(mOpenDir)
 
 	mUpdate := walk.NewAction()
@@ -652,10 +652,19 @@ func (u *UI) askImportSource() (fromFile bool, ok bool) {
 	return fromFile, ok
 }
 
-func (u *UI) onOpenDataDir() {
+// onOpenConfigDir 打开 config\ —— 用户从这里拿连接码、换连接码。
+//
+// 打开的是配置目录而不是程序目录：程序目录里就是一堆 exe/dll，没什么可看的；
+// 用户点这个菜单，想找的基本都是那个 node.antapp。
+func (u *UI) onOpenConfigDir() {
 	go func() {
-		if err := openInExplorer(u.app.RootDir()); err != nil {
-			u.alert("打开数据目录失败", err.Error())
+		dir := ConfigDir(u.app.RootDir())
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			u.alert("打开配置目录失败", err.Error())
+			return
+		}
+		if err := openInExplorer(dir); err != nil {
+			u.alert("打开配置目录失败", err.Error())
 		}
 	}()
 }
