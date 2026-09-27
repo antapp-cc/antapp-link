@@ -47,8 +47,12 @@ func runPowerShell(script string) (string, error) {
 //
 // 走 PowerShell 的 cmdlet 而不是解析 netsh 的文本输出：cmdlet 的属性名不随系统语言变化，
 // 而中文 Windows 上 netsh 的「静态配置的 DNS 服务器」这类关键字会让关键字匹配全部落空。
-func Capture() (Snapshot, error) {
+func Capture(serverIP string) (Snapshot, error) {
 	gateway, ifIndex, err := captureDefaultRoute()
+	if err != nil {
+		return Snapshot{}, err
+	}
+	nextHop, err := resolveServerNextHop(serverIP)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -56,7 +60,34 @@ func Capture() (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return newSnapshot(gateway, ifIndex, ifaces), nil
+	return newSnapshot(gateway, ifIndex, nextHop, ifaces), nil
+}
+
+// resolveServerNextHop 查到达云服所用的下一跳。
+//
+// 返回空表示云服就在直连网段内（本地拿 WSL 当服务端时就如此）：这时只靠现成的
+// 直连路由就能绕开隧道，不需要、也**不能**加 /32 —— 加了会用默认网关覆盖掉那条
+// 更具体的直连路由，把承载隧道的连接自己掐死。
+func resolveServerNextHop(serverIP string) (string, error) {
+	script := fmt.Sprintf(
+		`$r = Find-NetRoute -RemoteIPAddress '%s' -ErrorAction SilentlyContinue `+
+			`| Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } | Select-Object -First 1; `+
+			`if ($r) { $r | Select-Object NextHop | ConvertTo-Json -Compress }`, serverIP)
+	out, err := runPowerShell(script)
+	if err != nil {
+		return "", fmt.Errorf("查询到 %s 的路由: %w", serverIP, err)
+	}
+	text := strings.TrimSpace(out)
+	if text == "" {
+		return "", nil
+	}
+	var r struct {
+		NextHop string `json:"NextHop"`
+	}
+	if err := json.Unmarshal([]byte(text), &r); err != nil {
+		return "", fmt.Errorf("解析路由 %q: %w", text, err)
+	}
+	return r.NextHop, nil
 }
 
 type psRoute struct {

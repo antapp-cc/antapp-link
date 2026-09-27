@@ -45,38 +45,48 @@ type Snapshot struct {
 	DefaultIfIndex int        `json:"default_if_index"`
 	Interfaces     []IfaceDNS `json:"interfaces"`
 	CapturedAt     string     `json:"captured_at"`
+
+	// ServerNextHop 是到达云服所用的下一跳。
+	//
+	// 空字符串表示云服就在直连网段里（本地拿 WSL 当服务端验证时就是这种情况）。
+	// 这时**不加**绕行路由：现成的直连路由已经比默认路由更具体，抢不走；
+	// 硬加一条指向默认网关的 /32 反而会覆盖它，把承载隧道的连接自己掐死。
+	ServerNextHop string `json:"server_next_hop,omitempty"`
 }
 
 // NetConfig 是接管网络需要的参数。
 type NetConfig struct {
-	AdapterName     string
-	ServerIP        string
-	TunnelIP        string
-	Gateway         string
-	Prefix          int
-	MTU             int
-	DNS             []string
-	OriginalGateway string
+	AdapterName string
+	ServerIP    string
+	TunnelIP    string
+	Gateway     string
+	Prefix      int
+	MTU         int
+	DNS         []string
+}
+
+// ServerIPOf 从连接码里的 host:port 取出主机部分。
+func ServerIPOf(inv pki.Invite) string {
+	host, _, err := net.SplitHostPort(inv.Server)
+	if err != nil {
+		return inv.Server
+	}
+	return host
 }
 
 // BuildNetConfig 从连接码拼出网络配置。
 //
 // 参数直接取自连接码而不等服务端 HELLO_ACK：连接码里已经有同样的值，
 // 这样「抓快照 → 落盘 → 改网络」可以一气呵成，不必先把隧道拉起来再改网络。
-func BuildNetConfig(inv pki.Invite, originalGateway string) NetConfig {
-	serverIP, _, err := net.SplitHostPort(inv.Server)
-	if err != nil {
-		serverIP = inv.Server
-	}
+func BuildNetConfig(inv pki.Invite) NetConfig {
 	return NetConfig{
-		AdapterName:     AdapterName,
-		ServerIP:        serverIP,
-		TunnelIP:        inv.TunnelIP,
-		Gateway:         inv.Gateway,
-		Prefix:          inv.Prefix,
-		MTU:             inv.MTU,
-		DNS:             inv.DNS,
-		OriginalGateway: originalGateway,
+		AdapterName: AdapterName,
+		ServerIP:    ServerIPOf(inv),
+		TunnelIP:    inv.TunnelIP,
+		Gateway:     inv.Gateway,
+		Prefix:      inv.Prefix,
+		MTU:         inv.MTU,
+		DNS:         inv.DNS,
 	}
 }
 
@@ -109,9 +119,9 @@ func ApplyCommands(snap Snapshot, cfg NetConfig) []Command {
 			fmt.Sprintf("name=%s", cfg.AdapterName), "metric=1"}},
 	}
 
-	if cfg.OriginalGateway != "" && cfg.ServerIP != "" {
+	if snap.ServerNextHop != "" && cfg.ServerIP != "" {
 		cmds = append(cmds, Command{"route", []string{
-			"add", cfg.ServerIP, "mask", "255.255.255.255", cfg.OriginalGateway, "metric", "1"}})
+			"add", cfg.ServerIP, "mask", "255.255.255.255", snap.ServerNextHop, "metric", "1"}})
 	}
 	cmds = append(cmds, Command{"route", []string{
 		"add", "0.0.0.0", "mask", "0.0.0.0", cfg.Gateway, "metric", "1"}})
@@ -133,7 +143,8 @@ func RestoreCommands(snap Snapshot, cfg NetConfig) []Command {
 
 	cmds = append(cmds,
 		Command{"route", []string{"delete", "0.0.0.0", "mask", "0.0.0.0", cfg.Gateway}})
-	if cfg.OriginalGateway != "" && cfg.ServerIP != "" {
+	if cfg.ServerIP != "" {
+		// 删除不需要知道下一跳，所以快照损坏时也能把这条撤掉
 		cmds = append(cmds, Command{"route", []string{
 			"delete", cfg.ServerIP, "mask", "255.255.255.255"}})
 	}
@@ -215,10 +226,11 @@ func RemoveSnapshot(path string) error {
 	return nil
 }
 
-func newSnapshot(gateway string, ifIndex int, ifaces []IfaceDNS) Snapshot {
+func newSnapshot(gateway string, ifIndex int, serverNextHop string, ifaces []IfaceDNS) Snapshot {
 	return Snapshot{
 		DefaultGateway: gateway,
 		DefaultIfIndex: ifIndex,
+		ServerNextHop:  serverNextHop,
 		Interfaces:     ifaces,
 		CapturedAt:     time.Now().Format(time.RFC3339),
 	}

@@ -1,0 +1,7 @@
+# 构建产物
+dist/
+
+# 第三方原始发布包：内容已提取进 internal/client/assets/wintun/，
+# 这里只保留哈希与说明用于溯源，避免仓库里塞两份几 MB 的二进制。
+third_party/wintun-0.14.1/
+third_party/wintun-0.14.1.zip

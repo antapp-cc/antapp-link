@@ -35,6 +35,11 @@ type WintunDevice struct {
 // 先 OpenAdapter 再 CreateAdapter：程序被强杀、或者上次没清理干净时，
 // 适配器还在系统里 —— 直接 CreateAdapter 会失败，而复用它才是用户期望的行为。
 func OpenDevice() (*WintunDevice, error) {
+	// wintun.dll 只从 exe 同目录加载，先把内嵌的那份释放出去
+	if _, err := EnsureWintunDLL(); err != nil {
+		return nil, err
+	}
+
 	adapter, err := wintun.OpenAdapter(AdapterName)
 	if err != nil {
 		adapter, err = wintun.CreateAdapter(AdapterName, tunnelType, nil)

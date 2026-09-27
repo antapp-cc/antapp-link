@@ -56,13 +56,13 @@ func (a *App) HealIfNeeded() error {
 		// 快照本身坏了，DNS 原值已无从得知。至少把默认路由和隧道地址撤掉，
 		// 否则用户会一直卡在「所有流量都进了一条没人读的网卡」。
 		a.log.Warn("状态文件损坏，做一次保守还原（DNS 可能需要手动确认）", "err", err)
-		_ = Snapshot{}.Restore(BuildNetConfig(a.inv, ""))
+		_ = Snapshot{}.Restore(BuildNetConfig(a.inv))
 		_ = RemoveSnapshot(a.statePath)
 		return err
 	}
 
 	a.log.Info("发现上次残留的网络配置，先还原", "captured_at", snap.CapturedAt)
-	if err := snap.Restore(BuildNetConfig(a.inv, snap.DefaultGateway)); err != nil {
+	if err := snap.Restore(BuildNetConfig(a.inv)); err != nil {
 		return fmt.Errorf("还原上次的网络配置失败: %w", err)
 	}
 	if err := RemoveSnapshot(a.statePath); err != nil {
@@ -79,7 +79,7 @@ func (a *App) Connect() error {
 		return nil
 	}
 
-	snap, err := Capture()
+	snap, err := Capture(ServerIPOf(a.inv))
 	if err != nil {
 		return fmt.Errorf("抓取网络现场失败: %w", err)
 	}
@@ -87,7 +87,7 @@ func (a *App) Connect() error {
 	if err := SaveSnapshot(a.statePath, snap); err != nil {
 		return fmt.Errorf("写状态文件失败: %w", err)
 	}
-	cfg := BuildNetConfig(a.inv, snap.DefaultGateway)
+	cfg := BuildNetConfig(a.inv)
 
 	dev, err := OpenDevice()
 	if err != nil {
