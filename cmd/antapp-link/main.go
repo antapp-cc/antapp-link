@@ -36,21 +36,34 @@ func run() int {
 		return 0
 	}
 
+	// 双击 .antapp 连接码文件时，Windows 把文件路径作为位置参数传进来。
+	// 它和 -c 是同一件事，只是入口不同。
+	inviteArg := *codeArg
+	if inviteArg == "" && flag.NArg() > 0 {
+		inviteArg = flag.Arg(0)
+	}
+
+	rootDir := *dataArg
+
 	// 单实例闸门。桌面快捷方式点几次就起几个进程的话，托盘上会堆一排图标；
 	// 更要紧的是几个实例会同时去抢同一块虚拟网卡和同一批路由，把网络搅乱。
-	// 已经有实例在跑就把它叫到前台，本进程安静退出。
 	release, first, err := client.SingleInstance()
 	if err != nil {
 		client.ShowMessage("AntApp Link", "单实例检查失败："+err.Error())
 		return 1
 	}
 	if !first {
+		// 已经有实例在跑。如果这次是双击连接码文件进来的，先把码写进 config\，
+		// 那个实例会发现文件变了并自动重载 —— 否则用户双击了却什么都没发生。
+		if inviteArg != "" {
+			importInviteQuietly(rootDir, inviteArg)
+		}
 		client.ActivateExisting()
 		return 0
 	}
 	defer release()
 
-	dataDir := *dataArg
+	dataDir := rootDir
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		client.ShowMessage("AntApp Link", "创建工作目录失败："+err.Error())
 		return 1
@@ -63,8 +76,8 @@ func run() int {
 	}
 	defer closeLog()
 
-	if *codeArg != "" {
-		inv, err := client.LoadInvite(*codeArg)
+	if inviteArg != "" {
+		inv, err := client.LoadInvite(inviteArg)
 		if err != nil {
 			logger.Error("连接码无法解析", "err", err)
 			client.ShowMessage("AntApp Link", "连接码无法解析：\n"+err.Error())
@@ -124,6 +137,21 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+// importInviteQuietly 把连接码写进 config\，不做界面反馈。
+//
+// 用在「客户端已经在跑，用户又双击了一个 .antapp 文件」这条路径上：
+// 本进程只负责把文件落到正确位置，正在跑的那个实例会自己发现并重载。
+func importInviteQuietly(rootDir, arg string) {
+	inv, err := client.LoadInvite(arg)
+	if err != nil {
+		client.ShowMessage("AntApp Link", "连接码无法解析：\n"+err.Error())
+		return
+	}
+	if err := client.SaveInvite(rootDir, inv); err != nil {
+		client.ShowMessage("AntApp Link", "保存连接码失败："+err.Error())
+	}
 }
 
 // defaultRootDir 是客户端的工作根目录：程序自己所在的目录（安装后就是

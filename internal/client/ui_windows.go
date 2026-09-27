@@ -171,8 +171,56 @@ func (u *UI) build() error {
 
 	go u.refreshLoop()
 	go u.autoCheckUpdate()
+	go u.watchInvite()
 	u.refresh()
 	return nil
+}
+
+// watchInvite 盯着 config\node.conf，发现被外部改过就重载并重连。
+//
+// 用户在客户端已经运行时双击一个 .antapp 文件，那个新进程只会把连接码写进文件
+// 然后退出（单实例闸门挡着）。真正的切换得由这里完成 —— 否则双击看起来毫无反应。
+func (u *UI) watchInvite() {
+	path := InviteFilePath(u.app.RootDir())
+	last := inviteModTime(path)
+
+	for {
+		select {
+		case <-u.done:
+			return
+		case <-time.After(2 * time.Second):
+		}
+
+		now := inviteModTime(path)
+		if now.IsZero() || now.Equal(last) {
+			continue
+		}
+		last = now
+
+		inv, err := LoadSavedInvite(u.app.RootDir())
+		if err != nil {
+			u.app.Log().Warn("连接码变了但读不出来", "err", err)
+			continue
+		}
+		if err := u.app.UpdateInvite(inv); err != nil {
+			u.app.Log().Warn("换用新连接码失败", "err", err)
+			continue
+		}
+		u.app.Log().Info("检测到新的连接码，重新连接", "server", inv.Server, "name", inv.Name)
+
+		go func() {
+			_ = u.app.Connect()
+			u.mw.Synchronize(u.refresh)
+		}()
+	}
+}
+
+func inviteModTime(path string) time.Time {
+	st, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}
+	}
+	return st.ModTime()
 }
 
 func (u *UI) buildTray() error {

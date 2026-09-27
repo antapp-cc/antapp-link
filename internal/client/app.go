@@ -68,6 +68,9 @@ func NewApp(inv pki.Invite, rootDir string, logger *slog.Logger, opts ...Option)
 // config/、logs/、data/ 三个子目录都挂在它下面，见 paths.go。
 func (a *App) RootDir() string { return a.rootDir }
 
+// Log 给界面层用：界面需要记一些只有它才知道的事（比如检测到连接码被外部改了）。
+func (a *App) Log() *slog.Logger { return a.log }
+
 // Configured 表示是否已经导入过连接码。
 //
 // 没导入时界面照样要起来并引导用户去导入 —— 而不是程序一启动就弹个「没有连接码」

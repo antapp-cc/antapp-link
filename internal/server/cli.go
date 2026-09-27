@@ -204,7 +204,9 @@ func cmdInvite(stdout, stderr io.Writer, args []string) int {
 		fmt.Fprintf(stderr, "创建输出目录失败: %v\n", err)
 		return 1
 	}
-	path := filepath.Join(*outDir, fmt.Sprintf("antapp-node-%s.json", name))
+	// 用 .antapp 后缀：客户端安装时注册了这个关联，用户把它拷到节点机上
+	// 双击就能导入，不用再打开客户端找导入按钮。
+	path := filepath.Join(*outDir, fmt.Sprintf("antapp-node-%s.antapp", name))
 	// 私钥含在里面，权限必须收紧
 	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
 		fmt.Fprintf(stderr, "写连接码文件失败: %v\n", err)

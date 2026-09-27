@@ -32,6 +32,13 @@ const (
 	// 右键菜单里 —— 那里紧挨着「退出」，而卸载是不可逆的，太容易点错。
 	UninstallLinkName = "卸载 AntApp Link.lnk"
 
+	// InviteExt 是连接码文件的专属后缀，双击就能导进客户端。
+	// 刻意不用 .conf —— 那个后缀系统里一堆程序都在用，关联过去会打架。
+	InviteExt = ".antapp"
+
+	// inviteProgID 是关联用的 ProgID，注册表里靠它把后缀和打开命令连起来。
+	inviteProgID = "AntAppLink.Invite"
+
 	uninstallKey = `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AntApp Link`
 )
 
@@ -191,6 +198,13 @@ func Install(opts Options, log func(string)) error {
 	}
 	log("已登记到「应用和功能」，可从那里卸载")
 
+	if err := registerFileAssoc(dst); err != nil {
+		// 关联不上不影响使用，用户仍能在客户端里手动导入
+		log("注册 " + InviteExt + " 文件关联失败（不影响使用）：" + err.Error())
+	} else {
+		log("已关联 " + InviteExt + " 文件，双击连接码就能导入")
+	}
+
 	if opts.Launch {
 		log("启动客户端")
 		if err := exec.Command(dst).Start(); err != nil {
@@ -237,6 +251,9 @@ func Uninstall(opts Options, log func(string)) error {
 	if err := registry.DeleteKey(registry.LOCAL_MACHINE, uninstallKey); err != nil {
 		log("  删除失败（可能本来就没有）：" + err.Error())
 	}
+
+	log("撤销 " + InviteExt + " 文件关联")
+	unregisterFileAssoc()
 
 	// 客户端在安装目录写不进去时会把数据退回到这里，顺手一起清掉
 	if fb := fallbackDataDir(); fb != "" {
@@ -360,6 +377,72 @@ func createShortcut(lnkPath, target, workDir string, args ...string) error {
 	_, err := runHiddenOutput("powershell", "-NoProfile", "-NonInteractive",
 		"-ExecutionPolicy", "Bypass", "-Command", script)
 	return err
+}
+
+// registerFileAssoc 把 .antapp 关联到客户端，双击连接码文件就能导入。
+//
+// 写 HKCR（也就是 HKLM\Software\Classes），因为装到 Program Files 本来就是
+// 全机安装；用 HKCU 的话换个人登录就没了。
+func registerFileAssoc(exePath string) error {
+	// 后缀 -> ProgID
+	extKey, _, err := registry.CreateKey(registry.CLASSES_ROOT, InviteExt, registry.WRITE)
+	if err != nil {
+		return err
+	}
+	if err := extKey.SetStringValue("", inviteProgID); err != nil {
+		extKey.Close()
+		return err
+	}
+	extKey.Close()
+
+	// ProgID -> 说明、图标、打开命令
+	progKey, _, err := registry.CreateKey(registry.CLASSES_ROOT, inviteProgID, registry.WRITE)
+	if err != nil {
+		return err
+	}
+	defer progKey.Close()
+	if err := progKey.SetStringValue("", "AntApp Link 连接码"); err != nil {
+		return err
+	}
+
+	iconKey, _, err := registry.CreateKey(registry.CLASSES_ROOT, inviteProgID+`\DefaultIcon`, registry.WRITE)
+	if err != nil {
+		return err
+	}
+	// 用 "%s" 而不是 %q：%q 会把 Windows 路径里的反斜杠转义成 \\，
+	// 写进注册表就成了无效路径，双击文件根本找不到程序。
+	if err := iconKey.SetStringValue("", fmt.Sprintf(`"%s",0`, exePath)); err != nil {
+		iconKey.Close()
+		return err
+	}
+	iconKey.Close()
+
+	cmdKey, _, err := registry.CreateKey(registry.CLASSES_ROOT, inviteProgID+`\shell\open\command`, registry.WRITE)
+	if err != nil {
+		return err
+	}
+	defer cmdKey.Close()
+	// 只传文件路径这一个位置参数，客户端会认出来并导入
+	return cmdKey.SetStringValue("", fmt.Sprintf(`"%s" %%1`, exePath))
+}
+
+// unregisterFileAssoc 撤销 .antapp 关联。只删自己写的那几个键，
+// 后缀键若被别的程序占用就不动它。
+func unregisterFileAssoc() {
+	_ = registry.DeleteKey(registry.CLASSES_ROOT, inviteProgID+`\shell\open\command`)
+	_ = registry.DeleteKey(registry.CLASSES_ROOT, inviteProgID+`\shell\open`)
+	_ = registry.DeleteKey(registry.CLASSES_ROOT, inviteProgID+`\shell`)
+	_ = registry.DeleteKey(registry.CLASSES_ROOT, inviteProgID+`\DefaultIcon`)
+	_ = registry.DeleteKey(registry.CLASSES_ROOT, inviteProgID)
+
+	// 后缀还指向我们才删，免得把别人的关联一起端了
+	if k, err := registry.OpenKey(registry.CLASSES_ROOT, InviteExt, registry.QUERY_VALUE); err == nil {
+		cur, _, _ := k.GetStringValue("")
+		k.Close()
+		if strings.EqualFold(cur, inviteProgID) {
+			_ = registry.DeleteKey(registry.CLASSES_ROOT, InviteExt)
+		}
+	}
 }
 
 func writeUninstallEntry(opts Options, exePath string) error {
