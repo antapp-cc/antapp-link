@@ -21,7 +21,7 @@ func main() {
 func run() int {
 	var (
 		codeArg  = flag.String("c", "", "连接码：单行 antapp:// 或 json/txt 文件路径")
-		dataArg  = flag.String("data", defaultDataDir(), "数据目录")
+		dataArg  = flag.String("data", defaultRootDir(), "工作根目录（config/、logs/、data/ 都建在它下面）")
 		once     = flag.Bool("once", false, "前台连接，不显示界面（Ctrl+C 退出）")
 		noNetCfg = flag.Bool("no-netcfg", false, "只建隧道、只配虚拟网卡，不改路由与 DNS（联调端口转发用）")
 		showVer  = flag.Bool("version", false, "显示版本")
@@ -52,7 +52,7 @@ func run() int {
 
 	dataDir := *dataArg
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
-		client.ShowMessage("AntApp Link", "创建数据目录失败："+err.Error())
+		client.ShowMessage("AntApp Link", "创建工作目录失败："+err.Error())
 		return 1
 	}
 
@@ -126,13 +126,13 @@ func run() int {
 	return 0
 }
 
-// dataDir 默认放在程序自己旁边（安装后就是 C:\Program Files\AntApp Link\data），
-// 这样翻一下安装目录就能看到连接码、日志和状态文件，不用去 ProgramData 里找。
+// defaultRootDir 是客户端的工作根目录：程序自己所在的目录（安装后就是
+// C:\Program Files\AntApp Link）。config\、logs\、data\ 三个子目录都挂在它下面。
 //
-// 目录建不出来时（程序被放在只读位置之类的）退回 %ProgramData%\AntAppLink。
-func defaultDataDir() string {
+// 目录不可写时（程序被放在只读位置之类的）退回 %ProgramData%\AntAppLink。
+func defaultRootDir() string {
 	if exe, err := os.Executable(); err == nil {
-		dir := filepath.Join(filepath.Dir(exe), "data")
+		dir := filepath.Dir(exe)
 		if err := os.MkdirAll(dir, 0o700); err == nil {
 			return dir
 		}

@@ -40,7 +40,7 @@ bash install.sh
 - 登记到「应用和功能」；**安装时会把卸载程序自己也复制进安装目录**（`uninstall.exe`），所以用户删掉当初那个安装包之后，仍然能从「应用和功能」或客户端托盘菜单卸载
 - 装完自动启动；**首次使用会引导导入连接码**
 
-**连接码、日志、状态文件都在 `C:\Program Files\AntApp Link\data\`** —— 跟程序放在一起，翻安装目录就能看到，不用去 `ProgramData` 里找。该目录写不进去时（比如程序被放在只读位置）才退回到 `%ProgramData%\AntAppLink\`。
+**连接码、日志、运行状态分别在 `config\`、`logs\`、`data\` 三个子目录里** —— 都跟程序放在一起，翻安装目录就能看到，不用去 `ProgramData` 里找。写不进去时（程序被放在只读位置）才退回 `%ProgramData%\AntAppLink\`。
 
 安装目录长这样：
 
@@ -49,16 +49,21 @@ C:\Program Files\AntApp Link\
   antapp-link.exe
   wintun.dll            首次运行时释放
   卸载 AntApp Link.lnk   卸载入口
+  config\
+    node.conf           连接码（内含私钥）
+  logs\
+    client.log          运行日志，按大小轮转
   data\
-    node.conf          连接码（内含私钥）
-    antapp.ico
-    state.json         网络现场快照，崩溃自愈用
-    logs\client.log
+    state.json          网络现场快照，崩溃自愈用
+    antapp.ico          从 exe 提取的界面图标
+    update\             在线更新的下载暂存
 ```
+
+三个目录按用途分开，而不是全塞进一个 `data\`：想找连接码就直接进 `config\`，不用先猜文件名。
 
 ### 卸载
 
-三个入口，走的是同一个程序：**安装目录里的「卸载 AntApp Link」快捷方式**、「应用和功能」里的卸载按钮、直接跑卸载器。走界面会弹出卸载向导，问要不要连 `data` 一起删；静默模式（`--quiet`）默认全清。
+三个入口，走的是同一个程序：**安装目录里的「卸载 AntApp Link」快捷方式**、「应用和功能」里的卸载按钮、直接跑卸载器。走界面会弹出卸载向导，问要不要连 `config` / `logs` / `data` 一起删（静默模式 `--quiet` 默认全清）。
 
 卸载入口刻意**不放客户端托盘的右键菜单** —— 那里紧挨着「退出」，而卸载不可逆，误点代价太大。想卸载就翻一下安装目录。
 

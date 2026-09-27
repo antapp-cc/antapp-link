@@ -40,21 +40,21 @@ func LoadInvite(pathOrCode string) (pki.Invite, error) {
 }
 
 // InviteFilePath 是客户端保存连接码的位置。
-func InviteFilePath(dataDir string) string { return filepath.Join(dataDir, "node.conf") }
+func InviteFilePath(root string) string { return filepath.Join(ConfigDir(root), "node.conf") }
 
 // SaveInvite 把连接码存下来，这样下次启动不用再导入一次。
-func SaveInvite(dataDir string, inv pki.Invite) error {
+func SaveInvite(root string, inv pki.Invite) error {
 	code, err := inv.Encode()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+	if err := os.MkdirAll(ConfigDir(root), 0o700); err != nil {
 		return err
 	}
 	// 内含私钥，权限收紧
-	return os.WriteFile(InviteFilePath(dataDir), []byte(code+"\n"), 0o600)
+	return os.WriteFile(InviteFilePath(root), []byte(code+"\n"), 0o600)
 }
 
-func LoadSavedInvite(dataDir string) (pki.Invite, error) {
-	return LoadInvite(InviteFilePath(dataDir))
+func LoadSavedInvite(root string) (pki.Invite, error) {
+	return LoadInvite(InviteFilePath(root))
 }

@@ -229,7 +229,7 @@ func TestBuildNetConfigSplitsServerAddress(t *testing.T) {
 func TestSnapshotPersistence(t *testing.T) {
 	dir := t.TempDir()
 	path := StatePath(dir)
-	if want := filepath.Join(dir, "state.json"); path != want {
+	if want := filepath.Join(dir, "data", "state.json"); path != want {
 		t.Errorf("StatePath = %q, want %q", path, want)
 	}
 
@@ -270,6 +270,10 @@ func TestSnapshotPersistence(t *testing.T) {
 // 留着坏路由和坏 DNS 让用户断网，而且重启程序也救不回来。
 func TestLoadSnapshotTreatsCorruptFileAsExisting(t *testing.T) {
 	path := StatePath(t.TempDir())
+	// 走 SaveSnapshot 建目录是不行的（它会把快照覆盖掉），手动补 data\
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, []byte("{ broken"), 0o600); err != nil {
 		t.Fatal(err)
 	}

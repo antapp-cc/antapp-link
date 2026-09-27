@@ -19,7 +19,7 @@ import (
 // 所以这里不含任何界面代码，逻辑可以单独测。
 type App struct {
 	inv       pki.Invite
-	dataDir   string
+	rootDir   string
 	statePath string
 	log       *slog.Logger
 	noNetCfg  bool
@@ -47,14 +47,14 @@ func WithNoNetCfg() Option {
 	return func(a *App) { a.noNetCfg = true }
 }
 
-func NewApp(inv pki.Invite, dataDir string, logger *slog.Logger, opts ...Option) *App {
+func NewApp(inv pki.Invite, rootDir string, logger *slog.Logger, opts ...Option) *App {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	app := &App{
 		inv:       inv,
-		dataDir:   dataDir,
-		statePath: StatePath(dataDir),
+		rootDir:   rootDir,
+		statePath: StatePath(rootDir),
 		log:       logger,
 		checker:   update.NewChecker(Version),
 	}
@@ -64,7 +64,9 @@ func NewApp(inv pki.Invite, dataDir string, logger *slog.Logger, opts ...Option)
 	return app
 }
 
-func (a *App) DataDir() string { return a.dataDir }
+// RootDir 是客户端的工作根目录（安装后就是安装目录本身）。
+// config/、logs/、data/ 三个子目录都挂在它下面，见 paths.go。
+func (a *App) RootDir() string { return a.rootDir }
 
 // Configured 表示是否已经导入过连接码。
 //
@@ -427,7 +429,7 @@ func (a *App) PendingUpdate() *update.Manifest {
 
 // DownloadUpdate 下载并校验更新包，返回落地路径。
 func (a *App) DownloadUpdate(ctx context.Context, m *update.Manifest) (string, error) {
-	dir := filepath.Join(a.dataDir, "update")
+	dir := filepath.Join(RuntimeDir(a.rootDir), "update")
 	var lastLog time.Time
 
 	path, err := a.checker.Download(ctx, m, dir, func(done, total int64) {

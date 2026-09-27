@@ -185,8 +185,8 @@ func levelTag(l slog.Level) string {
 }
 
 // NewFileLogger 建一个同时写文件与界面缓冲的 logger。
-func NewFileLogger(dataDir string) (*slog.Logger, *LogBuffer, func(), error) {
-	rot, err := OpenLog(filepath.Join(dataDir, "logs", "client.log"), 2<<20)
+func NewFileLogger(root string) (*slog.Logger, *LogBuffer, func(), error) {
+	rot, err := OpenLog(filepath.Join(LogsDir(root), "client.log"), 2<<20)
 	if err != nil {
 		return nil, nil, nil, err
 	}

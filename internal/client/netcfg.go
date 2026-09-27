@@ -213,7 +213,7 @@ func restoreDNSCommands(iface IfaceDNS) []Command {
 
 const StateFileName = "state.json"
 
-func StatePath(dataDir string) string { return filepath.Join(dataDir, StateFileName) }
+func StatePath(root string) string { return filepath.Join(RuntimeDir(root), StateFileName) }
 
 // SaveSnapshot 落盘。文件存在本身就代表「上次接管过网络且没干净退出」，
 // 所以它必须在改写网络之前写入、在还原成功之后才删除。

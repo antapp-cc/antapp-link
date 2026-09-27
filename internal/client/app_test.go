@@ -2,6 +2,7 @@ package client
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -33,14 +34,31 @@ func TestDisconnectWithoutConnectIsNoop(t *testing.T) {
 	}
 }
 
-func TestStatePathUnderDataDir(t *testing.T) {
+func TestStatePathUnderRuntimeDir(t *testing.T) {
 	dir := t.TempDir()
 	app := NewApp(testInvite(t), dir, nil)
-	if got, want := app.DataDir(), dir; got != want {
-		t.Errorf("DataDir = %q, want %q", got, want)
+	if got, want := app.RootDir(), dir; got != want {
+		t.Errorf("RootDir = %q, want %q", got, want)
 	}
-	if got := StatePath(app.DataDir()); got == "" {
-		t.Error("状态文件路径不该为空")
+	if got, want := StatePath(app.RootDir()), filepath.Join(dir, "data", "state.json"); got != want {
+		t.Errorf("StatePath = %q, want %q", got, want)
+	}
+}
+
+// 三个子目录各司其职，别再把配置和日志混进 data。
+func TestDirLayout(t *testing.T) {
+	root := `C:\Program Files\AntApp Link`
+	cases := []struct{ got, want, what string }{
+		{ConfigDir(root), filepath.Join(root, "config"), "ConfigDir"},
+		{LogsDir(root), filepath.Join(root, "logs"), "LogsDir"},
+		{RuntimeDir(root), filepath.Join(root, "data"), "RuntimeDir"},
+		{InviteFilePath(root), filepath.Join(root, "config", "node.conf"), "InviteFilePath"},
+		{StatePath(root), filepath.Join(root, "data", "state.json"), "StatePath"},
+	}
+	for _, c := range cases {
+		if c.got != c.want {
+			t.Errorf("%s = %q, want %q", c.what, c.got, c.want)
+		}
 	}
 }
 

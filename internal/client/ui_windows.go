@@ -54,8 +54,8 @@ type UI struct {
 }
 
 // RunUI 阻塞运行图形界面，直到用户从托盘菜单退出。
-func RunUI(app *App, logs *LogBuffer, dataDir string) error {
-	iconPath, err := ensureIconFile(dataDir)
+func RunUI(app *App, logs *LogBuffer, rootDir string) error {
+	iconPath, err := ensureIconFile(rootDir)
 	if err != nil {
 		return err
 	}
@@ -472,7 +472,7 @@ func (u *UI) onImport() {
 				"请先复制整行 antapp:// 连接码（或整个 json 文件的内容），再点这个按钮。\n\n"+err.Error())
 			return
 		}
-		if err := SaveInvite(u.app.DataDir(), inv); err != nil {
+		if err := SaveInvite(u.app.RootDir(), inv); err != nil {
 			u.alert("保存连接码失败", err.Error())
 			return
 		}
@@ -491,7 +491,7 @@ func (u *UI) onImport() {
 
 func (u *UI) onOpenDataDir() {
 	go func() {
-		if err := openInExplorer(u.app.DataDir()); err != nil {
+		if err := openInExplorer(u.app.RootDir()); err != nil {
 			u.alert("打开数据目录失败", err.Error())
 		}
 	}()
@@ -537,17 +537,18 @@ func truncateRunes(s string, n int) string {
 	return string(r[:n]) + "…"
 }
 
-// ensureIconFile 把内嵌的图标释放到数据目录，供 walk 按路径加载。
-func ensureIconFile(dataDir string) (string, error) {
+// ensureIconFile 把内嵌的图标释放出来，供 walk 按路径加载。
+// 它是从 exe 提取的缓存，放运行时数据目录，不跟配置混在一起。
+func ensureIconFile(root string) (string, error) {
 	if len(appIcon) == 0 {
 		return "", errors.New("没有内嵌图标数据")
 	}
-	path := filepath.Join(dataDir, "antapp.ico")
+	path := filepath.Join(RuntimeDir(root), "antapp.ico")
 	want := sha256.Sum256(appIcon)
 	if existing, err := os.ReadFile(path); err == nil && sha256.Sum256(existing) == want {
 		return path, nil
 	}
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", err
 	}
 	tmp := path + ".tmp"

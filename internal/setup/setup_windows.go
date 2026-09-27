@@ -93,8 +93,8 @@ func DefaultInstallDir() string {
 	return `C:\Program Files\` + AppName
 }
 
-// DefaultDataDir 与客户端保持一致：数据就放在安装目录下的 data 里，
-// 用户翻安装目录就能看到连接码、日志和状态文件。
+// DefaultDataDir 是运行时数据目录。配置在 config\、日志在 logs\ ——
+// 三个子目录的分工见客户端那边的 paths.go。
 func DefaultDataDir() string {
 	return filepath.Join(DefaultInstallDir(), "data")
 }
@@ -220,12 +220,13 @@ func Uninstall(opts Options, log func(string)) error {
 	}
 
 	log("删除程序文件")
-	dataDir := filepath.Join(opts.InstallDir, "data")
 	if opts.RemoveData {
-		log("  删除数据目录 " + dataDir)
-		_ = os.RemoveAll(dataDir)
+		log("  删除 config / logs / data")
+		for _, name := range []string{"config", "logs", "data"} {
+			_ = os.RemoveAll(filepath.Join(opts.InstallDir, name))
+		}
 	} else {
-		log("  保留数据目录 " + dataDir + "（连接码与日志）")
+		log("  保留 config / logs / data（连接码、日志与运行状态）")
 	}
 	_ = os.Remove(filepath.Join(opts.InstallDir, AppExeName))
 	_ = os.Remove(filepath.Join(opts.InstallDir, "wintun.dll"))
