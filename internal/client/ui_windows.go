@@ -15,6 +15,7 @@ import (
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
+	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
 
 	"github.com/antapp-cc/antapp-link/internal/update"
@@ -131,6 +132,13 @@ func (u *UI) build() error {
 		u.mw.Hide()
 		u.hintTray()
 	})
+
+	// 日志框退出焦点轮转。
+	//
+	// 窗口被激活时，Windows 把焦点给第一个带 WS_TABSTOP 的控件 —— 只读日志框
+	// 拿到焦点就把整片内容画成蓝底。在 VisibleChanged 里 SetFocus 给按钮试过，
+	// 没用（会被随后的 SetForegroundWindow 重置）。索性让它根本不参与轮转。
+	disableTabStop(u.txtLog.Handle())
 
 	if err := u.buildTray(); err != nil {
 		return err
@@ -539,6 +547,13 @@ func (u *UI) quit() {
 		_ = u.app.Disconnect()
 		u.mw.Synchronize(func() { u.mw.Close() })
 	}()
+}
+
+// disableTabStop 摘掉控件的 WS_TABSTOP，让它不再被 Windows 选作默认焦点。
+func disableTabStop(w win.HWND) {
+	const wsTabStop = 0x00010000
+	style := win.GetWindowLong(w, win.GWL_STYLE)
+	win.SetWindowLong(w, win.GWL_STYLE, style&^wsTabStop)
 }
 
 // alert 把错误挂在主窗口上弹出来，而不是变成一个找不到归属的孤立对话框。
