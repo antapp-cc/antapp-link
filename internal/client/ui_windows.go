@@ -12,11 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unsafe"
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
-	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
 
 	"github.com/antapp-cc/antapp-link/internal/update"
@@ -133,16 +131,14 @@ func (u *UI) build() error {
 		u.mw.Hide()
 		// 第一次收进托盘时说一声。不说的话用户会以为程序已经关了，
 		// 但隧道其实还在后台跑着。
+		//
+		// 气泡停多久由系统的「通知显示时长」决定（默认 5 秒），程序改不了：
+		// Vista 之后 uTimeout 被忽略，试过自己再发一条空 NIF_INFO 去收掉，
+		// 结果系统把图标状态也一起改坏、后面干脆不显示了，所以不再干预。
 		if !u.trayHinted {
 			u.trayHinted = true
 			_ = u.ni.ShowInfo("AntApp Link 仍在运行",
 				"窗口已收进托盘，专线保持连接。\n双击托盘图标可以重新打开，右键菜单里可以退出。")
-			// 系统默认让气泡停 5 秒，太久了。等 2 秒主动收掉。
-			hwnd := u.mw.Handle()
-			go func() {
-				time.Sleep(2 * time.Second)
-				hideBalloon(hwnd)
-			}()
 		}
 	})
 
@@ -515,23 +511,6 @@ func (u *UI) quit() {
 		_ = u.app.Disconnect()
 		u.mw.Synchronize(func() { u.mw.Close() })
 	}()
-}
-
-// hideBalloon 主动收起托盘气泡。
-//
-// Vista 之后 Shell_NotifyIcon 的 uTimeout 字段被忽略，气泡停多久完全由系统的
-// 「通知显示时长」决定（默认 5 秒），walk 也没暴露时长参数。所以只能在显示之后
-// 自己再发一条空通知把它收掉 —— 这是唯一能控制停留时间的办法。
-//
-// UID 传 0：walk 创建 NotifyIcon 时根本没设这个字段，系统侧就是 0。
-func hideBalloon(hwnd win.HWND) {
-	nid := win.NOTIFYICONDATA{
-		HWnd:   hwnd,
-		UID:    0,
-		UFlags: win.NIF_INFO,
-	}
-	nid.CbSize = uint32(unsafe.Sizeof(nid) - unsafe.Sizeof(win.HICON(0)))
-	win.Shell_NotifyIcon(win.NIM_MODIFY, &nid)
 }
 
 // alert 把错误挂在主窗口上弹出来，而不是变成一个找不到归属的孤立对话框。
