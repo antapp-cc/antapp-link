@@ -20,6 +20,10 @@ const (
 	TypePing     Type = 0x04
 	TypePong     Type = 0x05
 	TypeBye      Type = 0x06
+
+	// TypeUDPPort 是客户端在控制通道上告诉服务端「我的 UDP 数据口在这个端口」。
+	// UDP 模式下数据不再走这条 TCP 连接，服务端得知道往哪发。
+	TypeUDPPort Type = 0x07
 )
 
 func (t Type) String() string {
@@ -36,6 +40,8 @@ func (t Type) String() string {
 		return "PONG"
 	case TypeBye:
 		return "BYE"
+	case TypeUDPPort:
+		return "UDP_PORT"
 	default:
 		return fmt.Sprintf("TYPE(0x%02X)", uint8(t))
 	}

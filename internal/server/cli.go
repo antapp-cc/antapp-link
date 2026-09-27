@@ -97,6 +97,7 @@ func cmdInit(stdout, stderr io.Writer, args []string) int {
 	listen := fs.String("listen", "", "隧道监听地址，形如 0.0.0.0:62233（不传则不改）")
 	forward := fs.String("forward", "", "转发端口段，形如 31400-31409（不传则不改）")
 	network := fs.String("network", "", "隧道网段，形如 10.10.0.0/24（不传则不改）")
+	mode := fs.String("mode", "", "数据通道模式：tcp（默认）或 udp（不传则不改）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -104,6 +105,13 @@ func cmdInit(stdout, stderr io.Writer, args []string) int {
 	var ov Overrides
 	ov.Listen = *listen
 	ov.Network = *network
+	if *mode != "" {
+		if _, err := pki.ParseMode(*mode); err != nil {
+			fmt.Fprintf(stderr, "--mode %v\n", err)
+			return 2
+		}
+		ov.Mode = *mode
+	}
 	if *forward != "" {
 		start, end, err := parsePortRange(*forward)
 		if err != nil {
@@ -148,8 +156,17 @@ func cmdInit(stdout, stderr io.Writer, args []string) int {
 	fmt.Fprintf(stdout, "隧道网段      : %s（服务端 %s / 客户端 %s）\n",
 		cfg.Tunnel.Network, cfg.Tunnel.ServerIP, cfg.Tunnel.ClientIP)
 	fmt.Fprintf(stdout, "转发端口段    : %d-%d\n", cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
+	fmt.Fprintf(stdout, "数据通道      : %s\n", modeLabel(cfg.Mode))
 	fmt.Fprintf(stdout, "\n下一步: antapp-linkd invite pi-node-01\n")
 	return 0
+}
+
+// modeLabel 把配置里的模式变成人读的说明。
+func modeLabel(mode string) string {
+	if m, err := pki.ParseMode(mode); err == nil && m == pki.ModeUDP {
+		return "UDP（控制走 TCP，数据包走 UDP + AES-GCM）"
+	}
+	return "TCP（TLS 1.3，数据与控制同一条连接）"
 }
 
 // parsePortRange 解析 31400-31409 这种形式。
@@ -222,6 +239,7 @@ func cmdInvite(stdout, stderr io.Writer, args []string) int {
 		Prefix:   cfg.PrefixLen(),
 		MTU:      cfg.Tunnel.MTU,
 		DNS:      cfg.DNS,
+		Mode:     pki.TunnelMode(cfg.Mode),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "签发失败: %v\n", err)
@@ -255,7 +273,7 @@ func cmdInvite(stdout, stderr io.Writer, args []string) int {
 	fmt.Fprintf(stdout, "隧道地址      : %s/%d（网关 %s）\n", cfg.Tunnel.ClientIP, cfg.PrefixLen(), cfg.Tunnel.ServerIP)
 	fmt.Fprintf(stdout, "MTU           : %d\n", cfg.Tunnel.MTU)
 	fmt.Fprintf(stdout, "DNS           : %s\n", strings.Join(cfg.DNS, ", "))
-	fmt.Fprintf(stdout, "转发端口      : %d-%d（TCP + UDP）\n", cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
+	fmt.Fprintf(stdout, "转发端口      : %d-%d（只转 TCP）\n", cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
 	fmt.Fprintf(stdout, "连接码文件    : %s\n", path)
 	fmt.Fprintf(stdout, "\n单行连接码（发给节点机导入；内含私钥，等同密码）:\n%s\n", code)
 	return 0
@@ -278,7 +296,7 @@ func cmdUp(stdout, stderr io.Writer, args []string) int {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "netfilter 规则已就绪：%d-%d (TCP+UDP) -> %s\n",
+	fmt.Fprintf(stdout, "netfilter 规则已就绪：%d-%d (TCP) -> %s\n",
 		cfg.ForwardPorts.Start, cfg.ForwardPorts.End, cfg.Tunnel.ClientIP)
 	return 0
 }
@@ -344,7 +362,7 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 		cfg.Tunnel.Network, cfg.Tunnel.ServerIP, cfg.Tunnel.ClientIP)
 	fmt.Fprintf(stdout, "MTU         : %d\n", cfg.Tunnel.MTU)
 	fmt.Fprintf(stdout, "DNS         : %s\n", strings.Join(cfg.DNS, ", "))
-	fmt.Fprintf(stdout, "转发端口    : %d-%d（TCP + UDP）\n", cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
+	fmt.Fprintf(stdout, "转发端口    : %d-%d（只转 TCP）\n", cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
 	fmt.Fprintf(stdout, "PKI 目录    : %s\n", cfg.PKIDir)
 
 	if st, err := ReadStatus(); err == nil {

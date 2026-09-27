@@ -31,22 +31,50 @@ type TunnelParams struct {
 	Prefix   int
 	MTU      int
 	DNS      []string
+	Mode     TunnelMode // 空表示 TCP
+}
+
+// TunnelMode 是隧道的数据通道走法。
+type TunnelMode string
+
+const (
+	// ModeTCP 是默认：TLS over TCP，数据和控制都走它。
+	ModeTCP TunnelMode = "tcp"
+	// ModeUDP 让数据包走 UDP（AES-GCM，密钥从 TLS 会话导出），控制仍走 TCP。
+	// 解决的是「TCP 能连但被限速/干扰」，TCP 完全不通时连握手都做不了。
+	ModeUDP TunnelMode = "udp"
+)
+
+// ParseMode 把配置里的字符串转成 TunnelMode，空值当 TCP。
+func ParseMode(s string) (TunnelMode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", string(ModeTCP):
+		return ModeTCP, nil
+	case string(ModeUDP):
+		return ModeUDP, nil
+	default:
+		return "", fmt.Errorf("未知的隧道模式 %q（只支持 tcp / udp）", s)
+	}
 }
 
 // Invite 是一个 Pi 节点的完整连接信息。私钥在内，所以它等同密码：日志和界面都不回显。
 type Invite struct {
-	Server   string    `json:"server"`
-	TunnelIP string    `json:"tunnel_ip"`
-	Gateway  string    `json:"gateway"`
-	Prefix   int       `json:"prefix"`
-	MTU      int       `json:"mtu"`
-	DNS      []string  `json:"dns"`
-	CAPEM    string    `json:"ca_pem"`
-	CertPEM  string    `json:"cert_pem"`
-	KeyPEM   string    `json:"key_pem"`
-	Name     string    `json:"name"`
-	Created  time.Time `json:"created"`
+	Server   string     `json:"server"`
+	TunnelIP string     `json:"tunnel_ip"`
+	Gateway  string     `json:"gateway"`
+	Prefix   int        `json:"prefix"`
+	MTU      int        `json:"mtu"`
+	DNS      []string   `json:"dns"`
+	Mode     TunnelMode `json:"mode,omitempty"`
+	CAPEM    string     `json:"ca_pem"`
+	CertPEM  string     `json:"cert_pem"`
+	KeyPEM   string     `json:"key_pem"`
+	Name     string     `json:"name"`
+	Created  time.Time  `json:"created"`
 }
+
+// UseUDP 表示这条连接码要求走 UDP 数据通道。
+func (i Invite) UseUDP() bool { return i.Mode == ModeUDP }
 
 // Issue 用现有 CA 给 name 签一张客户端证书，并组装出连接码。
 func Issue(dir, name, server string, tp TunnelParams) (Invite, error) {
@@ -77,6 +105,7 @@ func Issue(dir, name, server string, tp TunnelParams) (Invite, error) {
 		Prefix:   tp.Prefix,
 		MTU:      tp.MTU,
 		DNS:      tp.DNS,
+		Mode:     tp.Mode,
 		CAPEM:    string(caPEM),
 		CertPEM:  string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})),
 		KeyPEM:   string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})),

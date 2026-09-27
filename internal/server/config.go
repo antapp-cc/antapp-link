@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/antapp-cc/antapp-link/internal/pki"
 )
 
 // Config 对应 /etc/antapp-link/server.json。
@@ -17,6 +19,11 @@ type Config struct {
 	DNS          []string     `json:"dns"`
 	ForwardPorts PortRange    `json:"forward_ports"`
 	PKIDir       string       `json:"pki_dir"`
+
+	// Mode 决定数据通道走法："tcp"（默认，TLS over TCP）或 "udp"
+	// （控制仍走 TCP，数据包走 UDP + AES-GCM）。
+	// 它会被写进签发的连接码，客户端据此选择。
+	Mode string `json:"mode,omitempty"`
 }
 
 type TunnelConfig struct {
@@ -92,6 +99,7 @@ type Overrides struct {
 	ForwardStart int    // 0 表示不改
 	ForwardEnd   int
 	Network      string // 空表示不改
+	Mode         string // tcp / udp；空表示不改
 }
 
 // ApplyOverrides 把非空项写进配置。网段变了的话，服务端/客户端地址按新网段重算
@@ -99,6 +107,9 @@ type Overrides struct {
 func (c *Config) ApplyOverrides(o Overrides) {
 	if o.Listen != "" {
 		c.Listen = o.Listen
+	}
+	if o.Mode != "" {
+		c.Mode = o.Mode
 	}
 	if o.ForwardStart > 0 && o.ForwardEnd > 0 {
 		c.ForwardPorts = PortRange{Start: o.ForwardStart, End: o.ForwardEnd}
@@ -122,6 +133,9 @@ func (c *Config) ApplyOverrides(o Overrides) {
 }
 
 func (c Config) Validate() error {
+	if _, err := pki.ParseMode(c.Mode); err != nil {
+		return err
+	}
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		return fmt.Errorf("listen %q 必须是 host:port 形式: %w", c.Listen, err)
 	}
