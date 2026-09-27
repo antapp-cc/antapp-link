@@ -39,6 +39,9 @@ func runQuiet(uninstall bool, dirFlag string) int {
 			fmt.Fprintln(os.Stderr, "没有找到已安装的 AntApp Link")
 			return 1
 		}
+		// 静默卸载是给脚本和自动化用的，默认连数据一起清干净；
+		// 走界面的那条路会让用户自己勾选
+		opts.RemoveData = true
 		if err := setup.Uninstall(opts, func(string) {}); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1

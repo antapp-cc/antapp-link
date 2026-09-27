@@ -37,7 +37,7 @@ bash install.sh
 
 - 释放到 `C:\Program Files\AntApp Link\`
 - 建桌面与开始菜单快捷方式（可勾掉）
-- 登记到「应用和功能」，从那里卸载，或用 `antapp-setup.exe --uninstall`
+- 登记到「应用和功能」；**安装时会把卸载程序自己也复制进安装目录**（`uninstall.exe`），所以用户删掉当初那个安装包之后，仍然能从「应用和功能」或客户端托盘菜单卸载
 - 装完自动启动；**首次使用会引导导入连接码**
 
 **连接码、日志、状态文件都在 `C:\Program Files\AntApp Link\data\`** —— 跟程序放在一起，翻安装目录就能看到，不用去 `ProgramData` 里找。该目录写不进去时（比如程序被放在只读位置）才退回到 `%ProgramData%\AntAppLink\`。
@@ -47,6 +47,7 @@ bash install.sh
 ```
 C:\Program Files\AntApp Link\
   antapp-link.exe
+  uninstall.exe        卸载器（安装程序的副本）
   wintun.dll           首次运行时释放
   data\
     node.conf          连接码（内含私钥）
@@ -55,7 +56,13 @@ C:\Program Files\AntApp Link\
     logs\client.log
 ```
 
-卸载时会问要不要连 `data` 一起删。
+### 卸载
+
+三个入口，走的是同一个程序：客户端托盘菜单的「卸载 AntApp Link」、「应用和功能」里的卸载按钮、直接跑 `uninstall.exe --uninstall`（静默加 `--quiet`）。走界面会问要不要连 `data` 一起删；静默模式默认全清。
+
+**一个已知限制**：Windows 不允许删除正在运行的 exe，而卸载器就住在它要删的那个目录里 —— 所以卸载做完后，安装目录里**可能剩下一个 `uninstall.exe`**。程序会把它登记成「重启后删除」（`MoveFileEx` + `DELAY_UNTIL_REBOOT`，实测有效），下次重启系统自动清掉，也可以手动删。
+
+试过四种绕法都不成立：`CREATE_NO_WINDOW`、`DETACHED_PROCESS`、`CREATE_BREAKAWAY_FROM_JOB`，以及改用任务计划/WMI 启动卸载器 —— 命令行本身没问题（手工执行一次就删干净了），矛盾在「卸载器住在哪」这个设计上，不在启动方式。彻底解法是把卸载器挪到 `%ProgramData%`，那样安装目录一次就能删干净；暂时没做，因为那等于又添一个常驻位置。
 
 安装包是自写的（本机没有 Inno Setup / NSIS），所以整个流程没有外部依赖。
 

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -194,6 +195,12 @@ func (u *UI) buildTray() error {
 		}()
 	})
 	ni.ContextMenu().Actions().Add(mAuto)
+	ni.ContextMenu().Actions().Add(walk.NewSeparatorAction())
+
+	mUninstall := walk.NewAction()
+	_ = mUninstall.SetText("卸载 AntApp Link")
+	mUninstall.Triggered().Attach(u.onUninstall)
+	ni.ContextMenu().Actions().Add(mUninstall)
 	ni.ContextMenu().Actions().Add(walk.NewSeparatorAction())
 
 	mQuit := walk.NewAction()
@@ -434,6 +441,43 @@ func (u *UI) applyUpdate(newExe string) {
 	}
 	u.quitting = true
 	os.Exit(0)
+}
+
+// onUninstall 走的是安装目录里那份卸载器，跟「应用和功能」里的卸载按钮是同一个程序。
+func (u *UI) onUninstall() {
+	self, err := os.Executable()
+	if err != nil {
+		u.alert("卸载失败", "取当前程序路径："+err.Error())
+		return
+	}
+	dir := filepath.Dir(self)
+	uninst := filepath.Join(dir, "uninstall.exe")
+	if _, err := os.Stat(uninst); err != nil {
+		u.alert("找不到卸载程序",
+			"安装目录里没有 uninstall.exe：\n"+dir+"\n\n"+
+				"可以到「设置 → 应用 → 已安装的应用」里卸载，或者用当初那个安装包加 --uninstall。")
+		return
+	}
+
+	if walk.MsgBox(u.mw, "卸载 AntApp Link",
+		"将从下面这个目录删除程序：\n"+dir+"\n\n"+
+			"卸载时会先断开隧道、还原网络，然后程序退出。确定卸载吗？",
+		walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
+		return
+	}
+
+	go func() {
+		// 先把网络还原干净再交给卸载器 —— 它下一步就会把本进程杀掉
+		_ = u.app.Disconnect()
+
+		cmd := exec.Command(uninst, "--uninstall")
+		if err := cmd.Start(); err != nil {
+			u.alert("启动卸载程序失败", err.Error())
+			return
+		}
+		u.quitting = true
+		u.mw.Synchronize(func() { u.mw.Close() })
+	}()
 }
 
 // onImport 从剪贴板取连接码。
