@@ -20,7 +20,7 @@ func main() {
 
 func run() int {
 	var (
-		codeArg  = flag.String("c", "", "连接码：单行 antapp:// 或 json/txt 文件路径")
+		codeArg  = flag.String("c", "", "连接码：单行 antapp:// 或 .antapp 文件路径（双击连接码文件时由系统传入）")
 		dataArg  = flag.String("data", defaultRootDir(), "工作根目录（config/、logs/、data/ 都建在它下面）")
 		once     = flag.Bool("once", false, "前台连接，不显示界面（Ctrl+C 退出）")
 		noNetCfg = flag.Bool("no-netcfg", false, "只建隧道、只配虚拟网卡，不改路由与 DNS（联调端口转发用）")

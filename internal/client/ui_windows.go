@@ -562,7 +562,7 @@ func (u *UI) onImport() {
 	if fromFile {
 		dlg := new(walk.FileDialog)
 		dlg.Title = "选择连接码文件"
-		dlg.Filter = "连接码文件 (*.json;*.conf;*.txt)|*.json;*.conf;*.txt|所有文件 (*.*)|*.*"
+		dlg.Filter = "AntApp Link 连接码 (*.antapp)|*.antapp"
 		chosen, err := dlg.ShowOpen(u.mw)
 		if err != nil {
 			u.alert("打开文件对话框失败", err.Error())
@@ -587,7 +587,7 @@ func (u *UI) onImport() {
 		if fromFile {
 			where = "这个文件里没有可用的连接码"
 		}
-		u.alert(where, "需要服务端生成的 .json/.conf 文件，或整行 antapp:// 连接码。\n\n"+err.Error())
+		u.alert(where, "需要服务端生成的 .antapp 连接码文件，或整行 antapp:// 连接码。\n\n"+err.Error())
 		return
 	}
 
@@ -623,7 +623,7 @@ func (u *UI) askImportSource() (fromFile bool, ok bool) {
 		Layout:   VBox{Margins: Margins{Left: 16, Top: 16, Right: 16, Bottom: 16}, Spacing: 10},
 		Children: []Widget{
 			Label{Text: "连接码从哪里来？", Font: Font{PointSize: 10}},
-			Label{Text: "服务端生成的文件（.json / .conf / .txt），\n或者聊天窗口里复制好的整行 antapp:// 连接码。"},
+			Label{Text: "服务端生成的 .antapp 连接码文件，\n或者聊天窗口里复制好的整行 antapp:// 连接码。"},
 			Composite{
 				Layout: HBox{MarginsZero: true, Spacing: 8},
 				Children: []Widget{
