@@ -34,6 +34,7 @@ type UI struct {
 
 	lblState   *walk.Label
 	lblIP      *walk.Label
+	lblTraffic *walk.Label
 	lblVersion *walk.Label
 	txtLog     *walk.TextEdit
 	btnPrimary *walk.PushButton
@@ -91,6 +92,8 @@ func (u *UI) build() error {
 				Layout: HBox{MarginsZero: true},
 				Children: []Widget{
 					Label{AssignTo: &u.lblIP, Text: "分配 IP: —"},
+					HSpacer{},
+					Label{AssignTo: &u.lblTraffic, Text: "发送 — / 接收 —"},
 					HSpacer{},
 					Label{AssignTo: &u.lblVersion, Text: fmt.Sprintf("AntApp Link %s", Version)},
 				},
@@ -230,13 +233,21 @@ func (u *UI) refresh() {
 
 	// 上次的错误比「服务端 x」更有用，就摆在状态行下面
 	if configured && !st.Online && st.LastError != "" {
-		u.lblIP.SetText("上次错误: " + truncateRunes(st.LastError, 70))
+		u.lblIP.SetText("上次错误: " + truncateRunes(st.LastError, 46))
 	} else if st.Online {
 		u.lblIP.SetText(fmt.Sprintf("分配 IP: %s", st.TunnelIP))
 	} else if configured {
 		u.lblIP.SetText("服务端: " + st.Server)
 	} else {
 		u.lblIP.SetText("分配 IP: —")
+	}
+
+	// 流量按本次连接累计；断开重连会新开一个隧道实例，计数从零开始
+	if st.Running {
+		u.lblTraffic.SetText(fmt.Sprintf("发送 %s / 接收 %s",
+			formatBytes(st.TxBytes), formatBytes(st.RxBytes)))
+	} else {
+		u.lblTraffic.SetText("发送 — / 接收 —")
 	}
 
 	// 按钮文字跟着状态走：没连接码时主按钮就是导入入口
