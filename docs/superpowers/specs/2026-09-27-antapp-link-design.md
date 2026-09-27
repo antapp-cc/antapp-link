@@ -1,4 +1,4 @@
-# 蚁巢 Pi 节点虚拟专线（antnest-link）设计
+# AntApp Pi 节点虚拟专线（antapp-link）设计
 
 日期：2026-09-27
 状态：待评审
@@ -47,15 +47,15 @@
 ```
 Pi 节点机 (Windows)                        云服 (Linux, 公网 103.143.11.34)
 ┌───────────────────────────┐             ┌────────────────────────────────┐
-│ Pi Node (Docker)          │             │ antnest-linkd                  │
-│   监听 31400-31409        │             │  ├ antnest0  10.10.0.1/24      │
+│ Pi Node (Docker)          │             │ antapp-linkd                  │
+│   监听 31400-31409        │             │  ├ antapp0  10.10.0.1/24      │
 │        ↕                  │             │  ├ :62233  TLS1.3 mTLS         │
-│ Windows 内核 TCP/IP 栈    │             │  └ 隧道 ↔ antnest0 搬运        │
+│ Windows 内核 TCP/IP 栈    │             │  └ 隧道 ↔ antapp0 搬运        │
 │        ↕                  │             │                                │
-│ Wintun "AntNest Link"     │◄──TLS/TCP──►│ netfilter:                     │
+│ Wintun "AntApp Link"     │◄──TLS/TCP──►│ netfilter:                     │
 │   10.10.0.2/24 gw .1      │             │  MASQUERADE 10.10.0.0/24       │
 │        ↕                  │             │  DNAT 31400-31409 → 10.10.0.2  │
-│ antnest-link.exe (托盘)   │             │  MSS clamp                     │
+│ antapp-link.exe (托盘)   │             │  MSS clamp                     │
 └───────────────────────────┘             └────────────────────────────────┘
 ```
 
@@ -69,7 +69,7 @@ Pi 节点机 (Windows)                        云服 (Linux, 公网 103.143.11.3
 
 ## 5. 协议
 
-外层：**TLS 1.3 over TCP**，双向证书（mTLS），ALPN 固定 `antnest-link/1`。
+外层：**TLS 1.3 over TCP**，双向证书（mTLS），ALPN 固定 `antapp-link/1`。
 选 TLS 的理由：握手、证书校验、重连退避全用 Go 标准库 `crypto/tls`，不手写任何密码学；且 TCP 这条路已在现网验证可用（`client-antnest-pinode.ovpn:131` 走的 `tcp-client`，当初放弃 UDP 62230 不是偶然）。
 
 内层：长度前缀帧。
@@ -100,25 +100,25 @@ Pi 节点机 (Windows)                        云服 (Linux, 公网 103.143.11.3
 
 ## 6. 服务端设计
 
-单个 Linux 二进制 `antnest-linkd`：
+单个 Linux 二进制 `antapp-linkd`：
 
 ```
-antnest-linkd init              生成 CA + 服务端证书（无 easy-rsa）
-antnest-linkd invite <name>     签发客户端证书，输出连接码
-antnest-linkd install           写 systemd unit + iptables oneshot，开机自启
-antnest-linkd up                配置 iptables（幂等）
-antnest-linkd down              清理 iptables
-antnest-linkd run               前台跑隧道（systemd 调用）
-antnest-linkd status            显示隧道与转发状态
+antapp-linkd init              生成 CA + 服务端证书（无 easy-rsa）
+antapp-linkd invite <name>     签发客户端证书，输出连接码
+antapp-linkd install           写 systemd unit + iptables oneshot，开机自启
+antapp-linkd up                配置 iptables（幂等）
+antapp-linkd down              清理 iptables
+antapp-linkd run               前台跑隧道（systemd 调用）
+antapp-linkd status            显示隧道与转发状态
 ```
 
-配置 `/etc/antnest-link/server.json`：
+配置 `/etc/antapp-link/server.json`：
 
 ```json
 {
   "listen": "0.0.0.0:62233",
   "tunnel": {
-    "device": "antnest0",
+    "device": "antapp0",
     "network": "10.10.0.0/24",
     "server_ip": "10.10.0.1",
     "client_ip": "10.10.0.2",
@@ -126,27 +126,27 @@ antnest-linkd status            显示隧道与转发状态
   },
   "dns": ["8.8.8.8", "149.112.112.112"],
   "forward_ports": { "start": 31400, "end": 31409 },
-  "pki_dir": "/etc/antnest-link/pki"
+  "pki_dir": "/etc/antapp-link/pki"
 }
 ```
 
 网卡：`/dev/net/tun`，`IFF_TUN | IFF_NO_PI`，配 `10.10.0.1/24`。
 
-iptables 用自定义链 `ANTNEST_LINK`，先建后插，保证幂等、可干净清理：
+iptables 用自定义链 `ANTAPP_LINK`，先建后插，保证幂等、可干净清理：
 
 ```
 sysctl net.ipv4.ip_forward=1
-iptables -t nat -N ANTNEST_LINK
+iptables -t nat -N ANTAPP_LINK
 iptables -t nat -A POSTROUTING -s 10.10.0.0/24 -o <wan> -j MASQUERADE
 iptables -A FORWARD -s 10.10.0.0/24 -j ACCEPT
 iptables -A FORWARD -d 10.10.0.0/24 -j ACCEPT
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 iptables -A INPUT -p tcp --dport 62233 -j ACCEPT
 # 端口转发：TCP 与 UDP 都做
-iptables -t nat -A ANTNEST_LINK -p tcp --dport 31400:31409 -j DNAT --to-destination 10.10.0.2
-iptables -t nat -A ANTNEST_LINK -p udp --dport 31400:31409 -j DNAT --to-destination 10.10.0.2
-iptables -t nat -A PREROUTING -p tcp --dport 31400:31409 -j ANTNEST_LINK
-iptables -t nat -A PREROUTING -p udp --dport 31400:31409 -j ANTNEST_LINK
+iptables -t nat -A ANTAPP_LINK -p tcp --dport 31400:31409 -j DNAT --to-destination 10.10.0.2
+iptables -t nat -A ANTAPP_LINK -p udp --dport 31400:31409 -j DNAT --to-destination 10.10.0.2
+iptables -t nat -A PREROUTING -p tcp --dport 31400:31409 -j ANTAPP_LINK
+iptables -t nat -A PREROUTING -p udp --dport 31400:31409 -j ANTAPP_LINK
 ```
 
 DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。客户端未连上时 DNAT 目标不可达，外部连接超时 —— 与现状行为一致。
@@ -157,7 +157,7 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 
 ## 7. 客户端设计
 
-单个 Windows exe `antnest-link.exe`，GUI 子系统 + 托盘图标，manifest 声明 `requireAdministrator`（创建虚拟网卡和改路由必须提权）。
+单个 Windows exe `antapp-link.exe`，GUI 子系统 + 托盘图标，manifest 声明 `requireAdministrator`（创建虚拟网卡和改路由必须提权）。
 
 内部模块：
 
@@ -167,11 +167,11 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 | `tunnel` | TLS 连接、帧编解码、心跳、重连（指数退避 1s→2s→4s…上限 30s） |
 | `netcfg` | IP / 路由 / DNS 配置与还原，快照记录 |
 | `tray` | 托盘图标、状态、菜单 |
-| `store` | 配置读写 `%ProgramData%\AntNestLink\node.conf` |
+| `store` | 配置读写 `%ProgramData%\AntAppLink\node.conf` |
 | `import` | 导入连接码（粘贴单行或选文件） |
 | `autostart` | 计划任务注册（要提权，注册表 Run 项不够） |
 
-日志：客户端写 `%ProgramData%\AntNestLink\logs\client.log`（按大小轮转，保留最近 2 份）；服务端走 journald（`journalctl -u antnest-linkd`），另有 `antnest-linkd status` 看隧道与转发状态。
+日志：客户端写 `%ProgramData%\AntAppLink\logs\client.log`（按大小轮转，保留最近 2 份）；服务端走 journald（`journalctl -u antapp-linkd`），另有 `antapp-linkd status` 看隧道与转发状态。
 
 托盘菜单：
 
@@ -186,7 +186,7 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 退出
 ```
 
-**Wintun 说明**：虚拟网卡用 WireGuard 官方的 Wintun。`wintun.dll` 用 `go:embed` 内嵌进 exe，运行时释放到 `%ProgramData%\AntNestLink\` 再动态加载，**分发物只有一个 exe**；内嵌的 dll 必须与 exe 架构一致（amd64 / arm64 分开构建）。它是操作系统的网络适配器驱动，不是「要用户另外安装的工具/服务」——用户双击就能用，不需要装 OpenVPN、不需要装 TAP 驱动、不需要单独跑安装程序。
+**Wintun 说明**：虚拟网卡用 WireGuard 官方的 Wintun。`wintun.dll` 用 `go:embed` 内嵌进 exe，运行时释放到 `%ProgramData%\AntAppLink\` 再动态加载，**分发物只有一个 exe**；内嵌的 dll 必须与 exe 架构一致（amd64 / arm64 分开构建）。它是操作系统的网络适配器驱动，不是「要用户另外安装的工具/服务」——用户双击就能用，不需要装 OpenVPN、不需要装 TAP 驱动、不需要单独跑安装程序。
 
 **许可已核实**（原计划是「实现前确认」，现已确认）：Wintun 的**源码**是 GPLv2，但从 wintun.net 下载的**预编译 `wintun.dll` 适用单独的 Prebuilt Binaries License**，其中第 3.d 条明确允许「随其他软件一起分发」，前提是只通过 `wintun.h` 暴露的 API 使用它 —— 我们的用法正好落在许可范围内，商业分发没问题。两条要求必须遵守：发行包要附上该许可原文（条款 c 禁止移除版权声明），且**不得分发改名后的驱动文件**，用原始的 `wintun.dll`。
 
@@ -194,8 +194,8 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 
 连接时按顺序执行，断开时逆序还原：
 
-1. 快照现场：默认路由（网关 + 接口）、所有活动网卡的 IPv4 DNS 列表 → 写 `%ProgramData%\AntNestLink\state.json`
-2. 创建 Wintun 适配器 `AntNest Link`
+1. 快照现场：默认路由（网关 + 接口）、所有活动网卡的 IPv4 DNS 列表 → 写 `%ProgramData%\AntAppLink\state.json`
+2. 创建 Wintun 适配器 `AntApp Link`
 3. 配 IP：`10.10.0.2/24`，网关 `10.10.0.1`
 4. 加防自噬路由：`<云服 IP>/32` 走**原网关**（否则承载隧道的 TLS/TCP 自己会被送进隧道，死循环）
 5. 加默认路由走 `10.10.0.1`，metric 设最低
@@ -214,7 +214,7 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 
 ## 10. 配置与连接码
 
-`antnest-linkd invite <name>` 输出两样东西：
+`antapp-linkd invite <name>` 输出两样东西：
 
 1. `antnest-node-<name>.json` 文件，内容：
 
@@ -241,7 +241,7 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 
 不能直接抢占现网资源，并行期用独立端口和独立网段：
 
-| | 现网（OpenVPN + rinetd） | 新方案（antnest-link） |
+| | 现网（OpenVPN + rinetd） | 新方案（antapp-link） |
 |---|---|---|
 | 隧道端口 | tcp/62231（另有 udp/62230） | **tcp/62233** |
 | 隧道网段 | `10.9.0.0/24` | **`10.10.0.0/24`** |
