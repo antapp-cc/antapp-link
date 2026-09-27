@@ -245,7 +245,7 @@ func (u *UI) buildTray() error {
 	ni.ContextMenu().Actions().Add(mToggle)
 
 	mImport := walk.NewAction()
-	_ = mImport.SetText("从剪贴板导入连接码")
+	_ = mImport.SetText("导入连接码")
 	mImport.Triggered().Attach(u.onImport)
 	ni.ContextMenu().Actions().Add(mImport)
 
