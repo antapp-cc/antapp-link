@@ -149,29 +149,84 @@ func runInstallUI(icon *walk.Icon, dirFlag string) int {
 		AssignTo: &mw,
 		Title:    "安装 AntApp Link",
 		Icon:     icon,
-		Size:     Size{Width: 580, Height: 460},
-		MinSize:  Size{Width: 500, Height: 400},
-		Layout:   VBox{Margins: Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
+		Size:     Size{Width: 600, Height: 540},
+		MinSize:  Size{Width: 540, Height: 480},
+		Layout:   VBox{Margins: Margins{Left: 16, Top: 16, Right: 16, Bottom: 16}, Spacing: 12},
 		Children: []Widget{
-			Label{Text: "AntApp Link —— Pi 节点虚拟专线"},
-			Composite{
-				Layout: HBox{Spacing: 6},
+			Label{
+				Text: "AntApp Link —— Pi 节点虚拟专线",
+				Font: Font{PointSize: 11},
+			},
+			GroupBox{
+				Title:  "安装位置",
+				Layout: VBox{Margins: Margins{Left: 10, Top: 6, Right: 10, Bottom: 10}, Spacing: 6},
 				Children: []Widget{
-					Label{Text: "安装目录"},
-					LineEdit{AssignTo: &edDir, Text: opts.InstallDir},
-					PushButton{Text: "浏览…", OnClicked: browse},
+					Composite{
+						Layout: HBox{MarginsZero: true, Spacing: 8},
+						Children: []Widget{
+							Label{Text: "安装目录"},
+							LineEdit{AssignTo: &edDir, Text: opts.InstallDir},
+							// 固定宽度：不给 MaxSize 的话 BoxLayout 会把它拉长
+							PushButton{Text: "浏览…", MinSize: Size{Width: 78}, MaxSize: Size{Width: 78}, OnClicked: browse},
+						},
+					},
+					Label{Text: "连接码、日志和状态文件放在该目录下的 data 文件夹里。"},
 				},
 			},
-			CheckBox{AssignTo: &chkDesktop, Text: "创建桌面快捷方式", Checked: true},
-			CheckBox{AssignTo: &chkStartMenu, Text: "创建开始菜单快捷方式", Checked: true},
-			CheckBox{AssignTo: &chkLaunch, Text: "安装完成后立即启动", Checked: true},
-			PushButton{AssignTo: &btn, Text: "开始安装", MinSize: Size{Width: 120}, OnClicked: doInstall},
-			Label{Text: "安装过程"},
-			TextEdit{
-				AssignTo: &txtLog,
-				ReadOnly: true,
-				VScroll:  true,
-				Font:     Font{Family: "Consolas", PointSize: 8},
+			GroupBox{
+				Title:  "安装选项",
+				Layout: VBox{Margins: Margins{Left: 10, Top: 6, Right: 10, Bottom: 8}, Spacing: 5},
+				Children: []Widget{
+					// 每行套一层 HBox + HSpacer 才会左对齐：
+					// CheckBox 本身不参与横向拉伸，直接放进 VBox 会被居中
+					Composite{
+						Layout: HBox{MarginsZero: true},
+						Children: []Widget{
+							CheckBox{AssignTo: &chkDesktop, Text: "创建桌面快捷方式", Checked: true},
+							HSpacer{},
+						},
+					},
+					Composite{
+						Layout: HBox{MarginsZero: true},
+						Children: []Widget{
+							CheckBox{AssignTo: &chkStartMenu, Text: "创建开始菜单快捷方式", Checked: true},
+							HSpacer{},
+						},
+					},
+					Composite{
+						Layout: HBox{MarginsZero: true},
+						Children: []Widget{
+							CheckBox{AssignTo: &chkLaunch, Text: "安装完成后立即启动客户端", Checked: true},
+							HSpacer{},
+						},
+					},
+				},
+			},
+			GroupBox{
+				Title:  "安装过程",
+				Layout: VBox{Margins: Margins{Left: 10, Top: 6, Right: 10, Bottom: 10}},
+				Children: []Widget{
+					TextEdit{
+						AssignTo: &txtLog,
+						ReadOnly: true,
+						VScroll:  true,
+						MinSize:  Size{Height: 110},
+						Font:     Font{Family: "Consolas", PointSize: 8},
+					},
+				},
+			},
+			Composite{
+				Layout: HBox{MarginsZero: true},
+				Children: []Widget{
+					HSpacer{},
+					PushButton{
+						AssignTo:  &btn,
+						Text:      "开始安装",
+						MinSize:   Size{Width: 110},
+						MaxSize:   Size{Width: 110},
+						OnClicked: doInstall,
+					},
+				},
 			},
 		},
 	}).Create(); err != nil {
@@ -222,21 +277,84 @@ func runUninstallUI(icon *walk.Icon) int {
 		AssignTo: &mw,
 		Title:    "卸载 AntApp Link",
 		Icon:     icon,
-		Size:     Size{Width: 560, Height: 420},
-		MinSize:  Size{Width: 480, Height: 360},
-		Layout:   VBox{Margins: Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
+		Size:     Size{Width: 600, Height: 480},
+		MinSize:  Size{Width: 540, Height: 430},
+		Layout:   VBox{Margins: Margins{Left: 16, Top: 16, Right: 16, Bottom: 16}, Spacing: 12},
 		Children: []Widget{
-			Label{Text: "将从下面这个目录删除程序文件："},
-			Label{Text: opts.InstallDir},
-			Label{Text: "数据目录：" + opts.DataDir},
-			CheckBox{AssignTo: &chkData, Text: "同时删除 data 文件夹（连接码与日志；不勾选则保留）", Checked: true},
-			PushButton{AssignTo: &btn, Text: "开始卸载", MinSize: Size{Width: 120}, OnClicked: doUninstall},
-			Label{Text: "卸载过程"},
-			TextEdit{
-				AssignTo: &txtLog,
-				ReadOnly: true,
-				VScroll:  true,
-				Font:     Font{Family: "Consolas", PointSize: 8},
+			Label{
+				Text: "将删除下面这些内容",
+				Font: Font{PointSize: 11},
+			},
+			GroupBox{
+				Title:  "程序与数据",
+				Layout: VBox{Margins: Margins{Left: 10, Top: 6, Right: 10, Bottom: 10}, Spacing: 4},
+				Children: []Widget{
+					Composite{
+						Layout: HBox{MarginsZero: true},
+						Children: []Widget{
+							Label{Text: "程序目录：" + opts.InstallDir},
+							HSpacer{},
+						},
+					},
+					Composite{
+						Layout: HBox{MarginsZero: true},
+						Children: []Widget{
+							Label{Text: "数据目录：" + opts.DataDir},
+							HSpacer{},
+						},
+					},
+				},
+			},
+			GroupBox{
+				Title:  "卸载选项",
+				Layout: VBox{Margins: Margins{Left: 10, Top: 6, Right: 10, Bottom: 8}, Spacing: 5},
+				Children: []Widget{
+					// 套 HBox + HSpacer 才会左对齐（CheckBox 不参与横向拉伸）
+					Composite{
+						Layout: HBox{MarginsZero: true},
+						Children: []Widget{
+							CheckBox{
+								AssignTo: &chkData,
+								Text:     "同时删除 data 文件夹（连接码与日志）",
+								Checked:  true,
+							},
+							HSpacer{},
+						},
+					},
+					Composite{
+						Layout: HBox{MarginsZero: true},
+						Children: []Widget{
+							Label{Text: "不勾选则保留连接码，重新安装后不用再次导入。"},
+							HSpacer{},
+						},
+					},
+				},
+			},
+			GroupBox{
+				Title:  "卸载过程",
+				Layout: VBox{Margins: Margins{Left: 10, Top: 6, Right: 10, Bottom: 10}},
+				Children: []Widget{
+					TextEdit{
+						AssignTo: &txtLog,
+						ReadOnly: true,
+						VScroll:  true,
+						MinSize:  Size{Height: 100},
+						Font:     Font{Family: "Consolas", PointSize: 8},
+					},
+				},
+			},
+			Composite{
+				Layout: HBox{MarginsZero: true},
+				Children: []Widget{
+					HSpacer{},
+					PushButton{
+						AssignTo:  &btn,
+						Text:      "开始卸载",
+						MinSize:   Size{Width: 110},
+						MaxSize:   Size{Width: 110},
+						OnClicked: doUninstall,
+					},
+				},
 			},
 		},
 	}).Create(); err != nil {

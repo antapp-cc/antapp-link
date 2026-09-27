@@ -36,6 +36,20 @@ func run() int {
 		return 0
 	}
 
+	// 单实例闸门。桌面快捷方式点几次就起几个进程的话，托盘上会堆一排图标；
+	// 更要紧的是几个实例会同时去抢同一块虚拟网卡和同一批路由，把网络搅乱。
+	// 已经有实例在跑就把它叫到前台，本进程安静退出。
+	release, first, err := client.SingleInstance()
+	if err != nil {
+		client.ShowMessage("AntApp Link", "单实例检查失败："+err.Error())
+		return 1
+	}
+	if !first {
+		client.ActivateExisting()
+		return 0
+	}
+	defer release()
+
 	dataDir := *dataArg
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		client.ShowMessage("AntApp Link", "创建数据目录失败："+err.Error())
