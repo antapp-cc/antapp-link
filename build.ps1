@@ -44,20 +44,37 @@ function Build-Target {
 Build-Target -Goos 'linux' -Goarch 'amd64' -Out 'antapp-linkd' -Pkg './cmd/antapp-linkd' `
     -Ldflags '-s -w'
 
-# 客户端：GUI 子系统，双击不弹控制台黑框；出错时走系统对话框提示
+# 客户端：GUI 子系统，双击不弹控制台黑框；wintun.dll 已内嵌
 Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-link.exe' -Pkg './cmd/antapp-link' `
     -Ldflags "-s -w -H windowsgui -X github.com/antapp-cc/antapp-link/internal/client.Version=$Version"
+
+# 安装程序：和客户端 exe 必须放在同一个目录里分发
+Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-setup.exe' -Pkg './cmd/antapp-setup' `
+    -Ldflags "-s -w -H windowsgui -X github.com/antapp-cc/antapp-link/internal/setup.Version=$Version"
 
 # 合规要求：Wintun 的预编译二进制许可要求随包附上原文
 Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') $distDir -Force
 
+# 打成安装包：setup.exe 会去同目录找 antapp-link.exe
+$pkgDir = Join-Path $distDir 'AntAppLink-Setup'
+if (Test-Path $pkgDir) { Remove-Item $pkgDir -Recurse -Force }
+New-Item -ItemType Directory -Force $pkgDir | Out-Null
+foreach ($f in @('antapp-setup.exe', 'antapp-link.exe', 'THIRD-PARTY-NOTICES.md')) {
+    Copy-Item (Join-Path $distDir $f) $pkgDir -Force
+}
+$zip = Join-Path $distDir "AntAppLink-Setup-$Version.zip"
+Compress-Archive -Path (Join-Path $pkgDir '*') -DestinationPath $zip -Force
+
 Write-Host ''
 Write-Host '== 产物 ==' -ForegroundColor Green
 Get-ChildItem $distDir -File | Sort-Object Name | ForEach-Object {
-    '  {0,-24} {1,12:N0} 字节' -f $_.Name, $_.Length
+    '  {0,-32} {1,12:N0} 字节' -f $_.Name, $_.Length
 }
-
 Write-Host ''
-Write-Host '提示：客户端 exe 自带 wintun.dll（首次运行会释放到 exe 同目录），' -ForegroundColor DarkGray
-Write-Host '      节点机不需要安装任何驱动包或额外程序。' -ForegroundColor DarkGray
-Write-Host '      签名请用仓库根目录之外的签名流程，签名后再分发。' -ForegroundColor DarkGray
+Write-Host '== 安装包 ==' -ForegroundColor Green
+Get-ChildItem $pkgDir -File | Sort-Object Name | ForEach-Object {
+    '  AntAppLink-Setup/{0,-22} {1,12:N0} 字节' -f $_.Name, $_.Length
+}
+Write-Host ''
+Write-Host '分发：把 AntAppLink-Setup 整个目录（或那个 zip）给用户，运行 antapp-setup.exe。' -ForegroundColor DarkGray
+Write-Host '节点机不需要装任何驱动或额外程序，客户端 exe 自带 wintun.dll。' -ForegroundColor DarkGray

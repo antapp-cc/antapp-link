@@ -1,7 +1,6 @@
 // Command antapp-link 是 AntApp Link 的 Windows 客户端。
 //
-// 正常使用不需要命令行：导入连接码之后双击即可，之后都在托盘里操作。
-// 带参数运行时可以指定连接码，或走前台 / 联调模式方便排查。
+// 默认启动主窗口 + 托盘图标。带参数运行时可以指定连接码，或走前台 / 联调模式方便排查。
 package main
 
 import (
@@ -11,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/antapp-cc/antapp-link/internal/client"
+	"github.com/antapp-cc/antapp-link/internal/pki"
 )
 
 func main() {
@@ -21,7 +21,7 @@ func run() int {
 	var (
 		codeArg  = flag.String("c", "", "连接码：单行 antapp:// 或 json/txt 文件路径")
 		dataArg  = flag.String("data", defaultDataDir(), "数据目录")
-		once     = flag.Bool("once", false, "前台连接，不显示托盘（Ctrl+C 退出）")
+		once     = flag.Bool("once", false, "前台连接，不显示界面（Ctrl+C 退出）")
 		noNetCfg = flag.Bool("no-netcfg", false, "只建隧道、只配虚拟网卡，不改路由与 DNS（联调端口转发用）")
 		showVer  = flag.Bool("version", false, "显示版本")
 	)
@@ -38,7 +38,7 @@ func run() int {
 		return 1
 	}
 
-	logger, closeLog, err := client.NewFileLogger(dataDir)
+	logger, logs, closeLog, err := client.NewFileLogger(dataDir)
 	if err != nil {
 		client.ShowMessage("AntApp Link", "初始化日志失败："+err.Error())
 		return 1
@@ -60,14 +60,12 @@ func run() int {
 		logger.Info("已导入连接码", "server", inv.Server, "name", inv.Name)
 	}
 
+	// 没有连接码不是错误：界面照样起来，引导用户在界面上导入。
+	// 装完之后直接弹个框退出，用户等于看不到这个软件。
 	inv, err := client.LoadSavedInvite(dataDir)
 	if err != nil {
-		logger.Error("没有可用的连接码", "err", err)
-		client.ShowMessage("AntApp Link",
-			"还没有导入连接码。\n\n"+
-				"做法：复制整行 antapp:// 连接码，然后在托盘菜单里选「从剪贴板导入连接码」。\n"+
-				"也可以命令行导入：antapp-link.exe -c \"antapp://...\"")
-		return 1
+		logger.Warn("还没有连接码，等用户在界面上导入", "err", err)
+		inv = pki.Invite{}
 	}
 
 	var opts []client.Option
@@ -96,13 +94,15 @@ func run() int {
 		return 0
 	}
 
-	if err := app.Connect(); err != nil {
-		// 连不上也要留在托盘里，用户可以改连接码或看日志
-		logger.Warn("自动连接失败，托盘仍可用", "err", err)
+	if app.Configured() {
+		if err := app.Connect(); err != nil {
+			// 连不上也要把界面显示出来，用户可以改连接码或看日志
+			logger.Warn("自动连接失败，界面仍可用", "err", err)
+		}
 	}
-	if err := app.RunTray(); err != nil {
-		logger.Error("托盘启动失败", "err", err)
-		client.ShowMessage("AntApp Link", "托盘启动失败："+err.Error())
+	if err := client.RunUI(app, logs, dataDir); err != nil {
+		logger.Error("界面启动失败", "err", err)
+		client.ShowMessage("AntApp Link", "界面启动失败："+err.Error())
 		return 1
 	}
 	return 0

@@ -1,0 +1,233 @@
+// Command antapp-setup 是 AntApp Link 的安装 / 卸载程序。
+//
+// 安装：把 antapp-link.exe 释放到安装目录、建快捷方式、登记到「应用和功能」。
+// 卸载：同一个程序加 --uninstall（「应用和功能」里的卸载按钮就是这么调它的）。
+package main
+
+import (
+	_ "embed"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/lxn/walk"
+	. "github.com/lxn/walk/declarative"
+
+	"github.com/antapp-cc/antapp-link/internal/setup"
+)
+
+//go:embed assets/antapp.ico
+var iconData []byte
+
+func main() {
+	uninstall := flag.Bool("uninstall", false, "卸载")
+	quiet := flag.Bool("quiet", false, "静默模式，不显示界面")
+	dirFlag := flag.String("dir", "", "安装目录")
+	flag.Parse()
+
+	if *quiet {
+		os.Exit(runQuiet(*uninstall, *dirFlag))
+	}
+	os.Exit(runUI(*uninstall, *dirFlag))
+}
+
+func runQuiet(uninstall bool, dirFlag string) int {
+	if uninstall {
+		opts, ok := setup.Installed()
+		if !ok {
+			fmt.Fprintln(os.Stderr, "没有找到已安装的 AntApp Link")
+			return 1
+		}
+		if err := setup.Uninstall(opts, func(string) {}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	}
+
+	opts := setup.DefaultOptions()
+	if dirFlag != "" {
+		opts.InstallDir = dirFlag
+	}
+	if err := setup.Install(opts, func(s string) { fmt.Println(s) }); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func runUI(uninstall bool, dirFlag string) int {
+	icon, err := loadIcon()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if uninstall {
+		return runUninstallUI(icon)
+	}
+	return runInstallUI(icon, dirFlag)
+}
+
+func loadIcon() (*walk.Icon, error) {
+	path := filepath.Join(os.TempDir(), "antapp-setup.ico")
+	if err := os.WriteFile(path, iconData, 0o644); err != nil {
+		return nil, err
+	}
+	return walk.NewIconFromFile(path)
+}
+
+func runInstallUI(icon *walk.Icon, dirFlag string) int {
+	opts := setup.DefaultOptions()
+	if dirFlag != "" {
+		opts.InstallDir = dirFlag
+	}
+
+	var mw *walk.MainWindow
+	var edDir *walk.LineEdit
+	var chkDesktop, chkStartMenu, chkLaunch *walk.CheckBox
+	var btn *walk.PushButton
+	var txtLog *walk.TextEdit
+
+	logLine := func(s string) {
+		mw.Synchronize(func() { txtLog.AppendText(s + "\r\n") })
+	}
+
+	browse := func() {
+		dlg := new(walk.FileDialog)
+		dlg.Title = "选择安装目录"
+		dlg.InitialDirPath = edDir.Text()
+		if ok, err := dlg.ShowBrowseFolder(mw); err != nil || !ok {
+			return
+		}
+		edDir.SetText(dlg.FilePath)
+	}
+
+	doInstall := func() {
+		btn.SetEnabled(false)
+		go func() {
+			o := opts
+			o.InstallDir = edDir.Text()
+			o.Desktop = chkDesktop.Checked()
+			o.StartMenu = chkStartMenu.Checked()
+			o.Launch = chkLaunch.Checked()
+
+			err := setup.Install(o, logLine)
+			mw.Synchronize(func() {
+				if err != nil {
+					txtLog.AppendText("\r\n安装失败：" + err.Error() + "\r\n")
+					btn.SetEnabled(true)
+					btn.SetText("重试")
+					return
+				}
+				walk.MsgBox(mw, "安装完成",
+					"AntApp Link 已安装到：\n"+o.InstallDir+"\n\n"+
+						"首次使用请在界面上导入连接码。",
+					walk.MsgBoxIconInformation)
+				mw.Close()
+			})
+		}()
+	}
+
+	if err := (MainWindow{
+		AssignTo: &mw,
+		Title:    "安装 AntApp Link",
+		Icon:     icon,
+		Size:     Size{Width: 580, Height: 460},
+		MinSize:  Size{Width: 500, Height: 400},
+		Layout:   VBox{Margins: Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
+		Children: []Widget{
+			Label{Text: "AntApp Link —— Pi 节点虚拟专线"},
+			Composite{
+				Layout: HBox{Spacing: 6},
+				Children: []Widget{
+					Label{Text: "安装目录"},
+					LineEdit{AssignTo: &edDir, Text: opts.InstallDir},
+					PushButton{Text: "浏览…", OnClicked: browse},
+				},
+			},
+			CheckBox{AssignTo: &chkDesktop, Text: "创建桌面快捷方式", Checked: true},
+			CheckBox{AssignTo: &chkStartMenu, Text: "创建开始菜单快捷方式", Checked: true},
+			CheckBox{AssignTo: &chkLaunch, Text: "安装完成后立即启动", Checked: true},
+			PushButton{AssignTo: &btn, Text: "开始安装", MinSize: Size{Width: 120}, OnClicked: doInstall},
+			Label{Text: "安装过程"},
+			TextEdit{
+				AssignTo: &txtLog,
+				ReadOnly: true,
+				VScroll:  true,
+				Font:     Font{Family: "Consolas", PointSize: 8},
+			},
+		},
+	}).Create(); err != nil {
+		fmt.Fprintln(os.Stderr, "创建窗口失败:", err)
+		return 1
+	}
+	mw.Run()
+	return 0
+}
+
+func runUninstallUI(icon *walk.Icon) int {
+	opts, ok := setup.Installed()
+	if !ok {
+		walk.MsgBox(nil, "卸载 AntApp Link",
+			"没有找到已安装的 AntApp Link。\n\n如果确实装过，可能安装信息已被清理，可以直接手动删除安装目录。",
+			walk.MsgBoxIconWarning)
+		return 1
+	}
+	opts.DataDir = setup.DefaultDataDir()
+
+	var mw *walk.MainWindow
+	var chkData *walk.CheckBox
+	var btn *walk.PushButton
+	var txtLog *walk.TextEdit
+
+	logLine := func(s string) {
+		mw.Synchronize(func() { txtLog.AppendText(s + "\r\n") })
+	}
+
+	doUninstall := func() {
+		btn.SetEnabled(false)
+		go func() {
+			o := opts
+			o.RemoveData = chkData.Checked()
+
+			err := setup.Uninstall(o, logLine)
+			mw.Synchronize(func() {
+				if err != nil {
+					txtLog.AppendText("\r\n卸载失败：" + err.Error() + "\r\n")
+					btn.SetEnabled(true)
+					return
+				}
+				walk.MsgBox(mw, "卸载完成", "AntApp Link 已卸载。", walk.MsgBoxIconInformation)
+				mw.Close()
+			})
+		}()
+	}
+
+	if err := (MainWindow{
+		AssignTo: &mw,
+		Title:    "卸载 AntApp Link",
+		Icon:     icon,
+		Size:     Size{Width: 560, Height: 420},
+		MinSize:  Size{Width: 480, Height: 360},
+		Layout:   VBox{Margins: Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
+		Children: []Widget{
+			Label{Text: "将从下面这个目录删除程序文件："},
+			Label{Text: opts.InstallDir},
+			CheckBox{AssignTo: &chkData, Text: "同时删除数据目录（连接码与日志；删了需要重新导入连接码）"},
+			PushButton{AssignTo: &btn, Text: "开始卸载", MinSize: Size{Width: 120}, OnClicked: doUninstall},
+			Label{Text: "卸载过程"},
+			TextEdit{
+				AssignTo: &txtLog,
+				ReadOnly: true,
+				VScroll:  true,
+				Font:     Font{Family: "Consolas", PointSize: 8},
+			},
+		},
+	}).Create(); err != nil {
+		fmt.Fprintln(os.Stderr, "创建窗口失败:", err)
+		return 1
+	}
+	mw.Run()
+	return 0
+}

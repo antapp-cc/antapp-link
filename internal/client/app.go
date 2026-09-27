@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -58,6 +60,18 @@ func NewApp(inv pki.Invite, dataDir string, logger *slog.Logger, opts ...Option)
 
 func (a *App) DataDir() string { return a.dataDir }
 
+// Configured 表示是否已经导入过连接码。
+//
+// 没导入时界面照样要起来并引导用户去导入 —— 而不是程序一启动就弹个「没有连接码」
+// 然后退出，那样用户装完根本看不到界面。
+func (a *App) Configured() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.configuredLocked()
+}
+
+func (a *App) configuredLocked() bool { return a.inv.Server != "" }
+
 // HealIfNeeded 在启动时还原上次残留的网络配置。
 //
 // state.json 存在就代表上次没干净退出。留着坏路由和坏 DNS 会让用户整机断网，
@@ -99,6 +113,9 @@ func (a *App) Connect() error {
 	if a.running {
 		return nil
 	}
+	if !a.configuredLocked() {
+		return errors.New("还没有连接码，请先在界面上点「从剪贴板导入连接码」")
+	}
 
 	cfg := BuildNetConfig(a.inv)
 	dev, err := OpenDevice()
@@ -114,6 +131,18 @@ func (a *App) Connect() error {
 			return fmt.Errorf("配置隧道网卡失败: %w", err)
 		}
 		return a.startTunnelLocked(cfg, dev)
+	}
+
+	// 先确认服务端真的连得上，再动用户的网络。
+	// 顺序反过来的话，服务端不可达时用户要白白经历「网络被接管 → 自检失败 → 再还原」
+	// 这十几秒的断网 —— 这种体验不能有第二次。
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 12*time.Second)
+	probeErr := a.probeServer(probeCtx)
+	cancelProbe()
+	if probeErr != nil {
+		_ = dev.Close()
+		a.lastError = "连接服务端失败：" + probeErr.Error()
+		return fmt.Errorf("连接服务端失败，未改动网络: %w", probeErr)
 	}
 
 	snap, err := Capture(cfg.ServerIP)
@@ -196,6 +225,30 @@ func (a *App) watchHealth(ctx context.Context) {
 	if derr := a.Disconnect(); derr != nil {
 		a.log.Error("自检失败后还原网络也失败，状态文件已保留，下次启动会重试", "err", derr)
 	}
+}
+
+// probeServer 只做一次 TLS 握手，用来确认「服务端可达且证书可信」。
+//
+// 它存在的意义是保住顺序：连不上服务端时，一点都不要碰用户的网络。
+func (a *App) probeServer(ctx context.Context) error {
+	tlsCfg, err := pki.ClientTLSConfig(a.inv)
+	if err != nil {
+		return err
+	}
+	d := net.Dialer{Timeout: 8 * time.Second}
+	raw, err := d.DialContext(ctx, "tcp", a.inv.Server)
+	if err != nil {
+		return fmt.Errorf("连接 %s: %w", a.inv.Server, err)
+	}
+	defer raw.Close()
+
+	conn := tls.Client(raw, tlsCfg)
+	hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := conn.HandshakeContext(hctx); err != nil {
+		return fmt.Errorf("TLS 握手失败（证书或网络问题）: %w", err)
+	}
+	return nil
 }
 
 // healthCheck 探两件事：隧道内通不通，以及下发的 DNS 能不能真的解析。

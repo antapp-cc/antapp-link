@@ -29,6 +29,39 @@ bash install.sh
 
 详细步骤见 [deploy/README.md](deploy/README.md)。
 
+## Windows 客户端
+
+### 安装
+
+把 `AntAppLink-Setup` 目录（或那个 zip）给用户，运行 `antapp-setup.exe`：
+
+- 释放到 `C:\Program Files\AntApp Link\`
+- 建桌面与开始菜单快捷方式（可勾掉）
+- 登记到「应用和功能」，从那里卸载，或用 `antapp-setup.exe --uninstall`
+- 装完自动启动；**首次使用会引导导入连接码**
+
+安装包是自写的（本机没有 Inno Setup / NSIS），所以整个流程没有外部依赖。
+
+### 界面与托盘
+
+主窗口显示连接状态、隧道地址、延迟、上下行流量和实时日志，按钮有「连接 / 断开」「从剪贴板导入连接码」「打开数据目录」，另有开机自启开关。
+
+关窗口只是**收进托盘**（否则隧道会跟着断）；从托盘菜单退出才会断开并还原网络。托盘图标会随状态变化提示文字（未配置 / 未连接 / 已连接 10.10.0.2 · 38 ms），双击回到主窗口。
+
+导入连接码走剪贴板：界面里做不了「粘贴一大段文本」的体验，而连接码本来就是从聊天窗口复制来的。
+
+### 资源与 manifest
+
+`cmd/*/rsrc_windows_amd64.syso` 里嵌了 manifest 和图标，**已经提交进仓库，平时构建不需要额外工具**。
+
+改动 `app.manifest` 或换图标之后，跑一次：
+
+```powershell
+pwsh -File tools/mkres.ps1     # 会用 go install 装 rsrc
+```
+
+manifest 干三件事：请求 Common-Controls v6（walk 的图标加载依赖它，不然启动即失败）、声明高 DPI、声明 `requireAdministrator`（建虚拟网卡和改路由都要提权，让 UAC 在双击时就弹而不是点「连接」才失败）。
+
 ## 项目结构
 
 ```
