@@ -21,6 +21,9 @@ var appIcon []byte
 
 // UI 是主窗口加托盘。托盘用 walk 自带的 NotifyIcon，跟主窗口共用同一个消息循环 ——
 // 换成独立的托盘库就得处理两个消息循环抢主线程的问题。
+//
+// 窗口布局照用户已经在 Pi 节点机上用惯的那个 OpenVPN 客户端来：
+// 状态行 → 大日志区 → 分配 IP 与版本 → 三个按钮。
 type UI struct {
 	app  *App
 	logs *LogBuffer
@@ -29,11 +32,13 @@ type UI struct {
 	mw *walk.MainWindow
 	ni *walk.NotifyIcon
 
-	lblState  *walk.Label
-	lblDetail *walk.Label
-	btnToggle *walk.PushButton
-	txtLog    *walk.TextEdit
-	chkAuto   *walk.CheckBox
+	lblState   *walk.Label
+	lblIP      *walk.Label
+	lblVersion *walk.Label
+	txtLog     *walk.TextEdit
+	btnPrimary *walk.PushButton
+	btnReconn  *walk.PushButton
+	btnHide    *walk.PushButton
 
 	quitting    bool
 	lastLogText string
@@ -67,35 +72,37 @@ func (u *UI) build() error {
 		AssignTo: &u.mw,
 		Title:    "AntApp Link",
 		Icon:     u.icon,
-		MinSize:  Size{Width: 520, Height: 400},
-		Size:     Size{Width: 620, Height: 500},
-		Layout:   VBox{Margins: Margins{Left: 12, Top: 12, Right: 12, Bottom: 12}, Spacing: 10},
+		MinSize:  Size{Width: 520, Height: 360},
+		Size:     Size{Width: 640, Height: 460},
+		Layout:   VBox{Margins: Margins{Left: 10, Top: 10, Right: 10, Bottom: 10}, Spacing: 8},
 		Children: []Widget{
-			Composite{
-				Layout: Grid{Columns: 2, Spacing: 8},
-				Children: []Widget{
-					Label{Text: "状态"},
-					Label{AssignTo: &u.lblState, Text: "未配置"},
-					Label{Text: "明细"},
-					Label{AssignTo: &u.lblDetail, Text: "—"},
-				},
+			Label{
+				AssignTo: &u.lblState,
+				Text:     "当前状态: 未连接",
+				Font:     Font{PointSize: 10},
 			},
-			Composite{
-				Layout: HBox{Spacing: 8},
-				Children: []Widget{
-					PushButton{AssignTo: &u.btnToggle, Text: "连接", MinSize: Size{Width: 96}, OnClicked: u.onToggle},
-					PushButton{Text: "从剪贴板导入连接码", OnClicked: u.onImport},
-					PushButton{Text: "打开数据目录", OnClicked: u.onOpenDataDir},
-					HSpacer{},
-					CheckBox{AssignTo: &u.chkAuto, Text: "开机自启", OnCheckedChanged: u.onAutostart},
-				},
-			},
-			Label{Text: "运行日志"},
 			TextEdit{
 				AssignTo: &u.txtLog,
 				ReadOnly: true,
 				VScroll:  true,
-				Font:     Font{Family: "Consolas", PointSize: 8},
+				Font:     Font{Family: "Consolas", PointSize: 9},
+			},
+			Composite{
+				Layout: HBox{MarginsZero: true},
+				Children: []Widget{
+					Label{AssignTo: &u.lblIP, Text: "分配 IP: —"},
+					HSpacer{},
+					Label{AssignTo: &u.lblVersion, Text: fmt.Sprintf("AntApp Link %s", Version)},
+				},
+			},
+			Composite{
+				Layout: HBox{MarginsZero: true, Spacing: 8},
+				Children: []Widget{
+					PushButton{AssignTo: &u.btnPrimary, Text: "连接", MinSize: Size{Width: 110}, OnClicked: u.onPrimary},
+					PushButton{AssignTo: &u.btnReconn, Text: "重新连接", MinSize: Size{Width: 110}, OnClicked: u.onReconnect},
+					HSpacer{},
+					PushButton{AssignTo: &u.btnHide, Text: "隐藏", MinSize: Size{Width: 110}, OnClicked: u.onHide},
+				},
 			},
 		},
 	}).Create(); err != nil {
@@ -110,7 +117,6 @@ func (u *UI) build() error {
 		}
 	})
 
-	u.chkAuto.SetChecked(AutostartEnabled())
 	if err := u.buildTray(); err != nil {
 		return err
 	}
@@ -130,21 +136,42 @@ func (u *UI) buildTray() error {
 		return err
 	}
 
-	onShow := func() {
-		u.mw.Show()
-		u.mw.Activate()
-	}
-
 	mShow := walk.NewAction()
 	_ = mShow.SetText("显示主窗口")
-	mShow.Triggered().Attach(onShow)
+	mShow.Triggered().Attach(u.showWindow)
 	ni.ContextMenu().Actions().Add(mShow)
 	ni.ContextMenu().Actions().Add(walk.NewSeparatorAction())
 
 	mToggle := walk.NewAction()
 	_ = mToggle.SetText("连接 / 断开")
-	mToggle.Triggered().Attach(u.onToggle)
+	mToggle.Triggered().Attach(u.onPrimary)
 	ni.ContextMenu().Actions().Add(mToggle)
+
+	mImport := walk.NewAction()
+	_ = mImport.SetText("从剪贴板导入连接码")
+	mImport.Triggered().Attach(u.onImport)
+	ni.ContextMenu().Actions().Add(mImport)
+
+	mOpenDir := walk.NewAction()
+	_ = mOpenDir.SetText("打开数据目录")
+	mOpenDir.Triggered().Attach(u.onOpenDataDir)
+	ni.ContextMenu().Actions().Add(mOpenDir)
+
+	mAuto := walk.NewAction()
+	_ = mAuto.SetText("开机自启")
+	_ = mAuto.SetChecked(AutostartEnabled())
+	mAuto.Triggered().Attach(func() {
+		go func() {
+			if mAuto.Checked() {
+				_ = DisableAutostart()
+				mAuto.SetChecked(false)
+			} else {
+				_ = EnableAutostart()
+				mAuto.SetChecked(true)
+			}
+		}()
+	})
+	ni.ContextMenu().Actions().Add(mAuto)
 	ni.ContextMenu().Actions().Add(walk.NewSeparatorAction())
 
 	mQuit := walk.NewAction()
@@ -155,11 +182,16 @@ func (u *UI) buildTray() error {
 	// 双击托盘图标回到主窗口
 	ni.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
 		if button == walk.LeftButton {
-			onShow()
+			u.showWindow()
 		}
 	})
 
 	return ni.SetVisible(true)
+}
+
+func (u *UI) showWindow() {
+	u.mw.Show()
+	u.mw.Activate()
 }
 
 func (u *UI) refreshLoop() {
@@ -179,42 +211,52 @@ func (u *UI) refreshLoop() {
 func (u *UI) refresh() {
 	st := u.app.Status()
 	configured := u.app.Configured()
-	u.btnToggle.SetEnabled(configured)
 
+	var state string
 	switch {
 	case !configured:
-		u.lblState.SetText("未配置连接码")
-		u.lblState.SetTextColor(walk.RGB(0x88, 0x44, 0x00))
-		u.lblDetail.SetText("复制整行 antapp:// 连接码，再点「从剪贴板导入连接码」")
-		u.btnToggle.SetText("连接")
+		state = "当前状态: 未配置连接码"
 	case !st.Running:
-		u.lblState.SetText("未连接")
-		u.lblState.SetTextColor(walk.RGB(0x88, 0x44, 0x00))
-		u.lblDetail.SetText("服务端 " + st.Server)
-		u.btnToggle.SetText("连接")
+		state = "当前状态: 未连接"
 	case st.Online:
-		u.lblState.SetText("已连接")
-		u.lblState.SetTextColor(walk.RGB(0x0A, 0x7D, 0x1E))
-		u.lblDetail.SetText(fmt.Sprintf("隧道 %s · %s · 延迟 %d ms · ↑%.0f KB ↓%.0f KB",
-			st.TunnelIP, st.Server, st.RTT.Milliseconds(),
-			float64(st.TxBytes)/1024, float64(st.RxBytes)/1024))
-		u.btnToggle.SetText("断开")
+		state = "当前状态: 已连接"
 	default:
-		u.lblState.SetText("连接中…")
-		u.lblState.SetTextColor(walk.RGB(0x88, 0x44, 0x00))
-		u.lblDetail.SetText("服务端 " + st.Server)
-		u.btnToggle.SetText("断开")
+		state = "当前状态: 连接中…"
+	}
+	if configured && st.Online {
+		state += fmt.Sprintf("（延迟 %d ms）", st.RTT.Milliseconds())
+	}
+	u.lblState.SetText(state)
+
+	// 上次的错误比「服务端 x」更有用，就摆在状态行下面
+	if configured && !st.Online && st.LastError != "" {
+		u.lblIP.SetText("上次错误: " + truncateRunes(st.LastError, 70))
+	} else if st.Online {
+		u.lblIP.SetText(fmt.Sprintf("分配 IP: %s", st.TunnelIP))
+	} else if configured {
+		u.lblIP.SetText("服务端: " + st.Server)
+	} else {
+		u.lblIP.SetText("分配 IP: —")
 	}
 
-	// 上次的错误比「服务端 x」更有用，摆在明细行上
-	if configured && st.LastError != "" && !st.Online {
-		u.lblDetail.SetText(st.LastError)
+	// 按钮文字跟着状态走：没连接码时主按钮就是导入入口
+	switch {
+	case !configured:
+		u.btnPrimary.SetText("导入连接码")
+		u.btnPrimary.SetEnabled(true)
+	case st.Running:
+		u.btnPrimary.SetText("断开连接")
+		u.btnPrimary.SetEnabled(true)
+	default:
+		u.btnPrimary.SetText("连接")
+		u.btnPrimary.SetEnabled(true)
 	}
+	u.btnReconn.SetEnabled(configured && st.Running)
 
 	if u.ni != nil {
 		switch {
 		case !configured:
-			u.ni.SetToolTip("AntApp Link · 未配置")
+			u.ni.SetToolTip("AntApp Link · 未配置连接码")
 		case !st.Running:
 			u.ni.SetToolTip("AntApp Link · 未连接")
 		case st.Online:
@@ -225,7 +267,7 @@ func (u *UI) refresh() {
 	}
 
 	// 日志只在内容变了才重设，否则每秒都会把滚动位置弹回顶部
-	text := strings.Join(u.logs.Tail(200), "\r\n")
+	text := strings.Join(u.logs.Tail(500), "\r\n")
 	if text != u.lastLogText {
 		u.lastLogText = text
 		u.txtLog.SetText(text)
@@ -236,7 +278,11 @@ func (u *UI) refresh() {
 }
 
 // Connect/Disconnect 会做网络操作（探测、改路由、跑 PowerShell），不能卡住界面线程。
-func (u *UI) onToggle() {
+func (u *UI) onPrimary() {
+	if !u.app.Configured() {
+		u.onImport()
+		return
+	}
 	go func() {
 		if u.app.Status().Running {
 			_ = u.app.Disconnect()
@@ -247,9 +293,19 @@ func (u *UI) onToggle() {
 	}()
 }
 
+func (u *UI) onReconnect() {
+	go func() {
+		_ = u.app.Disconnect()
+		_ = u.app.Connect()
+		u.mw.Synchronize(u.refresh)
+	}()
+}
+
+func (u *UI) onHide() { u.mw.Hide() }
+
 // onImport 从剪贴板取连接码。
 //
-// 界面上没法做「粘贴一大段文本」的输入体验（那需要多行对话框），而连接码本来就是
+// 界面上做不了「粘贴一大段文本」的输入体验（那需要多行对话框），而连接码本来就是
 // 从聊天窗口复制来的，直接读剪贴板是最顺手也最不容易出错的方式。
 func (u *UI) onImport() {
 	go func() {
@@ -289,16 +345,6 @@ func (u *UI) onOpenDataDir() {
 	}()
 }
 
-func (u *UI) onAutostart() {
-	go func() {
-		if u.chkAuto.Checked() {
-			_ = EnableAutostart()
-		} else {
-			_ = DisableAutostart()
-		}
-	}()
-}
-
 func (u *UI) quit() {
 	if u.quitting {
 		return
@@ -320,6 +366,14 @@ func (u *UI) alert(title, msg string) {
 
 func openInExplorer(path string) error {
 	return runCommand(Command{"explorer", []string{path}})
+}
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // ensureIconFile 把内嵌的图标释放到数据目录，供 walk 按路径加载。

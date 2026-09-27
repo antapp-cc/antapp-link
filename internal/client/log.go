@@ -1,7 +1,7 @@
 package client
 
 import (
-	"io"
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -89,13 +89,12 @@ func (l *rotatingLog) Path() string { return l.path }
 
 // LogBuffer 保留最近若干行日志供界面显示。
 //
-// 界面不去 tail 日志文件：文件按大小轮转，读它还要处理并发和轮转；
+// 界面不去 tail 日志文件：文件是按大小轮转的，读它还要处理并发和轮转；
 // 而在写日志时顺手留一份几乎不花成本。
 type LogBuffer struct {
-	mu      sync.Mutex
-	lines   []string
-	partial string
-	max     int
+	mu    sync.Mutex
+	lines []string
+	max   int
 }
 
 func NewLogBuffer(max int) *LogBuffer {
@@ -105,25 +104,15 @@ func NewLogBuffer(max int) *LogBuffer {
 	return &LogBuffer{max: max}
 }
 
-func (b *LogBuffer) Write(p []byte) (int, error) {
+func (b *LogBuffer) addLine(line string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	b.partial += string(p)
-	for {
-		i := strings.IndexByte(b.partial, '\n')
-		if i < 0 {
-			break
-		}
-		b.lines = append(b.lines, b.partial[:i])
-		b.partial = b.partial[i+1:]
-	}
+	b.lines = append(b.lines, line)
 	if len(b.lines) > b.max {
 		keep := make([]string, b.max)
 		copy(keep, b.lines[len(b.lines)-b.max:])
 		b.lines = keep
 	}
-	return len(p), nil
 }
 
 // Tail 返回最后 n 行。n<=0 表示全部。
@@ -138,16 +127,71 @@ func (b *LogBuffer) Tail(n int) []string {
 	return out
 }
 
-// NewFileLogger 建一个同时写文件与内存缓冲的 logger。
+// teeHandler 让同一份日志有两个去处：文件里保留结构化原文（排查时字段好搜），
+// 界面上给一行人类读得懂的短格式（时间 + 级别 + 消息 + 字段）。
 //
-// 写文件是因为托盘程序没有控制台；留缓冲是因为界面要能实时显示，
-// 而让界面去读一个正在轮转的文件既不安全也不及时。
+// 直接在界面里显示 slog 的原文也行，但那样满屏都是 time=/level=/msg=，
+// 跟用户已经习惯的 OpenVPN 客户端日志观感差得远。
+type teeHandler struct {
+	file slog.Handler
+	buf  *LogBuffer
+}
+
+func (h *teeHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.file.Enabled(ctx, level)
+}
+
+func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
+	if err := h.file.Handle(ctx, r); err != nil {
+		return err
+	}
+
+	var b strings.Builder
+	b.WriteString(r.Time.Format("01-02 15:04:05"))
+	b.WriteString("  ")
+	b.WriteString(levelTag(r.Level))
+	b.WriteString("  ")
+	b.WriteString(r.Message)
+	r.Attrs(func(a slog.Attr) bool {
+		b.WriteString("  ")
+		b.WriteString(a.Key)
+		b.WriteString("=")
+		b.WriteString(a.Value.String())
+		return true
+	})
+	h.buf.addLine(b.String())
+	return nil
+}
+
+// WithAttrs / WithGroup 在本项目里用不到（都是直接 slog.Info/Warn/Error），
+// 但 slog.Handler 要求实现，这里保持语义正确即可。
+func (h *teeHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &teeHandler{file: h.file.WithAttrs(attrs), buf: h.buf}
+}
+
+func (h *teeHandler) WithGroup(name string) slog.Handler {
+	return &teeHandler{file: h.file.WithGroup(name), buf: h.buf}
+}
+
+func levelTag(l slog.Level) string {
+	switch {
+	case l >= slog.LevelError:
+		return "错误"
+	case l >= slog.LevelWarn:
+		return "警告"
+	default:
+		return "信息"
+	}
+}
+
+// NewFileLogger 建一个同时写文件与界面缓冲的 logger。
 func NewFileLogger(dataDir string) (*slog.Logger, *LogBuffer, func(), error) {
 	rot, err := OpenLog(filepath.Join(dataDir, "logs", "client.log"), 2<<20)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	buf := NewLogBuffer(400)
-	handler := slog.NewTextHandler(io.MultiWriter(rot, buf), &slog.HandlerOptions{Level: slog.LevelInfo})
-	return slog.New(handler), buf, func() { _ = rot.Close() }, nil
+	buf := NewLogBuffer(500)
+	fileHandler := slog.NewTextHandler(rot, &slog.HandlerOptions{Level: slog.LevelInfo})
+	return slog.New(&teeHandler{file: fileHandler, buf: buf}), buf,
+		func() { _ = rot.Close() }, nil
 }
