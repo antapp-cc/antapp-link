@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -163,13 +164,53 @@ func captureDNS() ([]IfaceDNS, error) {
 	return out2, nil
 }
 
-func (s Snapshot) Apply(cfg NetConfig) error {
-	for _, c := range ApplyCommands(s, cfg) {
+// ConfigureAdapter 只把隧道网卡本身配起来（地址、MTU、接口跃点），不碰路由和 DNS。
+//
+// 单独暴露出来是给联调模式用的：只验端口转发时，也需要网卡上有 10.10.0.2，
+// 这样内核收到隧道里过来的包才认得出是给自己的；但路由和 DNS 一概不动，
+// 用户正在用的网络完全不受影响。
+func ConfigureAdapter(cfg NetConfig) error {
+	for _, c := range PrepareCommands(cfg) {
 		if err := runCommand(c); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// Apply 分两阶段接管网络：先把网卡配好，拿到它的接口索引，再挂路由。
+// 路由必须显式绑定接口索引，否则 Windows 可能把它挂到别的网卡上去
+// （实测会把 10.10.0.1 挂到 WLAN 上，流量于是根本没进隧道）。
+func (s Snapshot) Apply(cfg NetConfig) error {
+	if err := ConfigureAdapter(cfg); err != nil {
+		return err
+	}
+	ifIndex, err := interfaceIndex(cfg.AdapterName)
+	if err != nil {
+		return err
+	}
+	for _, c := range RouteCommands(s, cfg, ifIndex) {
+		if err := runCommand(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func interfaceIndex(name string) (int, error) {
+	script := fmt.Sprintf(
+		`$a = Get-NetAdapter -Name '%s' -ErrorAction SilentlyContinue | Select-Object -First 1; `+
+			`if ($a) { $a.ifIndex }`, name)
+	out, err := runPowerShell(script)
+	if err != nil {
+		return 0, fmt.Errorf("查询网卡 %s 的接口索引: %w", name, err)
+	}
+	text := strings.TrimSpace(out)
+	idx, err := strconv.Atoi(text)
+	if err != nil {
+		return 0, fmt.Errorf("网卡 %q 的接口索引不是数字（拿到 %q）—— 网卡可能没建起来", name, text)
+	}
+	return idx, nil
 }
 
 // Restore 尽力还原全部配置：某一条失败（典型是规则本就不存在）不该阻断后面的还原。

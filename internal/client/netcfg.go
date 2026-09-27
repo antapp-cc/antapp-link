@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,17 +98,14 @@ func MaskFromPrefix(prefix int) string {
 	return net.IP(net.CIDRMask(prefix, 32)).String()
 }
 
-// ApplyCommands 生成接管网络的命令，顺序敏感：
+// PrepareCommands 是接管网络的第一阶段：把隧道网卡本身配好。
 //
-//  1. 先配好隧道网卡自己的地址、MTU 与接口跃点
-//  2. 再加云服 IP 的 /32 绕行路由 —— 必须在改写默认路由之前。顺序反了，
-//     承载隧道的 TCP 连接自己会被送进隧道，形成自噬：表现为「连不上，但没有任何报错」
-//  3. 才轮到把默认路由指向隧道
-//  4. 最后改 DNS，否则解析会先跑到还被污染的本地 DNS 上
-func ApplyCommands(snap Snapshot, cfg NetConfig) []Command {
-	cmds := []Command{
-		// 只配地址不配网关：让默认路由完全由下面那条显式命令控制，
-		// 免得 netsh 顺手加的默认路由和我们的混在一起，还原时删不干净。
+// 之所以与路由分成两阶段：接管路由要显式绑定隧道网卡的接口索引，而索引只有在
+// 地址配好之后才拿得到。
+func PrepareCommands(cfg NetConfig) []Command {
+	return []Command{
+		// 只配地址、不配网关：默认路由的接管交给下面两条 /1 路由，
+		// 免得 netsh 顺手加的默认路由和我们的混在一起、还原时删不干净。
 		{"netsh", []string{"interface", "ipv4", "set", "address",
 			fmt.Sprintf("name=%s", cfg.AdapterName),
 			"source=static",
@@ -115,16 +113,43 @@ func ApplyCommands(snap Snapshot, cfg NetConfig) []Command {
 			fmt.Sprintf("mask=%s", MaskFromPrefix(cfg.Prefix))}},
 		{"netsh", []string{"interface", "ipv4", "set", "subinterface",
 			cfg.AdapterName, fmt.Sprintf("mtu=%d", cfg.MTU), "store=persistent"}},
+		// 接口跃点压到最低：Windows 按接口跃点挑 DNS 服务器，
+		// 不压低的话解析还可能落到本地网卡上。
 		{"netsh", []string{"interface", "ipv4", "set", "interface",
 			fmt.Sprintf("name=%s", cfg.AdapterName), "metric=1"}},
 	}
+}
+
+// TunnelRoutes 是两条把全球 IPv4 空间对半切的 /1 路由，也就是 OpenVPN `redirect-gateway def1`
+// 用的手法。**这是本方案能不能真正接管流量的关键**，原因见 RouteCommands 的注释。
+func TunnelRoutes(cfg NetConfig, ifIndex int) []Command {
+	via := []string{"metric", "1", "if", strconv.Itoa(ifIndex)}
+	return []Command{
+		{"route", append([]string{"add", "0.0.0.0", "mask", "128.0.0.0", cfg.Gateway}, via...)},
+		{"route", append([]string{"add", "128.0.0.0", "mask", "128.0.0.0", cfg.Gateway}, via...)},
+	}
+}
+
+// RouteCommands 是第二阶段：绕行路由、接管路由、DNS。
+//
+// 次序有两条硬约束：
+//
+//  1. 绕行路由必须排在接管路由之前。反了的话，承载隧道的 TCP 连接自己会被送进隧道，
+//     形成自噬 —— 表现是「连不上，但没有任何报错」。
+//  2. DNS 必须排在接管路由之后，否则解析会先落到还被污染的本地 DNS 上。
+//
+// 接管流量用两条 /1 路由而不是改写 0.0.0.0/0：默认路由的胜负还要跟跃点数较劲，
+// 而本地网卡那条往往是 metric 0，新加的抢不过它 —— 实测就是这样，流量根本没进隧道，
+// DNS 查询照旧从本地出去、解析回一个被污染的地址。而 /1 比 /0 更具体，按最长前缀
+// 匹配直接胜出，与跃点数无关。
+func RouteCommands(snap Snapshot, cfg NetConfig, ifIndex int) []Command {
+	var cmds []Command
 
 	if snap.ServerNextHop != "" && cfg.ServerIP != "" {
 		cmds = append(cmds, Command{"route", []string{
 			"add", cfg.ServerIP, "mask", "255.255.255.255", snap.ServerNextHop, "metric", "1"}})
 	}
-	cmds = append(cmds, Command{"route", []string{
-		"add", "0.0.0.0", "mask", "0.0.0.0", cfg.Gateway, "metric", "1"}})
+	cmds = append(cmds, TunnelRoutes(cfg, ifIndex)...)
 
 	for _, iface := range snap.Interfaces {
 		cmds = append(cmds, setDNSCommands(iface.Name, cfg.DNS)...)
@@ -132,7 +157,7 @@ func ApplyCommands(snap Snapshot, cfg NetConfig) []Command {
 	return append(cmds, Command{"ipconfig", []string{"/flushdns"}})
 }
 
-// RestoreCommands 与 ApplyCommands 逆序：先撤默认路由，再撤 /32 绕行。
+// RestoreCommands 与 RouteCommands 逆序：先撤接管路由，再撤绕行路由。
 // 反过来会留下一个「流量正被送进一条已经不通的隧道」的窗口。
 func RestoreCommands(snap Snapshot, cfg NetConfig) []Command {
 	var cmds []Command
@@ -141,8 +166,13 @@ func RestoreCommands(snap Snapshot, cfg NetConfig) []Command {
 		cmds = append(cmds, restoreDNSCommands(iface)...)
 	}
 
+	// 第一条是替旧版本擦屁股：早期版本改写的是 0.0.0.0/0，升级后不会再有新的一批，
+	// 但用户机器上可能还留着。它只匹配下一跳等于本隧道网关的规则，不会误伤用户的默认路由。
 	cmds = append(cmds,
-		Command{"route", []string{"delete", "0.0.0.0", "mask", "0.0.0.0", cfg.Gateway}})
+		Command{"route", []string{"delete", "0.0.0.0", "mask", "0.0.0.0", cfg.Gateway}},
+		Command{"route", []string{"delete", "0.0.0.0", "mask", "128.0.0.0", cfg.Gateway}},
+		Command{"route", []string{"delete", "128.0.0.0", "mask", "128.0.0.0", cfg.Gateway}})
+
 	if cfg.ServerIP != "" {
 		// 删除不需要知道下一跳，所以快照损坏时也能把这条撤掉
 		cmds = append(cmds, Command{"route", []string{

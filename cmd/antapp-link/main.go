@@ -1,7 +1,7 @@
 // Command antapp-link 是 AntApp Link 的 Windows 客户端。
 //
 // 正常使用不需要命令行：导入连接码之后双击即可，之后都在托盘里操作。
-// 带参数运行时可以指定连接码，或走前台模式方便排查。
+// 带参数运行时可以指定连接码，或走前台 / 联调模式方便排查。
 package main
 
 import (
@@ -19,10 +19,11 @@ func main() {
 
 func run() int {
 	var (
-		codeArg = flag.String("c", "", "连接码：单行 antapp:// 或 json/txt 文件路径")
-		dataArg = flag.String("data", defaultDataDir(), "数据目录")
-		once    = flag.Bool("once", false, "前台连接，不显示托盘（Ctrl+C 退出）")
-		showVer = flag.Bool("version", false, "显示版本")
+		codeArg  = flag.String("c", "", "连接码：单行 antapp:// 或 json/txt 文件路径")
+		dataArg  = flag.String("data", defaultDataDir(), "数据目录")
+		once     = flag.Bool("once", false, "前台连接，不显示托盘（Ctrl+C 退出）")
+		noNetCfg = flag.Bool("no-netcfg", false, "只建隧道、只配虚拟网卡，不改路由与 DNS（联调端口转发用）")
+		showVer  = flag.Bool("version", false, "显示版本")
 	)
 	flag.Parse()
 
@@ -69,11 +70,19 @@ func run() int {
 		return 1
 	}
 
-	app := client.NewApp(inv, dataDir, logger)
+	var opts []client.Option
+	if *noNetCfg {
+		opts = append(opts, client.WithNoNetCfg())
+		logger.Warn("联调模式：只建隧道，不改路由与 DNS")
+	}
+	app := client.NewApp(inv, dataDir, logger, opts...)
 
-	// 上次没干净退出的话，先把网络修回来再谈连接
-	if err := app.HealIfNeeded(); err != nil {
-		logger.Warn("自愈未完全成功", "err", err)
+	// 上次没干净退出的话，先把网络修回来再谈连接。
+	// 联调模式刻意不碰网络，所以连自愈也一并跳过。
+	if !*noNetCfg {
+		if err := app.HealIfNeeded(); err != nil {
+			logger.Warn("自愈未完全成功", "err", err)
+		}
 	}
 
 	if *once {

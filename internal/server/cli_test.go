@@ -70,8 +70,8 @@ func TestCLIInitAndInviteEndToEnd(t *testing.T) {
 	out.Reset()
 	errOut.Reset()
 	code := RunCLI([]string{
-		"invite", "-c", cfgPath, "-o", dir,
-		"--server", "103.143.11.34:62233", "pinode-01",
+		"invite", "pinode-01", "-c", cfgPath, "-o", dir,
+		"--server", "103.143.11.34:62233",
 	}, &out, &errOut)
 	if code != 0 {
 		t.Fatalf("invite 失败(%d): %s", code, errOut.String())
@@ -165,7 +165,7 @@ func TestCLIUsesConfigForInvite(t *testing.T) {
 	out.Reset()
 	errOut.Reset()
 	if code := RunCLI([]string{
-		"invite", "-c", cfgPath, "-o", dir, "--server", "1.2.3.4:62233", "node-x",
+		"invite", "node-x", "-c", cfgPath, "-o", dir, "--server", "1.2.3.4:62233",
 	}, &out, &errOut); code != 0 {
 		t.Fatalf("invite 失败: %s", errOut.String())
 	}

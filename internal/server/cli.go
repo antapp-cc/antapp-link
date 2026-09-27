@@ -133,19 +133,25 @@ func writeDefaultConfig(path string) error {
 }
 
 func cmdInvite(stdout, stderr io.Writer, args []string) int {
+	// 客户端名必须是第一个参数，剩下的才交给 flag 解析。
+	//
+	// Go 的 flag 包遇到第一个位置参数就停止解析，所以 `invite pi-node-01 -o /tmp -c conf`
+	// 这种最自然的写法里，-o/-c/--server 会被整体当成位置参数而**静默失效**。
+	// 把名字摘出来单独处理，才是用户期望的行为。
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		fmt.Fprintln(stderr, "用法: antapp-linkd invite <客户端名> [-c 配置] [-o 输出目录] [--server host:port]")
+		return 2
+	}
+	name := args[0]
+
 	fs := flag.NewFlagSet("invite", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("c", DefaultConfigPath, "配置文件路径")
 	outDir := fs.String("o", ".", "连接码输出目录")
 	serverAddr := fs.String("server", "", "服务端地址 host:port（默认自动探测公网 IP）")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(args[1:]); err != nil {
 		return 2
 	}
-	if fs.NArg() < 1 {
-		fmt.Fprintln(stderr, "用法: antapp-linkd invite <客户端名> [-o 输出目录] [--server host:port]")
-		return 2
-	}
-	name := fs.Arg(0)
 
 	cfg, err := LoadConfig(*cfgPath)
 	if err != nil {

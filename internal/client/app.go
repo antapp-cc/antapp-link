@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ type App struct {
 	dataDir   string
 	statePath string
 	log       *slog.Logger
+	noNetCfg  bool
 
 	mu        sync.Mutex
 	snapshot  Snapshot
@@ -28,16 +30,30 @@ type App struct {
 	lastError string
 }
 
-func NewApp(inv pki.Invite, dataDir string, logger *slog.Logger) *App {
+type Option func(*App)
+
+// WithNoNetCfg 让客户端只建隧道、只配好虚拟网卡，但**不动路由和 DNS**。
+//
+// 用途是联调：端口转发这条链路（服务端 DNAT → 隧道 → Windows 内核 → Pi Node）
+// 可以在完全不碰现有网络的前提下验完。
+func WithNoNetCfg() Option {
+	return func(a *App) { a.noNetCfg = true }
+}
+
+func NewApp(inv pki.Invite, dataDir string, logger *slog.Logger, opts ...Option) *App {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &App{
+	app := &App{
 		inv:       inv,
 		dataDir:   dataDir,
 		statePath: StatePath(dataDir),
 		log:       logger,
 	}
+	for _, opt := range opts {
+		opt(app)
+	}
+	return app
 }
 
 func (a *App) DataDir() string { return a.dataDir }
@@ -47,13 +63,18 @@ func (a *App) DataDir() string { return a.dataDir }
 // state.json 存在就代表上次没干净退出。留着坏路由和坏 DNS 会让用户整机断网，
 // 而且光把程序重启也救不回来 —— 所以这一步必须在连接之前无条件执行。
 func (a *App) HealIfNeeded() error {
+	// 联调模式承诺过不碰网络，连自愈也不做
+	if a.noNetCfg {
+		return nil
+	}
+
 	snap, exists, err := LoadSnapshot(a.statePath)
 	if !exists {
 		return nil
 	}
 
 	if err != nil {
-		// 快照本身坏了，DNS 原值已无从得知。至少把默认路由和隧道地址撤掉，
+		// 快照本身坏了，DNS 原值已无从得知。至少把接管路由和隧道地址撤掉，
 		// 否则用户会一直卡在「所有流量都进了一条没人读的网卡」。
 		a.log.Warn("状态文件损坏，做一次保守还原（DNS 可能需要手动确认）", "err", err)
 		_ = Snapshot{}.Restore(BuildNetConfig(a.inv))
@@ -79,23 +100,32 @@ func (a *App) Connect() error {
 		return nil
 	}
 
-	snap, err := Capture(ServerIPOf(a.inv))
-	if err != nil {
-		return fmt.Errorf("抓取网络现场失败: %w", err)
-	}
-	// 先落盘再动网络：之后任何一步崩掉，下次启动都还能靠它把网络救回来
-	if err := SaveSnapshot(a.statePath, snap); err != nil {
-		return fmt.Errorf("写状态文件失败: %w", err)
-	}
 	cfg := BuildNetConfig(a.inv)
-
 	dev, err := OpenDevice()
 	if err != nil {
-		_ = RemoveSnapshot(a.statePath)
 		a.lastError = err.Error()
 		return err
 	}
 
+	if a.noNetCfg {
+		if err := ConfigureAdapter(cfg); err != nil {
+			_ = dev.Close()
+			a.lastError = err.Error()
+			return fmt.Errorf("配置隧道网卡失败: %w", err)
+		}
+		return a.startTunnelLocked(cfg, dev)
+	}
+
+	snap, err := Capture(cfg.ServerIP)
+	if err != nil {
+		_ = dev.Close()
+		return fmt.Errorf("抓取网络现场失败: %w", err)
+	}
+	// 先落盘再动网络：之后任何一步崩掉，下次启动都还能靠它把网络救回来
+	if err := SaveSnapshot(a.statePath, snap); err != nil {
+		_ = dev.Close()
+		return fmt.Errorf("写状态文件失败: %w", err)
+	}
 	if err := snap.Apply(cfg); err != nil {
 		// 网络已经改了一半，立刻还原，别把用户留在半截状态
 		_ = snap.Restore(cfg)
@@ -105,10 +135,15 @@ func (a *App) Connect() error {
 		return fmt.Errorf("接管网络失败（已还原）: %w", err)
 	}
 
+	a.snapshot = snap
+	return a.startTunnelLocked(cfg, dev)
+}
+
+// startTunnelLocked 在网卡（必要时还有网络）就绪之后拉起隧道循环。调用方必须持有 a.mu。
+func (a *App) startTunnelLocked(cfg NetConfig, dev Device) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	tunnel := NewTunnel(a.inv, dev, a.log)
 
-	a.snapshot = snap
 	a.cfg = cfg
 	a.dev = dev
 	a.tunnel = tunnel
@@ -122,7 +157,91 @@ func (a *App) Connect() error {
 		}
 	}()
 	a.log.Info("已连接", "server", a.inv.Server, "tunnel_ip", cfg.TunnelIP)
+
+	// 只有真接管了网络才自检：联调模式没动用户网络，出不去也不该由我们背
+	if !a.noNetCfg {
+		go a.watchHealth(ctx)
+	}
 	return nil
+}
+
+// watchHealth 在接管网络后确认「真的能出去」，失败就自动回退。
+//
+// 为什么必须有这一步 —— 实测踩过一次：隧道建好了、/1 路由也正确挂上了，但出口的
+// DNS 查不通（那次拿 WSL 当服务端，出口等于本机宽带，8.8.8.8 压根连不上）。
+// 结果用户面对的是一台「显示已连接、却什么都打不开、还没有任何提示」的机器。
+// 宁可明确报「连不上」并把网络还原，也不要留下这种状态。
+func (a *App) watchHealth(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(3 * time.Second):
+	}
+
+	err := a.healthCheck(ctx)
+	if err == nil {
+		a.log.Info("出网自检通过")
+		return
+	}
+	if ctx.Err() != nil {
+		// 用户自己断开或者换了连接码，不是故障
+		return
+	}
+
+	a.log.Error("出网自检失败，自动断开并还原网络", "err", err)
+	a.mu.Lock()
+	a.lastError = "出网自检失败：" + err.Error()
+	a.mu.Unlock()
+
+	if derr := a.Disconnect(); derr != nil {
+		a.log.Error("自检失败后还原网络也失败，状态文件已保留，下次启动会重试", "err", derr)
+	}
+}
+
+// healthCheck 探两件事：隧道内通不通，以及下发的 DNS 能不能真的解析。
+func (a *App) healthCheck(ctx context.Context) error {
+	// 第一级：连服务端在隧道里的监听地址 —— 这条一定走隧道，不受出口影响
+	tunnelAddr := net.JoinHostPort(a.inv.Gateway, tunnelPortOf(a.inv))
+	if err := probeTCP(ctx, tunnelAddr, 5*time.Second); err != nil {
+		return fmt.Errorf("隧道内不通（%s）: %w", tunnelAddr, err)
+	}
+
+	// 第二级：用下发的 DNS 真解析一次。这正是整套方案存在的理由 ——
+	// DNS 查不通，用户看到的就是「连上了但网页打不开」。
+	dnsServer := "8.8.8.8"
+	if len(a.inv.DNS) > 0 {
+		dnsServer = a.inv.DNS[0]
+	}
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, network, net.JoinHostPort(dnsServer, "53"))
+		},
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	if _, err := resolver.LookupHost(lookupCtx, "www.baidu.com"); err != nil {
+		return fmt.Errorf("DNS %s 解析不了域名: %w", dnsServer, err)
+	}
+	return nil
+}
+
+func probeTCP(ctx context.Context, addr string, timeout time.Duration) error {
+	d := net.Dialer{Timeout: timeout}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
+func tunnelPortOf(inv pki.Invite) string {
+	_, port, err := net.SplitHostPort(inv.Server)
+	if err != nil {
+		return "62233"
+	}
+	return port
 }
 
 // Disconnect 停隧道并把网络还原回去。幂等：没连上时直接返回。
@@ -145,6 +264,13 @@ func (a *App) Disconnect() error {
 	}
 	a.running = false
 	a.tunnel = nil
+
+	// 联调模式本来就没动过路由和 DNS，没什么可还原的
+	if a.noNetCfg {
+		a.cfg = NetConfig{}
+		a.log.Info("已断开")
+		return nil
+	}
 
 	if err := a.snapshot.Restore(a.cfg); err != nil {
 		// 还原失败就留着 state.json，让下次启动继续尝试自愈
