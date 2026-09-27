@@ -26,8 +26,8 @@ func mustContain(t *testing.T, rules []string, want string) {
 // 这条是本次相对现网的关键改进：rinetd 只转发 TCP，31400-31409 的 UDP 根本不可达。
 func TestRulesForwardBothTCPAndUDP(t *testing.T) {
 	rules := ruleStrings(Default(), "eth0")
-	mustContain(t, rules, "-p tcp --dport 31410:31419 -j DNAT --to-destination 10.10.0.2")
-	mustContain(t, rules, "-p udp --dport 31410:31419 -j DNAT --to-destination 10.10.0.2")
+	mustContain(t, rules, "-p tcp --dport 31400:31409 -j DNAT --to-destination 10.10.0.2")
+	mustContain(t, rules, "-p udp --dport 31400:31409 -j DNAT --to-destination 10.10.0.2")
 }
 
 func TestRulesMasqueradeAndForward(t *testing.T) {
@@ -50,17 +50,19 @@ func TestRulesOpenTunnelPort(t *testing.T) {
 func TestRulesFollowConfig(t *testing.T) {
 	cfg := Default()
 	cfg.Tunnel.ClientIP = "10.10.0.9"
-	cfg.ForwardPorts = PortRange{Start: 31400, End: 31409}
+	// 刻意用一段跟默认值不同的端口：这样才验得出「规则跟随配置」，
+	// 而不是碰巧等于默认值。断言里再确认默认段没被写死进去。
+	cfg.ForwardPorts = PortRange{Start: 31500, End: 31509}
 	cfg.Listen = "0.0.0.0:443"
 	rules := ruleStrings(cfg, "ens3")
 
-	mustContain(t, rules, "-p tcp --dport 31400:31409 -j DNAT --to-destination 10.10.0.9")
-	mustContain(t, rules, "-p udp --dport 31400:31409 -j DNAT --to-destination 10.10.0.9")
+	mustContain(t, rules, "-p tcp --dport 31500:31509 -j DNAT --to-destination 10.10.0.9")
+	mustContain(t, rules, "-p udp --dport 31500:31509 -j DNAT --to-destination 10.10.0.9")
 	mustContain(t, rules, "-o ens3 -j MASQUERADE")
 	mustContain(t, rules, "-A INPUT -p tcp --dport 443 -j ACCEPT")
 
 	for _, s := range rules {
-		if strings.Contains(s, "31410") {
+		if strings.Contains(s, "31400:31409") {
 			t.Errorf("规则里不该出现硬编码的默认端口段：%s", s)
 		}
 	}

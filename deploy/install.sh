@@ -4,8 +4,8 @@
 #
 # 用法（在云服上以 root 运行，保持 antapp-linkd 与本脚本同目录）：
 #
-#   bash install.sh                              # 用默认端口段 31410-31419（并网验证期）
-#   bash install.sh --forward 31400-31409        # 验收通过、老服务下线后再切回正式端口段
+#   bash install.sh                              # 用默认端口段 31400-31409
+#   bash install.sh --forward 31410-31419        # 需要换成别的段时（比如跟现网服务冲突）
 #
 # 幂等：重复执行只刷新二进制、配置与 systemd unit。
 # **不会重建 CA** —— 重建会让此前发出的所有连接码一起失效。
@@ -17,8 +17,8 @@ CONF="$CONF_DIR/server.json"
 BIN=/usr/local/bin/antapp-linkd
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-FORWARD_START=31410
-FORWARD_END=31419
+FORWARD_START=31400
+FORWARD_END=31409
 
 log() { echo "[antapp-link] $*"; }
 die() { echo "[antapp-link] $*" >&2; exit 1; }
@@ -52,7 +52,7 @@ mv -f "$BIN.new" "$BIN"
 log "初始化配置与 PKI（已存在的一律不动）"
 "$BIN" init -c "$CONF"
 
-if [[ "$FORWARD_START" != "31410" || "$FORWARD_END" != "31419" ]]; then
+if [[ "$FORWARD_START" != "31400" || "$FORWARD_END" != "31409" ]]; then
   current_start="$(sed -n 's/.*"start": *\([0-9]*\).*/\1/p' "$CONF" | head -n1)"
   current_end="$(sed -n 's/.*"end": *\([0-9]*\).*/\1/p' "$CONF" | head -n1)"
   if [[ "$current_start" != "$FORWARD_START" || "$current_end" != "$FORWARD_END" ]]; then

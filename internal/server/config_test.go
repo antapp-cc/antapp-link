@@ -15,9 +15,9 @@ func TestDefaultConfigIsValid(t *testing.T) {
 	if got := cfg.PrefixLen(); got != 24 {
 		t.Errorf("PrefixLen = %d, want 24", got)
 	}
-	if cfg.ForwardPorts.Start != 31410 {
-		t.Errorf("验证期默认端口段应从 31410 起（避开现网 rinetd 占着的 31400-31409），实际 %d",
-			cfg.ForwardPorts.Start)
+	if cfg.ForwardPorts.Start != 31400 || cfg.ForwardPorts.End != 31409 {
+		t.Errorf("默认端口段应该是正式的 31400-31409，实际 %d-%d",
+			cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
 	}
 	if cfg.Listen != "0.0.0.0:62233" {
 		t.Errorf("默认监听端口应避开现网 OpenVPN 的 62231，实际 %s", cfg.Listen)

@@ -31,8 +31,10 @@ type PortRange struct {
 	End   int `json:"end"`
 }
 
-// Default 的转发端口段是 31410-31419：并网验证期必须避开现网 rinetd 占着的 31400-31409。
-// 验收通过、老服务下线后再改回 31400-31409。
+// Default 的转发端口段就是正式的 31400-31409。
+//
+// 早先并网验证期用过 31410-31419，为的是避开现网 rinetd 占着的那一段；
+// 现在老服务已经下线，直接用正式端口段，不用再切来切去。
 func Default() Config {
 	return Config{
 		Listen: "0.0.0.0:62233",
@@ -44,7 +46,7 @@ func Default() Config {
 			MTU:      1400,
 		},
 		DNS:          []string{"8.8.8.8", "149.112.112.112"},
-		ForwardPorts: PortRange{Start: 31410, End: 31419},
+		ForwardPorts: PortRange{Start: 31400, End: 31409},
 		PKIDir:       "/etc/antapp-link/pki",
 	}
 }
