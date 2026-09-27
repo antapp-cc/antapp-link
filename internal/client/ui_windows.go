@@ -129,17 +129,7 @@ func (u *UI) build() error {
 		}
 		*canceled = true
 		u.mw.Hide()
-		// 第一次收进托盘时说一声。不说的话用户会以为程序已经关了，
-		// 但隧道其实还在后台跑着。
-		//
-		// 气泡停多久由系统的「通知显示时长」决定（默认 5 秒），程序改不了：
-		// Vista 之后 uTimeout 被忽略，试过自己再发一条空 NIF_INFO 去收掉，
-		// 结果系统把图标状态也一起改坏、后面干脆不显示了，所以不再干预。
-		if !u.trayHinted {
-			u.trayHinted = true
-			_ = u.ni.ShowInfo("AntApp Link 仍在运行",
-				"窗口已收进托盘，专线保持连接。\n双击托盘图标可以重新打开，右键菜单里可以退出。")
-		}
+		u.hintTray()
 	})
 
 	if err := u.buildTray(); err != nil {
@@ -354,7 +344,27 @@ func (u *UI) onReconnect() {
 	}()
 }
 
-func (u *UI) onHide() { u.mw.Hide() }
+func (u *UI) onHide() {
+	u.mw.Hide()
+	u.hintTray()
+}
+
+// hintTray 第一次收进托盘时说一声，之后不再打扰。
+//
+// 「隐藏」按钮走的是这里，而点 X 走 Closing 事件 —— 两条路都要提示，否则
+// 用户从按钮收起窗口时就完全没反馈（实测就是这么漏掉的）。
+//
+// 气泡停多久由系统的「通知显示时长」决定（默认 5 秒），程序改不了：Vista 之后
+// uTimeout 被忽略，试过自己再发一条空 NIF_INFO 去收掉，结果系统把图标状态也
+// 一起改坏、之后干脆不显示了，所以不再干预。
+func (u *UI) hintTray() {
+	if u.trayHinted {
+		return
+	}
+	u.trayHinted = true
+	_ = u.ni.ShowInfo("AntApp Link 仍在运行",
+		"窗口已收进托盘，专线保持连接。\n双击托盘图标可以重新打开，右键菜单里可以退出。")
+}
 
 // ---------- 在线更新 ----------
 
