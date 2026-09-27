@@ -314,15 +314,15 @@ func (u *UI) refresh() {
 		u.lastLogText = text
 		u.txtLog.SetText(text)
 
-		// 光标挪到末尾再滚过去，让最新一行始终可见。
-		//
-		// 这里必须用 TextLength()（字符数），不能用 len(text) —— Go 的 len 对 string
-		// 是字节数，中文日志下远超实际字符数，越界的值会被 Edit 控件当成「选到最尾」，
-		// 结果整片日志变成全选高亮（实测 start=0 end=全文）。
-		if n := u.txtLog.TextLength(); n > 0 {
-			u.txtLog.SetTextSelection(n, n)
-		}
-		u.txtLog.ScrollToCaret()
+		// 滚到最后一行。这里刻意不用 SetTextSelection(n, n) 去「把光标挪到末尾」：
+		// EM_SETSEL 之后 TextLength 确实报出空选择（诊断实测 165,165），但光标落在
+		// 末尾时这个只读文本框会把整片日志画成蓝底高亮 —— 截图能看到，而选择状态
+		// 读出来是正常的，所以只能绕开它。直接用滚动条消息，不碰选择。
+		const (
+			wmVScroll = 0x0115
+			sbBottom  = 7
+		)
+		u.txtLog.SendMessage(wmVScroll, sbBottom, 0)
 	}
 }
 
