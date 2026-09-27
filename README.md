@@ -7,7 +7,7 @@
 | 被取代 | 原来怎么做的 | 现在 |
 |---|---|---|
 | OpenVPN server + 客户端 | 装 `OpenVPN.msi`（境外几百 MB），`push redirect-gateway` 全流量走云服 | 两端自己的协议，客户端是**单个 exe**（wintun.dll 已内嵌） |
-| `rinetd` + 看门狗 | 用户态代理 `31400-31409`，**只转发 TCP**，每 5 秒解析 OpenVPN status 日志反查虚拟 IP | 内核 DNAT，**TCP + UDP 都转**，不需要轮询、不需要看门狗 |
+| `rinetd` + 看门狗 | 用户态代理 `31400-31409`，**只转发 TCP**，每 5 秒解析 OpenVPN status 日志反查虚拟 IP | 内核 DNAT，同样只转 TCP，但不需要轮询、不需要看门狗 |
 
 端口转发交给内核是关键取舍：两端都只做「虚拟网卡 ↔ 隧道」的搬运，TCP/IP 栈、NAT、DNAT 全归操作系统，所以协议里只剩 IP 包和心跳两种数据帧。
 

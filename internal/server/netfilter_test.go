@@ -23,11 +23,17 @@ func mustContain(t *testing.T, rules []string, want string) {
 	t.Errorf("规则里找不到 %q，实际规则：\n%s", want, strings.Join(rules, "\n"))
 }
 
-// 这条是本次相对现网的关键改进：rinetd 只转发 TCP，31400-31409 的 UDP 根本不可达。
-func TestRulesForwardBothTCPAndUDP(t *testing.T) {
+// 只转发 TCP。曾经 TCP 和 UDP 都转，后来按需求去掉了 UDP ——
+// Pi Node 只用 TCP，多留一条 UDP 规则等于平白多一个对外暴露的面。
+func TestRulesForwardTCPOnly(t *testing.T) {
 	rules := ruleStrings(Default(), "eth0")
 	mustContain(t, rules, "-p tcp --dport 31400:31409 -j DNAT --to-destination 10.10.0.2")
-	mustContain(t, rules, "-p udp --dport 31400:31409 -j DNAT --to-destination 10.10.0.2")
+
+	for _, s := range rules {
+		if strings.Contains(s, "--dport 31400:31409") && strings.Contains(s, "-p udp") {
+			t.Errorf("不该再有 UDP 转发规则：%s", s)
+		}
+	}
 }
 
 func TestRulesMasqueradeAndForward(t *testing.T) {
@@ -57,7 +63,6 @@ func TestRulesFollowConfig(t *testing.T) {
 	rules := ruleStrings(cfg, "ens3")
 
 	mustContain(t, rules, "-p tcp --dport 31500:31509 -j DNAT --to-destination 10.10.0.9")
-	mustContain(t, rules, "-p udp --dport 31500:31509 -j DNAT --to-destination 10.10.0.9")
 	mustContain(t, rules, "-o ens3 -j MASQUERADE")
 	mustContain(t, rules, "-A INPUT -p tcp --dport 443 -j ACCEPT")
 
@@ -95,8 +100,8 @@ func TestRulesJumpIntoSingleChain(t *testing.T) {
 
 func TestDNATRulesOnlyReturnsForwarding(t *testing.T) {
 	rules := DNATRules(Default())
-	if len(rules) != 2 {
-		t.Fatalf("应该正好两条 DNAT（tcp + udp），实际 %d 条", len(rules))
+	if len(rules) != 1 {
+		t.Fatalf("只转发 TCP，应该正好一条 DNAT，实际 %d 条", len(rules))
 	}
 	for _, r := range rules {
 		if r.Chain != ChainName {

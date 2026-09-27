@@ -53,13 +53,13 @@ func Rules(cfg Config, wanIface string) []Rule {
 
 		{Chain: "INPUT", Args: []string{"-p", "tcp", "--dport", listenPort, "-j", "ACCEPT"}},
 
-		// 端口转发交给内核：TCP 与 UDP 各一条（现网 rinetd 只做 TCP，所以 UDP 不可达）
+		// 端口转发交给内核，只做 TCP。
+		//
+		// 曾经 TCP 和 UDP 各一条，后来按需求去掉了 UDP：Pi Node 那边只用 TCP，
+		// 多开一条 UDP 规则等于平白多一个对外暴露的面。
 		{Table: "nat", Chain: ChainName, Args: []string{
 			"-p", "tcp", "--dport", portRange, "-j", "DNAT", "--to-destination", client}},
-		{Table: "nat", Chain: ChainName, Args: []string{
-			"-p", "udp", "--dport", portRange, "-j", "DNAT", "--to-destination", client}},
 		{Table: "nat", Chain: "PREROUTING", Args: []string{"-p", "tcp", "--dport", portRange, "-j", ChainName}},
-		{Table: "nat", Chain: "PREROUTING", Args: []string{"-p", "udp", "--dport", portRange, "-j", ChainName}},
 	}
 }
 

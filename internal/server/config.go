@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -65,6 +66,59 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, fmt.Errorf("配置 %s 不合法: %w", path, err)
 	}
 	return cfg, nil
+}
+
+// SaveConfig 把配置写回文件。
+func SaveConfig(path string, cfg Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(raw, '\n'), 0o644)
+}
+
+// Overrides 是安装时可以指定、其余用默认值的几项。
+//
+// 有了它，安装脚本就不必靠 sed 去改 JSON —— 那种做法一旦字段顺序或缩进变了
+// 就会静默失效，而这里改的是结构体字段，改没改过一目了然。
+type Overrides struct {
+	Listen       string // 形如 0.0.0.0:62233；空表示不改
+	ForwardStart int    // 0 表示不改
+	ForwardEnd   int
+	Network      string // 空表示不改
+}
+
+// ApplyOverrides 把非空项写进配置。网段变了的话，服务端/客户端地址按新网段重算
+// （取 .1 和 .2），否则会跟 Validate 的「地址必须落在网段内」冲突。
+func (c *Config) ApplyOverrides(o Overrides) {
+	if o.Listen != "" {
+		c.Listen = o.Listen
+	}
+	if o.ForwardStart > 0 && o.ForwardEnd > 0 {
+		c.ForwardPorts = PortRange{Start: o.ForwardStart, End: o.ForwardEnd}
+	}
+	if o.Network != "" && o.Network != c.Tunnel.Network {
+		if ip, ipnet, err := net.ParseCIDR(o.Network); err == nil {
+			ones, _ := ipnet.Mask.Size()
+			base := ip.Mask(ipnet.Mask)
+			server := make(net.IP, len(base))
+			copy(server, base)
+			server[len(server)-1] = 1
+			client := make(net.IP, len(base))
+			copy(client, base)
+			client[len(client)-1] = 2
+
+			c.Tunnel.Network = fmt.Sprintf("%s/%d", base.String(), ones)
+			c.Tunnel.ServerIP = server.String()
+			c.Tunnel.ClientIP = client.String()
+		}
+	}
 }
 
 func (c Config) Validate() error {

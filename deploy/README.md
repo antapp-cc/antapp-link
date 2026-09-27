@@ -71,7 +71,7 @@ bash install.sh --forward 31400-31409
 
 ## 防火墙
 
-`up` 会自动插 `INPUT` 放行隧道端口。转发端口（31400-31409）**不需要**在 `INPUT` 放行：DNAT 在 `PREROUTING` 完成，包走的是 `FORWARD`。
+`up` 会自动插 `INPUT` 放行隧道端口。转发端口（31400-31409）**不需要**在 `INPUT` 放行：DNAT 在 `PREROUTING` 完成，包走的是 `FORWARD`。转发只做 **TCP**，没有 UDP 规则。
 
 如果你的云服还有别的防火墙前端（安全组 / ufw），记得放行隧道端口。
 

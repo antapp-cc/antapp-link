@@ -4,9 +4,12 @@
 #
 # 用法（在云服上以 root 运行，保持 antapp-linkd 与本脚本同目录）：
 #
-#   bash install.sh                              # 用默认端口段 31400-31409
-#   bash install.sh --forward 31410-31419        # 需要换成别的段时（比如跟现网服务冲突）
+#   bash install.sh                                   # 全部用默认值
+#   bash install.sh --forward 31400-31409             # 指定转发端口段
+#   bash install.sh --tunnel-port 62233               # 指定隧道监听端口
+#   bash install.sh --network 10.10.0.0/24            # 指定隧道网段
 #
+# 默认值与"什么都不传"等价，脚本不依赖任何现网状态：网卡、公网 IP 都是运行时探测的。
 # 幂等：重复执行只刷新二进制、配置与 systemd unit。
 # **不会重建 CA** —— 重建会让此前发出的所有连接码一起失效。
 
@@ -17,8 +20,12 @@ CONF="$CONF_DIR/server.json"
 BIN=/usr/local/bin/antapp-linkd
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-FORWARD_START=31400
-FORWARD_END=31409
+# 留空表示"不改这一项"，由 antapp-linkd 用它自己的默认值
+TUNNEL_PORT=""
+FORWARD_RANGE=""
+NETWORK=""
+
+usage() { sed -n '2,15p' "${BASH_SOURCE[0]}"; }
 
 log() { echo "[antapp-link] $*"; }
 die() { echo "[antapp-link] $*" >&2; exit 1; }
@@ -28,12 +35,23 @@ while [[ $# -gt 0 ]]; do
     --forward)
       range="${2:-}"
       [[ "$range" =~ ^[0-9]+-[0-9]+$ ]] || die "--forward 需要形如 31400-31409 的参数"
-      FORWARD_START="${range%-*}"
-      FORWARD_END="${range#*-}"
+      FORWARD_RANGE="$range"
+      shift 2
+      ;;
+    --tunnel-port)
+      port="${2:-}"
+      [[ "$port" =~ ^[0-9]+$ ]] || die "--tunnel-port 需要端口号"
+      TUNNEL_PORT="$port"
+      shift 2
+      ;;
+    --network)
+      net="${2:-}"
+      [[ "$net" =~ ^[0-9.]+/[0-9]+$ ]] || die "--network 需要形如 10.10.0.0/24 的参数"
+      NETWORK="$net"
       shift 2
       ;;
     -h|--help)
-      sed -n '2,14p' "${BASH_SOURCE[0]}"
+      usage
       exit 0
       ;;
     *)
@@ -49,23 +67,15 @@ log "安装二进制到 $BIN"
 install -m 0755 "$SRC_DIR/antapp-linkd" "$BIN.new"
 mv -f "$BIN.new" "$BIN"
 
-log "初始化配置与 PKI（已存在的一律不动）"
-"$BIN" init -c "$CONF"
+log "初始化配置与 PKI（已存在的一律保留，只同步下面这几项）"
+init_args=(-c "$CONF")
+[[ -n "$FORWARD_RANGE" ]] && init_args+=(--forward "$FORWARD_RANGE")
+[[ -n "$TUNNEL_PORT" ]]   && init_args+=(--listen "0.0.0.0:$TUNNEL_PORT")
+[[ -n "$NETWORK" ]]       && init_args+=(--network "$NETWORK")
 
-# 把配置里的端口段同步成目标值。
-#
-# 这里不判断「目标值是不是默认」—— 老机器上的 server.json 可能写死了验证期的
-# 31410-31419，早先只在传了非默认值时才去改，于是重跑脚本也纠正不过来。
-# 现在一律对准目标值。
-current_start="$(sed -n 's/.*"start": *\([0-9]*\).*/\1/p' "$CONF" | head -n1)"
-current_end="$(sed -n 's/.*"end": *\([0-9]*\).*/\1/p' "$CONF" | head -n1)"
-if [[ -n "$current_start" && -n "$current_end" ]] &&
-   [[ "$current_start" != "$FORWARD_START" || "$current_end" != "$FORWARD_END" ]]; then
-  log "转发端口段 $current_start-$current_end -> $FORWARD_START-$FORWARD_END"
-  # 先撤旧规则再改配置：否则 down 会按新端口段去删、旧规则留在链里
-  "$BIN" down -c "$CONF" >/dev/null 2>&1 || true
-  sed -i "s/\"start\": *$current_start/\"start\": $FORWARD_START/; s/\"end\": *$current_end/\"end\": $FORWARD_END/" "$CONF"
-fi
+# 换端口段/网段之前先 down：否则 down 会按新值去删规则，旧规则留在链里
+"$BIN" down -c "$CONF" >/dev/null 2>&1 || true
+"$BIN" init "${init_args[@]}"
 
 log "安装 systemd 服务"
 "$BIN" install -c "$CONF"

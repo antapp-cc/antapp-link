@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -93,43 +94,79 @@ func cmdInit(stdout, stderr io.Writer, args []string) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("c", DefaultConfigPath, "配置文件路径")
+	listen := fs.String("listen", "", "隧道监听地址，形如 0.0.0.0:62233（不传则不改）")
+	forward := fs.String("forward", "", "转发端口段，形如 31400-31409（不传则不改）")
+	network := fs.String("network", "", "隧道网段，形如 10.10.0.0/24（不传则不改）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
-	if _, err := os.Stat(*cfgPath); errors.Is(err, os.ErrNotExist) {
-		if err := writeDefaultConfig(*cfgPath); err != nil {
-			fmt.Fprintf(stderr, "写默认配置失败: %v\n", err)
-			return 1
+	var ov Overrides
+	ov.Listen = *listen
+	ov.Network = *network
+	if *forward != "" {
+		start, end, err := parsePortRange(*forward)
+		if err != nil {
+			fmt.Fprintf(stderr, "--forward %v\n", err)
+			return 2
 		}
-		fmt.Fprintf(stdout, "已写入默认配置 %s\n", *cfgPath)
+		ov.ForwardStart, ov.ForwardEnd = start, end
 	}
 
-	cfg, err := LoadConfig(*cfgPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "%v\n", err)
+	_, statErr := os.Stat(*cfgPath)
+	fresh := errors.Is(statErr, os.ErrNotExist)
+
+	// 配置不存在就按默认值 + 覆盖项生成；已存在则只同步覆盖项，其余字段原样保留。
+	// 这样安装脚本重跑是幂等的，也不会把用户手改过的字段冲掉。
+	cfg := Default()
+	if !fresh {
+		loaded, err := LoadConfig(*cfgPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "%v\n", err)
+			return 1
+		}
+		cfg = loaded
+	}
+	cfg.ApplyOverrides(ov)
+
+	if err := SaveConfig(*cfgPath, cfg); err != nil {
+		fmt.Fprintf(stderr, "写配置失败: %v\n", err)
 		return 1
 	}
+	if fresh {
+		fmt.Fprintf(stdout, "已写入默认配置 %s\n", *cfgPath)
+	} else {
+		fmt.Fprintf(stdout, "已同步配置 %s\n", *cfgPath)
+	}
+
 	if err := pki.Init(cfg.PKIDir); err != nil {
 		fmt.Fprintf(stderr, "初始化 PKI 失败: %v\n", err)
 		return 1
 	}
 	fmt.Fprintf(stdout, "PKI 就绪      : %s\n", cfg.PKIDir)
-	fmt.Fprintf(stdout, "隧道端口      : %s\n", cfg.Listen)
+	fmt.Fprintf(stdout, "隧道监听      : %s\n", cfg.Listen)
+	fmt.Fprintf(stdout, "隧道网段      : %s（服务端 %s / 客户端 %s）\n",
+		cfg.Tunnel.Network, cfg.Tunnel.ServerIP, cfg.Tunnel.ClientIP)
 	fmt.Fprintf(stdout, "转发端口段    : %d-%d\n", cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
 	fmt.Fprintf(stdout, "\n下一步: antapp-linkd invite pi-node-01\n")
 	return 0
 }
 
-func writeDefaultConfig(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+// parsePortRange 解析 31400-31409 这种形式。
+func parsePortRange(s string) (int, int, error) {
+	parts := strings.SplitN(s, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("需要形如 31400-31409 的参数，实际 %q", s)
 	}
-	raw, err := json.MarshalIndent(Default(), "", "  ")
-	if err != nil {
-		return err
+	start, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	end, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil {
+		return 0, 0, fmt.Errorf("端口不是数字: %q", s)
 	}
-	return os.WriteFile(path, append(raw, '\n'), 0o600)
+	if start < 1 || end > 65535 || start > end {
+		return 0, 0, fmt.Errorf("不是合法的端口区间: %d-%d", start, end)
+	}
+	return start, end, nil
 }
 
 func cmdInvite(stdout, stderr io.Writer, args []string) int {
