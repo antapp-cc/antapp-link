@@ -14,6 +14,7 @@ import (
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
+	"golang.org/x/sys/windows"
 )
 
 //go:embed assets/antapp.ico
@@ -375,8 +376,17 @@ func (u *UI) alert(title, msg string) {
 	})
 }
 
+// openInExplorer 用 ShellExecute 打开目录。
+//
+// 不走 explorer.exe：它把目录打开之后经常返回非 0 退出码（实测在 C:\Program Files
+// 下必定返回 1），拿退出码当判据就会把「其实已经打开了」报成失败。
+// ShellExecute 是 Windows 打开文件/目录的规范入口，成败可信。
 func openInExplorer(path string) error {
-	return runCommand(Command{"explorer", []string{path}})
+	file, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	return windows.ShellExecute(0, nil, file, nil, nil, windows.SW_SHOWNORMAL)
 }
 
 func truncateRunes(s string, n int) string {
