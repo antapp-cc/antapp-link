@@ -84,6 +84,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		"forward_ports", fmt.Sprintf("%d-%d", cfg.ForwardPorts.Start, cfg.ForwardPorts.End))
 
 	go s.pumpTun(ctx)
+	go s.reportStatus(ctx)
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
@@ -181,7 +182,7 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	sess := &session{conn: tlsConn, name: name, closed: make(chan struct{})}
+	sess := &session{conn: tlsConn, name: name, closed: make(chan struct{}), connectedAt: time.Now()}
 	sess.touch()
 	if err := sess.write(proto.TypeHelloAck, ack); err != nil {
 		s.log.Warn("回 HELLO_ACK 失败", "client", name, "err", err)
@@ -286,13 +287,41 @@ func (s *Server) currentSession() *session {
 	return s.current
 }
 
+// reportStatus 定期把运行时状态落到文件，供 `antapp-linkd status` 读取。
+// 用文件而不是 IPC：status 是另一个短命进程，读一个 JSON 比引入套接字简单得多。
+func (s *Server) reportStatus(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		st := Status{
+			Listen:   s.cfg.Listen,
+			Device:   s.cfg.Tunnel.Device,
+			ServerIP: s.cfg.Tunnel.ServerIP,
+			ClientIP: s.cfg.Tunnel.ClientIP,
+		}
+		if sess := s.currentSession(); sess != nil {
+			st.Client = sess.name
+			st.ConnectedAt = sess.connectedAt.Format(time.RFC3339)
+		}
+		if err := WriteStatus(st); err != nil {
+			s.log.Debug("写状态文件失败", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 type session struct {
-	conn     net.Conn
-	name     string
-	closed   chan struct{}
-	once     sync.Once
-	writeMu  sync.Mutex
-	lastSeen atomic.Int64
+	conn        net.Conn
+	name        string
+	closed      chan struct{}
+	once        sync.Once
+	writeMu     sync.Mutex
+	lastSeen    atomic.Int64
+	connectedAt time.Time
 }
 
 func (s *session) touch() { s.lastSeen.Store(time.Now().UnixNano()) }
