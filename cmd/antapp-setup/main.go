@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
@@ -136,11 +137,22 @@ func runInstallUI(icon *walk.Icon, dirFlag string) int {
 					btn.SetText("重试")
 					return
 				}
-				walk.MsgBox(mw, "安装完成",
-					"AntApp Link 已安装到：\n"+o.InstallDir+"\n\n"+
-						"首次使用请在界面上导入连接码。",
-					walk.MsgBoxIconInformation)
-				mw.Close()
+				// 成功时不用模态提示框：客户端这时已经起来了，而且居中在最前，
+				// 模态框会被它整个盖住，用户反而点不到「确定」。写进日志再自动关掉向导。
+				txtLog.AppendText("\r\n安装完成，正在启动客户端……\r\n")
+				btn.SetText("已完成")
+
+				var installedTo string
+				if o.Launch {
+					installedTo = "客户端已启动。首次使用请在界面上导入连接码。"
+				} else {
+					installedTo = "已安装到：" + o.InstallDir
+				}
+				txtLog.AppendText(installedTo + "\r\n")
+
+				time.AfterFunc(1500*time.Millisecond, func() {
+					mw.Synchronize(func() { mw.Close() })
+				})
 			})
 		}()
 	}
@@ -268,8 +280,12 @@ func runUninstallUI(icon *walk.Icon) int {
 					btn.SetEnabled(true)
 					return
 				}
-				walk.MsgBox(mw, "卸载完成", "AntApp Link 已卸载。", walk.MsgBoxIconInformation)
-				mw.Close()
+				// 同上：不弹模态框，写进日志后自动关窗
+				txtLog.AppendText("\r\n卸载完成。\r\n")
+				btn.SetText("已完成")
+				time.AfterFunc(1500*time.Millisecond, func() {
+					mw.Synchronize(func() { mw.Close() })
+				})
 			})
 		}()
 	}
