@@ -216,7 +216,7 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 
 `antapp-linkd invite <name>` 输出两样东西：
 
-1. `antnest-node-<name>.json` 文件，内容：
+1. `antapp-node-<name>.json` 文件，内容：
 
 ```json
 {
@@ -233,7 +233,7 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 }
 ```
 
-2. 单行 `antnest://<base64(json)>`，方便微信/邮件直接发一段粘贴
+2. 单行 `antapp://<base64(json)>`，方便微信/邮件直接发一段粘贴
 
 客户端两种都能导入。私钥随配置走，所以连接码等同密码，服务端日志和界面上都要避免回显完整内容。
 
