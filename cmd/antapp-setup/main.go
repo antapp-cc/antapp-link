@@ -233,6 +233,7 @@ func runInstallUI(icon *walk.Icon, dirFlag string) int {
 		fmt.Fprintln(os.Stderr, "创建窗口失败:", err)
 		return 1
 	}
+	setup.CenterOnScreen(mw.Handle())
 	mw.Run()
 	return 0
 }
@@ -361,6 +362,7 @@ func runUninstallUI(icon *walk.Icon) int {
 		fmt.Fprintln(os.Stderr, "创建窗口失败:", err)
 		return 1
 	}
+	setup.CenterOnScreen(mw.Handle())
 	mw.Run()
 	return 0
 }

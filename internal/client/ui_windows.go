@@ -18,6 +18,7 @@ import (
 	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
 
+	"github.com/antapp-cc/antapp-link/internal/setup"
 	"github.com/antapp-cc/antapp-link/internal/update"
 )
 
@@ -132,6 +133,10 @@ func (u *UI) build() error {
 		u.mw.Hide()
 		u.hintTray()
 	})
+
+	// 每次打开都居中。不指定位置的话 Windows 按「层叠」摆放，
+	// 多开几次就跑偏到屏幕角落了。
+	setup.CenterOnScreen(u.mw.Handle())
 
 	// 日志框退出焦点轮转。
 	//
