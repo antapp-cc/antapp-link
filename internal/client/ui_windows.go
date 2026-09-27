@@ -46,11 +46,11 @@ type UI struct {
 	btnUpdate  *walk.PushButton
 	btnHide    *walk.PushButton
 
-	quitting    bool
-	trayHinted  bool
-	lastLogText string
-	done        chan struct{}
-	pending     *update.Manifest
+	quitting   bool
+	trayHinted bool
+	logSeq     uint64
+	done       chan struct{}
+	pending    *update.Manifest
 }
 
 // RunUI 阻塞运行图形界面，直到用户从托盘菜单退出。
@@ -319,18 +319,17 @@ func (u *UI) refresh() {
 		}
 	}
 
-	// 日志只在内容变了才重设，否则每秒都会把滚动位置弹回顶部
-	text := strings.Join(u.logs.Tail(500), "\r\n")
-	if text != u.lastLogText {
-		u.lastLogText = text
-		u.txtLog.SetText(text)
+	// 日志只做增量追加，绝不整体 SetText。
+	//
+	// SetText 走的是 WM_SETTEXT，之后这个只读框的选择会变成「全选」，一有焦点就
+	// 整片画成蓝底。之后无论用 EM_SETSEL 去清、还是只用滚动消息绕开，都压不住 ——
+	// 三种写法都试过，见 git 历史（dc4e6dc / 2fdfafc / f27a79a）。
+	//
+	// 改成只追加新行：控件从空开始，选择状态就永远停在初始值，不给它变全选的机会。
+	if newLines, seq := u.logs.Since(u.logSeq); len(newLines) > 0 {
+		u.logSeq = seq
+		u.txtLog.AppendText(strings.Join(newLines, "\r\n") + "\r\n")
 
-		// 滚到最后一行，全程不碰选择。
-		//
-		// 这里千万别加 SetTextSelection —— 哪怕传 (0,0) 也不行。只要调用过 EM_SETSEL，
-		// 这个只读框就建立了「选择锚点」，一拿到焦点便整片画成高亮；完全不调用时
-		// 它保持「从未选择过」的状态，反而是干净的。这一条是试错换来的：
-		// 曾经「改进」成显式设 (0,0)，结果把已经好了的版本又弄坏。
 		const (
 			wmVScroll = 0x0115
 			sbBottom  = 7

@@ -95,6 +95,9 @@ type LogBuffer struct {
 	mu    sync.Mutex
 	lines []string
 	max   int
+	// seq 是累计写入过的行数，只增不减。界面靠它算出「上次看到哪了」，
+	// 从而只追加新行 —— 整体 SetText 会让只读框变成全选，能不用就不用。
+	seq uint64
 }
 
 func NewLogBuffer(max int) *LogBuffer {
@@ -108,11 +111,31 @@ func (b *LogBuffer) addLine(line string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.lines = append(b.lines, line)
+	b.seq++
 	if len(b.lines) > b.max {
 		keep := make([]string, b.max)
 		copy(keep, b.lines[len(b.lines)-b.max:])
 		b.lines = keep
 	}
+}
+
+// Since 返回序号 >= seq 的那些行，以及新的序号。
+//
+// 界面用它做增量追加。seq 太旧（那些行已经被轮转丢掉）时从现有最早一行开始，
+// 调用方拿到的是「现在缓冲区里的全部内容」。
+func (b *LogBuffer) Since(seq uint64) ([]string, uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	start := b.seq - uint64(len(b.lines)) // 缓冲区里第一行的序号
+	if seq < start {
+		seq = start
+	}
+	out := make([]string, 0, b.seq-seq)
+	if idx := int(seq - start); idx < len(b.lines) {
+		out = append(out, b.lines[idx:]...)
+	}
+	return out, b.seq
 }
 
 // Tail 返回最后 n 行。n<=0 表示全部。
