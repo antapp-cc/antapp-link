@@ -36,3 +36,5 @@ func Installed() (Options, bool) { return Options{}, false }
 
 func Install(Options, func(string)) error   { return ErrNotWindows }
 func Uninstall(Options, func(string)) error { return ErrNotWindows }
+
+func RelaunchFromTempIfNeeded(func(string)) (bool, error) { return false, ErrNotWindows }

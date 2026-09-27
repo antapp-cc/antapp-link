@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
@@ -22,8 +21,11 @@ const (
 	AppExeName    = "antapp-link.exe"
 	AutostartTask = "AntAppLink"
 
-	// UninstallerName 是装进安装目录的那份卸载器。安装时把安装程序自己复制过去 ——
+	// UninstallerName 是卸载器。安装时把安装程序自己复制一份留在这里 ——
 	// 用户删掉当初的安装包之后，「应用和功能」和客户端里的卸载入口还得能用。
+	//
+	// 它住在 %ProgramData% 而不是安装目录：卸载器要删掉整个安装目录，而 Windows
+	// 不允许删除正在运行的 exe —— 放在安装目录里必定留个尾巴删不掉。
 	UninstallerName = "uninstall.exe"
 
 	uninstallKey = `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AntApp Link`
@@ -101,6 +103,22 @@ func fallbackDataDir() string {
 	return filepath.Join(os.Getenv("LOCALAPPDATA"), "AntAppLink")
 }
 
+// UninstallerDir 是卸载器的落脚处。
+//
+// 刻意不放在安装目录里：卸载器要删掉整个安装目录，而 Windows 不允许删除正在运行的
+// exe —— 放在那儿必定剩下一个 uninstall.exe 删不掉，卸载就永远「不干净」。
+func UninstallerDir() string {
+	if pd := os.Getenv("ProgramData"); pd != "" {
+		return filepath.Join(pd, AppName)
+	}
+	return filepath.Join(os.Getenv("LOCALAPPDATA"), AppName)
+}
+
+// UninstallerPath 是卸载器的完整路径。
+func UninstallerPath() string {
+	return filepath.Join(UninstallerDir(), UninstallerName)
+}
+
 // Installed 从注册表读回已安装的信息。
 func Installed() (Options, bool) {
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, uninstallKey, registry.QUERY_VALUE)
@@ -137,7 +155,7 @@ func Install(opts Options, log func(string)) error {
 	}
 	log("已释放 " + dst)
 
-	if err := installUninstaller(opts.InstallDir, log); err != nil {
+	if err := installUninstaller(log); err != nil {
 		return err
 	}
 
@@ -211,19 +229,29 @@ func Uninstall(opts Options, log func(string)) error {
 		}
 	}
 
-	scheduleSelfCleanup(opts.InstallDir, log)
+	// 卸载器自己住在 %ProgramData%，而此刻跑的是它在临时目录里的副本 ——
+	// 所以这块能连卸载器一起删干净。这正是把它搬出安装目录的意义。
+	if dir := UninstallerDir(); dir != "" {
+		log("清理卸载器目录 " + dir)
+		if err := os.RemoveAll(dir); err != nil {
+			log("  删除失败（重启后可手动清理）：" + err.Error())
+		}
+	}
 	return nil
 }
 
-// installUninstaller 把安装程序自己复制成安装目录里的 uninstall.exe。
-func installUninstaller(installDir string, log func(string)) error {
+// installUninstaller 把安装程序自己复制一份到 %ProgramData%，充当卸载器。
+func installUninstaller(log func(string)) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("取安装程序路径: %w", err)
 	}
-	target := filepath.Join(installDir, UninstallerName)
+	target := UninstallerPath()
 	if strings.EqualFold(self, target) {
 		return nil // 已经在目标位置，说明是卸载器在跑
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("创建卸载器目录: %w", err)
 	}
 	if err := copyFile(self, target); err != nil {
 		return fmt.Errorf("释放卸载程序: %w", err)
@@ -232,47 +260,37 @@ func installUninstaller(installDir string, log func(string)) error {
 	return nil
 }
 
-// scheduleSelfCleanup 处理「卸载器删不掉自己」这个老问题。
+// RelaunchFromTempIfNeeded 检查自己是不是在临时目录里跑，不是就切过去。
 //
-// Windows 不允许删除正在运行的 exe，所以安装目录里总会剩下一个 uninstall.exe，
-// 目录也就删不掉。两条路一起走，且顺序不能反 —— 先登记兜底再尝试，
-// 免得那个不一定成的尝试失败时把兜底也漏了：
+// 卸载要删掉 %ProgramData%\AntApp Link 整个目录，而卸载器自己就住在那里 ——
+// Windows 不允许删除正在运行的 exe，直接删必定失败。所以先把自己复制到临时目录、
+// 用副本重跑一遍，原进程立刻退出，副本就再没有「自己挡自己的路」这回事。
 //
-//  1. 登记「重启后删除」：Windows 的标准机制，保证它不会永远赖在磁盘上
-//  2. 起一个独立的 cmd，等我们退出后再删（正常路径上这一步就能清干净）
-func scheduleSelfCleanup(installDir string, log func(string)) {
-	self := filepath.Join(installDir, UninstallerName)
-
-	if err := deleteOnReboot(self); err != nil {
-		log("登记「重启后删除」失败：" + err.Error())
-	} else {
-		log("已登记「重启后删除」作兜底")
-	}
-
-	cleanupLog := filepath.Join(os.TempDir(), "antapp-cleanup.log")
-	script := fmt.Sprintf(
-		`ping 127.0.0.1 -n 4 >nul & (del /f /q "%s" & rmdir "%s") >"%s" 2>&1`,
-		self, installDir, cleanupLog)
-
-	// 刻意不设任何 CreationFlags。试过 CREATE_NO_WINDOW / DETACHED_PROCESS /
-	// CREATE_BREAKAWAY_FROM_JOB 的各种组合，反而出现「进程压根没起来」的情况，
-	// 而这条命令行本身是好的（手工执行一次就删干净了）。
-	cmd := exec.Command("cmd", "/c", script)
-	if err := cmd.Start(); err != nil {
-		log("收尾清理没能启动（已由「重启后删除」兜底）：" + err.Error())
-		return
-	}
-	log("收尾清理已安排（本窗口关闭后会自动删掉卸载器与空目录）")
-}
-
-// deleteOnReboot 把文件登记为「下次重启时删除」。这是 Windows 提供的标准机制，
-// 用来处理「自己删不掉自己」这类情况。
-func deleteOnReboot(path string) error {
-	p, err := windows.UTF16PtrFromString(path)
+// 返回 true 表示已经切换，调用方必须马上退出（活儿交给副本了）。
+func RelaunchFromTempIfNeeded(log func(string)) (bool, error) {
+	self, err := os.Executable()
 	if err != nil {
-		return err
+		return false, fmt.Errorf("取当前程序路径: %w", err)
 	}
-	return windows.MoveFileEx(p, nil, windows.MOVEFILE_DELAY_UNTIL_REBOOT)
+
+	tmp := filepath.Join(os.TempDir(), "antapp-uninstall.exe")
+	if strings.EqualFold(self, tmp) {
+		// 我就是那个副本。先等原进程退出 —— 它正占着 %ProgramData% 里那个 exe，
+		// 不等的话接下来删目录会失败。
+		time.Sleep(1200 * time.Millisecond)
+		return false, nil
+	}
+
+	if err := copyFile(self, tmp); err != nil {
+		return false, fmt.Errorf("复制卸载程序到临时目录失败: %w", err)
+	}
+	// 参数原样带过去（--uninstall、--quiet 之类）
+	cmd := exec.Command(tmp, os.Args[1:]...)
+	if err := cmd.Start(); err != nil {
+		return false, fmt.Errorf("启动临时目录里的卸载程序失败: %w", err)
+	}
+	log("已切换到临时目录里的副本：" + tmp)
+	return true, nil
 }
 
 func stopClient() {
@@ -333,9 +351,9 @@ func writeUninstallEntry(opts Options, exePath string) error {
 	}
 	defer k.Close()
 
-	// 指向安装目录里那份卸载器，而不是当前这个安装包 ——
+	// 指向 %ProgramData% 里那份卸载器，而不是当前这个安装包 ——
 	// 用户很可能早把安装包删了，那样「应用和功能」里的卸载按钮就废了
-	uninst := filepath.Join(opts.InstallDir, UninstallerName)
+	uninst := UninstallerPath()
 
 	values := map[string]string{
 		"DisplayName":     AppName,

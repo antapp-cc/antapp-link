@@ -47,7 +47,6 @@ bash install.sh
 ```
 C:\Program Files\AntApp Link\
   antapp-link.exe
-  uninstall.exe        卸载器（安装程序的副本）
   wintun.dll           首次运行时释放
   data\
     node.conf          连接码（内含私钥）
@@ -58,11 +57,13 @@ C:\Program Files\AntApp Link\
 
 ### 卸载
 
-三个入口，走的是同一个程序：客户端托盘菜单的「卸载 AntApp Link」、「应用和功能」里的卸载按钮、直接跑 `uninstall.exe --uninstall`（静默加 `--quiet`）。走界面会问要不要连 `data` 一起删；静默模式默认全清。
+三个入口，走的是同一个程序：客户端托盘菜单的「卸载 AntApp Link」、「应用和功能」里的卸载按钮、直接跑卸载器。走界面会弹出卸载向导，问要不要连 `data` 一起删；静默模式（`--quiet`）默认全清。
 
-**一个已知限制**：Windows 不允许删除正在运行的 exe，而卸载器就住在它要删的那个目录里 —— 所以卸载做完后，安装目录里**可能剩下一个 `uninstall.exe`**。程序会把它登记成「重启后删除」（`MoveFileEx` + `DELAY_UNTIL_REBOOT`，实测有效），下次重启系统自动清掉，也可以手动删。
+**卸载器住在 `C:\ProgramData\AntApp Link\`，刻意不放在安装目录里。** 因为卸载器要删掉整个安装目录，而 Windows 不允许删除正在运行的 exe —— 早先放在安装目录时，卸载完总会剩下一个 `uninstall.exe` 删不掉。试过四种绕法（`CREATE_NO_WINDOW`、`DETACHED_PROCESS`、`CREATE_BREAKAWAY_FROM_JOB`、改用任务计划/WMI 启动）都没用，因为矛盾在「它住在哪」，不在怎么启动它。
 
-试过四种绕法都不成立：`CREATE_NO_WINDOW`、`DETACHED_PROCESS`、`CREATE_BREAKAWAY_FROM_JOB`，以及改用任务计划/WMI 启动卸载器 —— 命令行本身没问题（手工执行一次就删干净了），矛盾在「卸载器住在哪」这个设计上，不在启动方式。彻底解法是把卸载器挪到 `%ProgramData%`，那样安装目录一次就能删干净；暂时没做，因为那等于又添一个常驻位置。
+现在的做法：卸载器启动后先把自己复制到 `%TEMP%`、用副本重跑一遍，原进程立刻退出。副本再去删 `%ProgramData%` 和安装目录，**两边都能删干净**（实测残留 0 条）。
+
+客户端托盘里的卸载入口用 `ShellExecute` 启动卸载器而不是 `exec.Command` —— 卸载器是 GUI 程序，走 shell 才会像用户双击那样正常拿到桌面会话和 UAC 处理。
 
 安装包是自写的（本机没有 Inno Setup / NSIS），所以整个流程没有外部依赖。
 

@@ -26,6 +26,19 @@ func main() {
 	dirFlag := flag.String("dir", "", "安装目录")
 	flag.Parse()
 
+	if *uninstall {
+		// 卸载器先把自己切到临时目录再干活：它住在 %ProgramData%，直接删那个目录
+		// 会被「不能删除正在运行的 exe」挡住。切换成功后职责就交给副本了。
+		switched, err := setup.RelaunchFromTempIfNeeded(func(string) {})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if switched {
+			return
+		}
+	}
+
 	if *quiet {
 		os.Exit(runQuiet(*uninstall, *dirFlag))
 	}

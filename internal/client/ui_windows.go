@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,6 +17,7 @@ import (
 	. "github.com/lxn/walk/declarative"
 	"golang.org/x/sys/windows"
 
+	"github.com/antapp-cc/antapp-link/internal/setup"
 	"github.com/antapp-cc/antapp-link/internal/update"
 )
 
@@ -443,25 +443,30 @@ func (u *UI) applyUpdate(newExe string) {
 	os.Exit(0)
 }
 
-// onUninstall 走的是安装目录里那份卸载器，跟「应用和功能」里的卸载按钮是同一个程序。
+// onUninstall 启动卸载器。跟「应用和功能」里的卸载按钮是同一个程序。
+//
+// 用 ShellExecute 而不是 exec.Command：卸载器是带界面的 GUI 程序，走 shell 才会
+// 像用户双击图标那样正常拿到桌面会话和 UAC 处理。之前用 exec.Command 起，
+// 结果界面根本没出来。
 func (u *UI) onUninstall() {
 	self, err := os.Executable()
 	if err != nil {
 		u.alert("卸载失败", "取当前程序路径："+err.Error())
 		return
 	}
-	dir := filepath.Dir(self)
-	uninst := filepath.Join(dir, "uninstall.exe")
+	installDir := filepath.Dir(self)
+	uninst := setup.UninstallerPath()
+
 	if _, err := os.Stat(uninst); err != nil {
 		u.alert("找不到卸载程序",
-			"安装目录里没有 uninstall.exe：\n"+dir+"\n\n"+
+			"没有在下面这个位置找到卸载器：\n"+uninst+"\n\n"+
 				"可以到「设置 → 应用 → 已安装的应用」里卸载，或者用当初那个安装包加 --uninstall。")
 		return
 	}
 
 	if walk.MsgBox(u.mw, "卸载 AntApp Link",
-		"将从下面这个目录删除程序：\n"+dir+"\n\n"+
-			"卸载时会先断开隧道、还原网络，然后程序退出。确定卸载吗？",
+		"将删除程序目录：\n"+installDir+"\n\n"+
+			"卸载时会先断开隧道、还原网络，然后由卸载向导让你选择是否保留连接码。\n\n确定卸载吗？",
 		walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
 		return
 	}
@@ -470,8 +475,17 @@ func (u *UI) onUninstall() {
 		// 先把网络还原干净再交给卸载器 —— 它下一步就会把本进程杀掉
 		_ = u.app.Disconnect()
 
-		cmd := exec.Command(uninst, "--uninstall")
-		if err := cmd.Start(); err != nil {
+		file, err := windows.UTF16PtrFromString(uninst)
+		if err != nil {
+			u.alert("卸载失败", err.Error())
+			return
+		}
+		args, err := windows.UTF16PtrFromString("--uninstall")
+		if err != nil {
+			u.alert("卸载失败", err.Error())
+			return
+		}
+		if err := windows.ShellExecute(0, nil, file, args, nil, windows.SW_SHOWNORMAL); err != nil {
 			u.alert("启动卸载程序失败", err.Error())
 			return
 		}
