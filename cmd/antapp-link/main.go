@@ -102,7 +102,9 @@ func run() int {
 	var opts []client.Option
 	if *noNetCfg {
 		opts = append(opts, client.WithNoNetCfg())
-		logger.Warn("联调模式：只建隧道，不改路由与 DNS")
+		// 这是说明不是警告：-no-netcfg 只在命令行显式指定时才有，
+		// 正常双击启动走不到这里。
+		logger.Info("联调模式：只建隧道、只配网卡，不改路由与 DNS")
 	}
 	app := client.NewApp(inv, dataDir, logger, opts...)
 

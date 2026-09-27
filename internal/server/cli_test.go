@@ -77,7 +77,7 @@ func TestCLIInitAndInviteEndToEnd(t *testing.T) {
 		t.Fatalf("invite 失败(%d): %s", code, errOut.String())
 	}
 
-	raw, err := os.ReadFile(filepath.Join(dir, "antapp-node-pinode-01.antapp"))
+	raw, err := os.ReadFile(filepath.Join(dir, "pinode.antapp"))
 	if err != nil {
 		t.Fatalf("读连接码文件: %v", err)
 	}

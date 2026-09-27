@@ -199,7 +199,9 @@ func TestRestorePutsOriginalDNSBack(t *testing.T) {
 
 func TestRestoreRemovesAdapterAddress(t *testing.T) {
 	s := dumpCommands(RestoreCommands(testSnapshot(), testNetConfig()))
-	mustContainCommand(t, RestoreCommands(testSnapshot(), testNetConfig()), "delete address")
+	// 用 PowerShell cmdlet 而不是 netsh —— 后者删最后一个地址时返回退出码 1，
+	// 会让上层误判还原失败。见 RestoreCommands 里的说明。
+	mustContainCommand(t, RestoreCommands(testSnapshot(), testNetConfig()), "Remove-NetIPAddress")
 	if !strings.Contains(s, "10.10.0.2") {
 		t.Errorf("没把隧道网卡的地址撤掉:\n%s", s)
 	}

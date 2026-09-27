@@ -179,8 +179,11 @@ func RestoreCommands(snap Snapshot, cfg NetConfig) []Command {
 			"delete", cfg.ServerIP, "mask", "255.255.255.255"}})
 	}
 	cmds = append(cmds,
-		Command{"netsh", []string{"interface", "ipv4", "delete", "address",
-			fmt.Sprintf("name=%s", cfg.AdapterName), fmt.Sprintf("addr=%s", cfg.TunnelIP)}},
+		// 用 PowerShell 的 cmdlet 而不是 netsh：netsh 删掉网卡上最后一个地址时会返回退出码 1，
+		// 即便删除本身是成功的。上层据此判定「还原失败」，于是双击一个新连接码时会断开却切不过去。
+		Command{"powershell", []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+			"-Command", fmt.Sprintf("Remove-NetIPAddress -InterfaceAlias '%s' -IPAddress '%s' -Confirm:$false -ErrorAction SilentlyContinue",
+				cfg.AdapterName, cfg.TunnelIP)}},
 		Command{"ipconfig", []string{"/flushdns"}})
 	return cmds
 }

@@ -259,9 +259,10 @@ func cmdInvite(stdout, stderr io.Writer, args []string) int {
 		fmt.Fprintf(stderr, "创建输出目录失败: %v\n", err)
 		return 1
 	}
-	// 用 .antapp 后缀：客户端安装时注册了这个关联，用户把它拷到节点机上
-	// 双击就能导入，不用再打开客户端找导入按钮。
-	path := filepath.Join(*outDir, fmt.Sprintf("antapp-node-%s.antapp", name))
+	// 文件名固定成 pinode.antapp：它是给节点机双击导入用的，
+	// 名字短一点更像「一张配置」，而不是一长串自动生成物。
+	// 代价是同一目录下签多个节点会互相覆盖，要并存就 -o 到不同目录。
+	path := filepath.Join(*outDir, "pinode.antapp")
 	// 私钥含在里面，权限必须收紧
 	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
 		fmt.Fprintf(stderr, "写连接码文件失败: %v\n", err)
