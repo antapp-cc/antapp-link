@@ -179,10 +179,12 @@ func RestoreCommands(snap Snapshot, cfg NetConfig) []Command {
 			"delete", cfg.ServerIP, "mask", "255.255.255.255"}})
 	}
 	cmds = append(cmds,
-		// 用 PowerShell 的 cmdlet 而不是 netsh：netsh 删掉网卡上最后一个地址时会返回退出码 1，
-		// 即便删除本身是成功的。上层据此判定「还原失败」，于是双击一个新连接码时会断开却切不过去。
+		// 先判存在再删，并让命令自己保证退出码为 0。
+		// Remove-NetIPAddress 在目标不存在（网卡或地址已被系统回收）时抛的是
+		// Cmdletization 层的终止性错误，-ErrorAction SilentlyContinue 压不住，
+		// 退出码照样是 1 —— 上层会据此误报「还原网络配置失败」。
 		Command{"powershell", []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-			"-Command", fmt.Sprintf("Remove-NetIPAddress -InterfaceAlias '%s' -IPAddress '%s' -Confirm:$false -ErrorAction SilentlyContinue",
+			"-Command", fmt.Sprintf("try { Remove-NetIPAddress -InterfaceAlias '%s' -IPAddress '%s' -Confirm:$false -ErrorAction Stop } catch { }; exit 0",
 				cfg.AdapterName, cfg.TunnelIP)}},
 		Command{"ipconfig", []string{"/flushdns"}})
 	return cmds
