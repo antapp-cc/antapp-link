@@ -11,6 +11,7 @@ import (
 
 	"github.com/antapp-cc/antapp-link/internal/client"
 	"github.com/antapp-cc/antapp-link/internal/pki"
+	"github.com/antapp-cc/antapp-link/internal/update"
 )
 
 func main() {
@@ -26,6 +27,9 @@ func run() int {
 		showVer  = flag.Bool("version", false, "显示版本")
 	)
 	flag.Parse()
+
+	// 上一次更新会在程序旁边留下 .old，这次启动顺手清掉
+	update.CleanupOld()
 
 	if *showVer {
 		fmt.Printf("antapp-link %s\n", client.Version)

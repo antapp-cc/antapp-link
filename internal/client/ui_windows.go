@@ -3,6 +3,7 @@
 package client
 
 import (
+	"context"
 	"crypto/sha256"
 	_ "embed"
 	"errors"
@@ -15,6 +16,8 @@ import (
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
 	"golang.org/x/sys/windows"
+
+	"github.com/antapp-cc/antapp-link/internal/update"
 )
 
 //go:embed assets/antapp.ico
@@ -40,11 +43,13 @@ type UI struct {
 	txtLog     *walk.TextEdit
 	btnPrimary *walk.PushButton
 	btnReconn  *walk.PushButton
+	btnUpdate  *walk.PushButton
 	btnHide    *walk.PushButton
 
 	quitting    bool
 	lastLogText string
 	done        chan struct{}
+	pending     *update.Manifest
 }
 
 // RunUI 阻塞运行图形界面，直到用户从托盘菜单退出。
@@ -104,10 +109,11 @@ func (u *UI) build() error {
 			Composite{
 				Layout: HBox{MarginsZero: true, Spacing: 8},
 				Children: []Widget{
-					PushButton{AssignTo: &u.btnPrimary, Text: "连接", MinSize: Size{Width: 110}, OnClicked: u.onPrimary},
-					PushButton{AssignTo: &u.btnReconn, Text: "重新连接", MinSize: Size{Width: 110}, OnClicked: u.onReconnect},
+					PushButton{AssignTo: &u.btnPrimary, Text: "连接", MinSize: Size{Width: 100}, OnClicked: u.onPrimary},
+					PushButton{AssignTo: &u.btnReconn, Text: "重新连接", MinSize: Size{Width: 100}, OnClicked: u.onReconnect},
+					PushButton{AssignTo: &u.btnUpdate, Text: "立即更新", MinSize: Size{Width: 100}, OnClicked: u.onUpdate},
 					HSpacer{},
-					PushButton{AssignTo: &u.btnHide, Text: "隐藏", MinSize: Size{Width: 110}, OnClicked: u.onHide},
+					PushButton{AssignTo: &u.btnHide, Text: "隐藏", MinSize: Size{Width: 100}, OnClicked: u.onHide},
 				},
 			},
 		},
@@ -127,7 +133,11 @@ func (u *UI) build() error {
 		return err
 	}
 
+	// 没有新版本时这个按钮不该占着位置
+	u.btnUpdate.SetVisible(false)
+
 	go u.refreshLoop()
+	go u.autoCheckUpdate()
 	u.refresh()
 	return nil
 }
@@ -162,6 +172,12 @@ func (u *UI) buildTray() error {
 	_ = mOpenDir.SetText("打开数据目录")
 	mOpenDir.Triggered().Attach(u.onOpenDataDir)
 	ni.ContextMenu().Actions().Add(mOpenDir)
+
+	mUpdate := walk.NewAction()
+	_ = mUpdate.SetText("检查更新")
+	mUpdate.Triggered().Attach(u.onCheckUpdate)
+	ni.ContextMenu().Actions().Add(mUpdate)
+	ni.ContextMenu().Actions().Add(walk.NewSeparatorAction())
 
 	mAuto := walk.NewAction()
 	_ = mAuto.SetText("开机自启")
@@ -231,6 +247,9 @@ func (u *UI) refresh() {
 	}
 	if configured && st.Online {
 		state += fmt.Sprintf("（延迟 %d ms）", st.RTT.Milliseconds())
+	}
+	if u.pending != nil {
+		state += fmt.Sprintf("　·　有新版本 %s", u.pending.Version)
 	}
 	u.lblState.SetText(state)
 
@@ -316,6 +335,106 @@ func (u *UI) onReconnect() {
 }
 
 func (u *UI) onHide() { u.mw.Hide() }
+
+// ---------- 在线更新 ----------
+
+// autoCheckUpdate 在界面出来之后静默查一次，不打扰用户。
+func (u *UI) autoCheckUpdate() {
+	select {
+	case <-u.done:
+		return
+	case <-time.After(8 * time.Second):
+	}
+	u.checkUpdate(false)
+}
+
+func (u *UI) onCheckUpdate() { go u.checkUpdate(true) }
+
+func (u *UI) checkUpdate(manual bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	m, err := u.app.CheckUpdate(ctx)
+
+	u.mw.Synchronize(func() {
+		switch {
+		case m != nil:
+			u.pending = m
+			u.btnUpdate.SetText("更新到 " + m.Version)
+			u.btnUpdate.SetVisible(true)
+			u.refresh()
+			if manual {
+				u.askUpdate()
+			}
+		case err != nil:
+			if manual {
+				walk.MsgBox(u.mw, "检查更新失败", err.Error(), walk.MsgBoxIconWarning)
+			}
+		default:
+			if manual {
+				walk.MsgBox(u.mw, "已是最新",
+					fmt.Sprintf("当前版本 %s 已经是最新的。", Version), walk.MsgBoxIconInformation)
+			}
+		}
+	})
+}
+
+func (u *UI) onUpdate() { u.askUpdate() }
+
+func (u *UI) askUpdate() {
+	m := u.pending
+	if m == nil {
+		return
+	}
+	notes := strings.TrimSpace(m.Notes)
+	if notes != "" {
+		notes = "\n\n更新说明：\n" + truncateRunes(notes, 300)
+	}
+	if walk.MsgBox(u.mw, "更新到 "+m.Version,
+		fmt.Sprintf("当前版本：%s\n新版本：%s%s\n\n"+
+			"下载并更新吗？更新会先断开连接、还原网络，随后自动重启。",
+			Version, m.Version, notes),
+		walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
+		return
+	}
+
+	u.btnUpdate.SetEnabled(false)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+		defer cancel()
+
+		newExe, err := u.app.DownloadUpdate(ctx, m)
+		if err != nil {
+			u.mw.Synchronize(func() {
+				u.btnUpdate.SetEnabled(true)
+				walk.MsgBox(u.mw, "下载更新包失败", err.Error(), walk.MsgBoxIconWarning)
+			})
+			return
+		}
+
+		u.mw.Synchronize(func() {
+			if walk.MsgBox(u.mw, "下载完成",
+				"更新包已通过校验。\n\n点「是」马上重启到新版本；点「否」下次启动时再更新。",
+				walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
+				u.btnUpdate.SetEnabled(true)
+				return
+			}
+			u.applyUpdate(newExe)
+		})
+	}()
+}
+
+// applyUpdate 已经回到主线程：替换文件、拉起新版，然后立刻退出自己 ——
+// 此刻磁盘上的文件名已经归新版所有了。
+func (u *UI) applyUpdate(newExe string) {
+	if err := u.app.ApplyUpdate(newExe); err != nil {
+		walk.MsgBox(u.mw, "更新失败", err.Error(), walk.MsgBoxIconWarning)
+		u.btnUpdate.SetEnabled(true)
+		return
+	}
+	u.quitting = true
+	os.Exit(0)
+}
 
 // onImport 从剪贴板取连接码。
 //

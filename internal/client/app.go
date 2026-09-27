@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/antapp-cc/antapp-link/internal/pki"
+	"github.com/antapp-cc/antapp-link/internal/update"
 )
 
 // App 把「连接 / 断开 / 自愈 / 状态」串起来。托盘只是它的一个界面，
@@ -30,6 +32,9 @@ type App struct {
 	cancel    context.CancelFunc
 	running   bool
 	lastError string
+
+	checker *update.Checker
+	pending *update.Manifest
 }
 
 type Option func(*App)
@@ -51,6 +56,7 @@ func NewApp(inv pki.Invite, dataDir string, logger *slog.Logger, opts ...Option)
 		dataDir:   dataDir,
 		statePath: StatePath(dataDir),
 		log:       logger,
+		checker:   update.NewChecker(Version),
 	}
 	for _, opt := range opts {
 		opt(app)
@@ -385,4 +391,75 @@ func (a *App) UpdateInvite(inv pki.Invite) error {
 	defer a.mu.Unlock()
 	a.inv = inv
 	return nil
+}
+
+// ---------- 在线更新 ----------
+
+// CheckUpdate 询问更新源。返回 nil 表示已经是最新。
+//
+// 部分源失败不算错（有备源就是干这个的）；只有全部源都失败才报错。
+func (a *App) CheckUpdate(ctx context.Context) (*update.Manifest, error) {
+	m, errs := a.checker.Check(ctx)
+	if m == nil {
+		if len(errs) > 0 && len(errs) == len(a.checker.Sources) {
+			for _, e := range errs {
+				a.log.Warn("更新源不可用", "err", e)
+			}
+			return nil, fmt.Errorf("所有更新源都不可用：%v", errs[0])
+		}
+		a.log.Info("已是最新版本", "version", Version)
+		return nil, nil
+	}
+
+	a.log.Info("发现新版本", "current", Version, "latest", m.Version)
+	a.mu.Lock()
+	a.pending = m
+	a.mu.Unlock()
+	return m, nil
+}
+
+// PendingUpdate 返回最近一次检查到的新版本，没有则为 nil。
+func (a *App) PendingUpdate() *update.Manifest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.pending
+}
+
+// DownloadUpdate 下载并校验更新包，返回落地路径。
+func (a *App) DownloadUpdate(ctx context.Context, m *update.Manifest) (string, error) {
+	dir := filepath.Join(a.dataDir, "update")
+	var lastLog time.Time
+
+	path, err := a.checker.Download(ctx, m, dir, func(done, total int64) {
+		// 进度只偶尔记一条，否则几 MB 下来能把日志刷满
+		if time.Since(lastLog) < 3*time.Second {
+			return
+		}
+		lastLog = time.Now()
+		if total > 0 {
+			a.log.Info("下载更新包", "进度", fmt.Sprintf("%.0f%%", float64(done)/float64(total)*100))
+		} else {
+			a.log.Info("下载更新包", "已下载", done)
+		}
+	})
+	if err != nil {
+		a.log.Error("更新包下载失败", "err", err)
+		return "", err
+	}
+	a.log.Info("更新包已下载并通过校验", "file", path)
+	return path, nil
+}
+
+// ApplyUpdate 断开隧道、还原网络，然后把新版本替换上去。
+//
+// 顺序不能反：先还原网络再替换文件。旧进程要是带着「接管中」的网络直接消失，
+// 用户就卡在断网状态，而新进程还没起来。
+//
+// 成功返回后调用方必须立刻退出自己 —— 磁盘上的文件名已经被新版占用了。
+func (a *App) ApplyUpdate(newExe string) error {
+	if err := a.Disconnect(); err != nil {
+		a.log.Warn("更新前还原网络失败，仍然继续替换", "err", err)
+	}
+	a.log.Info("替换程序并重启", "new", newExe)
+	return update.Apply(newExe)
 }

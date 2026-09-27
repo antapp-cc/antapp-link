@@ -93,6 +93,39 @@ pwsh -File tools/mkres.ps1     # 会用 go install 装 rsrc
 
 manifest 干三件事：请求 Common-Controls v6（walk 的图标加载依赖它，不然启动即失败）、声明高 DPI、声明 `requireAdministrator`（建虚拟网卡和改路由都要提权，让 UAC 在双击时就弹而不是点「连接」才失败）。
 
+### 在线更新
+
+启动 8 秒后静默查一次更新源；发现新版时状态行显示「有新版本 vX.Y.Z」，按钮区出现「立即更新」。托盘菜单里也有「检查更新」可手动触发。
+
+流程是：下载 → 校验 sha256 → **先断开隧道、还原网络** → 把当前 exe 改名成 `.old` → 写入新版 → 拉起新进程 → 自己退出。新版启动时顺手删掉 `.old`。
+
+顺序不能反：旧进程要是带着「接管中」的网络直接消失，用户就卡在断网状态，而新进程还没起来。拷贝失败会回滚到 `.old` —— 不能让用户手上既没有旧版也没有新版。
+
+**更新源是「一串 URL 按顺序试」**，内置主源：
+
+```
+https://github.com/antapp-cc/antapp-link/releases/latest/download/latest.json
+```
+
+用的是 `releases/latest/download/<文件名>` 这种固定链接而不是 API —— 未认证的 GitHub API 每 IP 每小时只有 60 次，而且 assets 结构解析起来脆。加自建备源只需往 [update.go](antapp-link/internal/update/update.go) 的 `DefaultSources` 里补一条。环境变量 `ANTAPP_UPDATE_SOURCES`（分号分隔）可临时覆盖，内网部署和本地联调都用它。
+
+**发布一个版本**：
+
+```powershell
+pwsh -File tools/release.ps1 -Version 0.2.0
+```
+
+它会构建、算 sha256、生成 `latest.json`，并写一份上传指引到输出目录。到 GitHub 建 tag 为 `v0.2.0` 的 Release，把 `antapp-link.exe` 和 `latest.json` 传上去即可 —— **资产名不能改**（客户端靠固定文件名取），记得勾上 "Set as the latest release"。
+
+**关于校验强度，说实话**：现在只校 sha256，能挡住传输损坏和下载截断，但**挡不住更新源本身被替换** —— 谁能改 `latest.json`，就能往所有节点机推任意程序。清单结构里已经预留了 `sig` 字段，将来要加 Ed25519 签名不用改格式，老客户端也不会因为多了字段解析失败。
+
+本地验整条链路（不需要真发 Release）：
+
+```powershell
+# 见 dist/updatetest 的用法：一个假「新版」+ 一个待更新的旧版 + 本地 http 源
+go run ./tools/updatetest -sources http://127.0.0.1:8899/latest.json -apply
+```
+
 ## 项目结构
 
 ```
@@ -101,8 +134,11 @@ cmd/antapp-link/         客户端入口（Windows，单 exe + 托盘）
 internal/proto/          帧编解码（两端共用）
 internal/pki/            自签 CA 与连接码
 internal/server/         TUN、隧道循环、netfilter、CLI、systemd 安装
-internal/client/         Wintun 网卡、隧道、路由与 DNS 接管、托盘、自启
+internal/client/         Wintun 网卡、隧道、路由与 DNS 接管、界面与托盘、自启
+internal/setup/          安装与卸载（释放文件、快捷方式、注册表）
+internal/update/         在线更新：检查、下载校验、替换自身
 deploy/                  云服安装脚本与迁移说明
+tools/                   构建期脚本：资源生成、发版打包、更新链路自测
 docs/superpowers/        设计文档与实现计划
 third_party/             Wintun 出处与哈希（dll 已提取进 internal/client/assets）
 ```
