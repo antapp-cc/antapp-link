@@ -28,6 +28,10 @@ const (
 	// 不允许删除正在运行的 exe —— 放在安装目录里必定留个尾巴删不掉。
 	UninstallerName = "uninstall.exe"
 
+	// UninstallLinkName 是放在安装目录里的卸载快捷方式。刻意不放客户端托盘的
+	// 右键菜单里 —— 那里紧挨着「退出」，而卸载是不可逆的，太容易点错。
+	UninstallLinkName = "卸载 AntApp Link.lnk"
+
 	uninstallKey = `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AntApp Link`
 )
 
@@ -159,6 +163,14 @@ func Install(opts Options, log func(string)) error {
 		return err
 	}
 
+	// 卸载入口就放在安装目录里，用户想卸载时翻进来点一下
+	uninstLink := filepath.Join(opts.InstallDir, UninstallLinkName)
+	if err := createShortcut(uninstLink, UninstallerPath(), opts.InstallDir, "--uninstall"); err != nil {
+		log("卸载快捷方式创建失败（仍可从「应用和功能」卸载）：" + err.Error())
+	} else {
+		log("已创建卸载快捷方式 " + uninstLink)
+	}
+
 	if opts.StartMenu {
 		if err := createShortcut(startMenuLink(), dst, opts.InstallDir); err != nil {
 			log("开始菜单快捷方式创建失败（不影响使用）：" + err.Error())
@@ -197,7 +209,11 @@ func Uninstall(opts Options, log func(string)) error {
 	_ = runHidden("schtasks", "/delete", "/tn", AutostartTask, "/f")
 
 	log("删除快捷方式")
-	for _, link := range []string{startMenuLink(), desktopLink()} {
+	for _, link := range []string{
+		startMenuLink(),
+		desktopLink(),
+		filepath.Join(opts.InstallDir, UninstallLinkName),
+	} {
 		if err := os.Remove(link); err == nil {
 			log("  已删除 " + link)
 		}
@@ -328,7 +344,7 @@ func desktopLink() string {
 	return filepath.Join(base, "Desktop", AppName+".lnk")
 }
 
-func createShortcut(lnkPath, target, workDir string) error {
+func createShortcut(lnkPath, target, workDir string, args ...string) error {
 	if err := os.MkdirAll(filepath.Dir(lnkPath), 0o755); err != nil {
 		return err
 	}
@@ -337,8 +353,9 @@ func createShortcut(lnkPath, target, workDir string) error {
 		`$ws = New-Object -ComObject WScript.Shell; `+
 			`$s = $ws.CreateShortcut('%s'); `+
 			`$s.TargetPath = '%s'; $s.WorkingDirectory = '%s'; `+
+			`$s.Arguments = '%s'; `+
 			`$s.IconLocation = '%s,0'; $s.Save()`,
-		q(lnkPath), q(target), q(workDir), q(target))
+		q(lnkPath), q(target), q(workDir), q(strings.Join(args, " ")), q(target))
 	_, err := runHiddenOutput("powershell", "-NoProfile", "-NonInteractive",
 		"-ExecutionPolicy", "Bypass", "-Command", script)
 	return err

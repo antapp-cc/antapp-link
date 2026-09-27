@@ -47,7 +47,8 @@ bash install.sh
 ```
 C:\Program Files\AntApp Link\
   antapp-link.exe
-  wintun.dll           首次运行时释放
+  wintun.dll            首次运行时释放
+  卸载 AntApp Link.lnk   卸载入口
   data\
     node.conf          连接码（内含私钥）
     antapp.ico
@@ -57,7 +58,9 @@ C:\Program Files\AntApp Link\
 
 ### 卸载
 
-三个入口，走的是同一个程序：客户端托盘菜单的「卸载 AntApp Link」、「应用和功能」里的卸载按钮、直接跑卸载器。走界面会弹出卸载向导，问要不要连 `data` 一起删；静默模式（`--quiet`）默认全清。
+三个入口，走的是同一个程序：**安装目录里的「卸载 AntApp Link」快捷方式**、「应用和功能」里的卸载按钮、直接跑卸载器。走界面会弹出卸载向导，问要不要连 `data` 一起删；静默模式（`--quiet`）默认全清。
+
+卸载入口刻意**不放客户端托盘的右键菜单** —— 那里紧挨着「退出」，而卸载不可逆，误点代价太大。想卸载就翻一下安装目录。
 
 **卸载器住在 `C:\ProgramData\AntApp Link\`，刻意不放在安装目录里。** 因为卸载器要删掉整个安装目录，而 Windows 不允许删除正在运行的 exe —— 早先放在安装目录时，卸载完总会剩下一个 `uninstall.exe` 删不掉。试过四种绕法（`CREATE_NO_WINDOW`、`DETACHED_PROCESS`、`CREATE_BREAKAWAY_FROM_JOB`、改用任务计划/WMI 启动）都没用，因为矛盾在「它住在哪」，不在怎么启动它。
 
