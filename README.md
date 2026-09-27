@@ -117,6 +117,8 @@ pwsh -File tools/release.ps1 -Version 0.2.0
 
 它会构建、算 sha256、生成 `latest.json`，并写一份上传指引到输出目录。到 GitHub 建 tag 为 `v0.2.0` 的 Release，把 `antapp-link.exe` 和 `latest.json` 传上去即可 —— **资产名不能改**（客户端靠固定文件名取），记得勾上 "Set as the latest release"。
 
+⚠️ **只上传 `dist/release-<版本>/` 里的文件**。`dist/` 下还有别的同名文件（更新链路自测用的假程序，放在 `dist/_fixtures/`），拿错了会让客户端「发现新版本但下载失败」—— 那份清单里的下载地址指向本机端口。分辨方法很简单：真客户端内嵌了 wintun.dll，**有 11 MB 左右**，假的那个只有 1.6 MB。
+
 **关于校验强度，说实话**：现在只校 sha256，能挡住传输损坏和下载截断，但**挡不住更新源本身被替换** —— 谁能改 `latest.json`，就能往所有节点机推任意程序。清单结构里已经预留了 `sig` 字段，将来要加 Ed25519 签名不用改格式，老客户端也不会因为多了字段解析失败。
 
 本地验整条链路（不需要真发 Release）：

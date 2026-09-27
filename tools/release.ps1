@@ -82,6 +82,8 @@ $guide = @"
 注意
   * 一定要勾选 "Set as the latest release"，否则 releases/latest 还是指向旧版。
   * 想撤回某个版本就把它标记成 pre-release，客户端不会取到。
+  * 只上传本目录（$out）里的文件。dist 下还有别的同名文件（联调用的假程序），
+    拿错了会让客户端「发现新版本但下载失败」—— 因为清单里的地址指向本机端口。
 "@
 [System.IO.File]::WriteAllText((Join-Path $out '上传指引.txt'), $guide,
     (New-Object System.Text.UTF8Encoding($false)))
