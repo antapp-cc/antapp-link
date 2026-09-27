@@ -186,7 +186,9 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 退出
 ```
 
-**Wintun 说明**：虚拟网卡用 WireGuard 官方的 Wintun。`wintun.dll` 用 `go:embed` 内嵌进 exe，运行时释放到 `%ProgramData%\AntNestLink\` 再动态加载，**分发物只有一个 exe**；内嵌的 dll 必须与 exe 架构一致（amd64 / arm64 分开构建）。它是操作系统的网络适配器驱动，不是「要用户另外安装的工具/服务」——用户双击就能用，不需要装 OpenVPN、不需要装 TAP 驱动、不需要单独跑安装程序。实现前需确认 Wintun 的分发许可对本项目（商业分发）适用。
+**Wintun 说明**：虚拟网卡用 WireGuard 官方的 Wintun。`wintun.dll` 用 `go:embed` 内嵌进 exe，运行时释放到 `%ProgramData%\AntNestLink\` 再动态加载，**分发物只有一个 exe**；内嵌的 dll 必须与 exe 架构一致（amd64 / arm64 分开构建）。它是操作系统的网络适配器驱动，不是「要用户另外安装的工具/服务」——用户双击就能用，不需要装 OpenVPN、不需要装 TAP 驱动、不需要单独跑安装程序。
+
+**许可已核实**（原计划是「实现前确认」，现已确认）：Wintun 的**源码**是 GPLv2，但从 wintun.net 下载的**预编译 `wintun.dll` 适用单独的 Prebuilt Binaries License**，其中第 3.d 条明确允许「随其他软件一起分发」，前提是只通过 `wintun.h` 暴露的 API 使用它 —— 我们的用法正好落在许可范围内，商业分发没问题。两条要求必须遵守：发行包要附上该许可原文（条款 c 禁止移除版权声明），且**不得分发改名后的驱动文件**，用原始的 `wintun.dll`。
 
 ## 8. 路由与 DNS 接管
 
@@ -268,7 +270,7 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 | 风险 | 说明与应对 |
 |---|---|
 | TCP-over-TCP 重传叠加 | 外层 TCP 丢包时内层也会重传。Pi 节点是低带宽长连接场景，影响可忽略。若实测上传统慢，再评估 UDP 通道（方案 C），协议帧格式不用改，只换外层传输 |
-| Wintun 许可 | 商业分发前必须确认 Wintun 的许可条款适用 |
+| Wintun 许可 | 已核实可用：预编译 `wintun.dll` 的 Prebuilt Binaries License 第 3.d 条允许随其他软件一起分发，只要求通过 API 使用、随包附许可原文、不改名分发 |
 | 杀软误报 | 未签名的 Go exe + 虚拟网卡驱动容易被拦。交付前用现有的 `签名exe.py` 做代码签名 |
 | Windows 11 自动 DoH | 8.8.8.8 是已知 DoH 服务器，Windows 可能自动升级为加密 DNS。但 DoH 走 443、443 也在隧道里，解析结果依然干净，不构成泄漏 |
 | 客户端需要管理员权限 | 创建虚拟网卡和改路由的硬性要求。开机自启用计划任务（最高权限）而不是注册表 Run 项 |
