@@ -29,6 +29,26 @@ bash install.sh
 
 详细步骤见 [deploy/README.md](deploy/README.md)。
 
+## 实测记录
+
+在一台全新的 VPS 上（Debian 12，2 核 2GB，除 SSH 外没有任何服务）端到端跑过一遍：
+
+| 验证项 | 结果 |
+|---|---|
+| `install.sh` 一键安装 | 二进制 + CA + systemd + netfilter 全就绪 |
+| 隧道建立 | 客户端从家宽（NAT 后）连上，服务端显示 `已接入节点 pi-node-01` |
+| 隧道连通性 | 云服 `ping 10.10.0.2`：4 发 4 收，0% 丢包，RTT ~200ms |
+| **公网端口转发** | 第三方机器 `wget http://<云服IP>:31400/` → **HTTP 200**，拿到客户端上的内容 |
+| 端口段逐端口 | 31400 可连接；31401-31409 被拒（RST）—— 正是「转发生效但无服务」的正确表现 |
+| `install.sh` 幂等重跑 | CA 未重建（已签发的连接码不会失效），隧道不掉线 |
+
+**全新 VPS 上真实踩到的两个坑**（都已写进 `install.sh`）：
+
+1. **Debian 12 默认不带 `iptables`** —— 它转向 nftables 了，而 DNAT 规则要用 iptables。脚本现在会自动装（装上的是 `iptables-nft`，后端仍是 nft，规则语法兼容）。
+2. **`tun` 模块不会自动加载** —— 精简系统上 `/dev/net/tun` 也就不会出现。脚本现在会 `modprobe tun` 并检查设备节点，不支持 TUN 的机器（老式 OpenVZ 容器）会直接报错退出，而不是装到一半才失败。
+
+**一个容易误判的验证陷阱**：在云服上访问**自己的公网 IP** 测不出端口转发 —— 那种流量走 `OUTPUT` 链，不经过 `PREROUTING`，DNAT 根本不参与。必须从第三方机器测。
+
 ## Windows 客户端
 
 ### 安装

@@ -11,5 +11,6 @@ require (
 
 require (
 	github.com/lxn/win v0.0.0-20210218163916-a377121e959e // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	gopkg.in/Knetic/govaluate.v3 v3.0.0 // indirect
 )

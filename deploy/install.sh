@@ -63,6 +63,31 @@ done
 [[ "$(id -u)" -eq 0 ]] || die "请用 root 运行"
 [[ -f "$SRC_DIR/antapp-linkd" ]] || die "同目录下没有 antapp-linkd，请把它和本脚本一起上传"
 
+# 全新 VPS 上真实踩到的两件事：
+# 1) Debian 12 默认不带 iptables（它转向 nftables 了），而 DNAT 规则要用它；
+# 2) tun 模块在精简系统上不会自动加载，/dev/net/tun 也就不会出现。
+log "检查系统依赖"
+missing=()
+command -v iptables >/dev/null || missing+=(iptables)
+command -v modprobe >/dev/null || missing+=(kmod)
+if [[ ${#missing[@]} -gt 0 ]]; then
+  log "缺少 ${missing[*]}，尝试安装"
+  if command -v apt-get >/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}"
+  elif command -v dnf >/dev/null; then
+    dnf install -y -q "${missing[@]}"
+  elif command -v yum >/dev/null; then
+    yum install -y -q "${missing[@]}"
+  else
+    die "缺少 ${missing[*]}，且没找到可用的包管理器，请手动安装"
+  fi
+fi
+command -v iptables >/dev/null || die "iptables 仍不可用"
+
+modprobe tun 2>/dev/null || true
+[[ -c /dev/net/tun ]] || die "/dev/net/tun 不可用 —— 这台机器不支持 TUN 设备（老式 OpenVZ 容器常见），换一台"
+
 log "安装二进制到 $BIN"
 install -m 0755 "$SRC_DIR/antapp-linkd" "$BIN.new"
 mv -f "$BIN.new" "$BIN"
