@@ -40,6 +40,23 @@ bash install.sh
 - 登记到「应用和功能」，从那里卸载，或用 `antapp-setup.exe --uninstall`
 - 装完自动启动；**首次使用会引导导入连接码**
 
+**连接码、日志、状态文件都在 `C:\Program Files\AntApp Link\data\`** —— 跟程序放在一起，翻安装目录就能看到，不用去 `ProgramData` 里找。该目录写不进去时（比如程序被放在只读位置）才退回到 `%ProgramData%\AntAppLink\`。
+
+安装目录长这样：
+
+```
+C:\Program Files\AntApp Link\
+  antapp-link.exe
+  wintun.dll           首次运行时释放
+  data\
+    node.conf          连接码（内含私钥）
+    antapp.ico
+    state.json         网络现场快照，崩溃自愈用
+    logs\client.log
+```
+
+卸载时会问要不要连 `data` 一起删。
+
 安装包是自写的（本机没有 Inno Setup / NSIS），所以整个流程没有外部依赖。
 
 ### 界面与托盘

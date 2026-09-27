@@ -174,8 +174,6 @@ func runUninstallUI(icon *walk.Icon) int {
 			walk.MsgBoxIconWarning)
 		return 1
 	}
-	opts.DataDir = setup.DefaultDataDir()
-
 	var mw *walk.MainWindow
 	var chkData *walk.CheckBox
 	var btn *walk.PushButton
@@ -214,7 +212,8 @@ func runUninstallUI(icon *walk.Icon) int {
 		Children: []Widget{
 			Label{Text: "将从下面这个目录删除程序文件："},
 			Label{Text: opts.InstallDir},
-			CheckBox{AssignTo: &chkData, Text: "同时删除数据目录（连接码与日志；删了需要重新导入连接码）"},
+			Label{Text: "数据目录：" + opts.DataDir},
+			CheckBox{AssignTo: &chkData, Text: "同时删除 data 文件夹（连接码与日志；不勾选则保留）", Checked: true},
 			PushButton{AssignTo: &btn, Text: "开始卸载", MinSize: Size{Width: 120}, OnClicked: doUninstall},
 			Label{Text: "卸载过程"},
 			TextEdit{

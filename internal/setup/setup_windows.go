@@ -81,7 +81,14 @@ func DefaultInstallDir() string {
 	return `C:\Program Files\` + AppName
 }
 
+// DefaultDataDir 与客户端保持一致：数据就放在安装目录下的 data 里，
+// 用户翻安装目录就能看到连接码、日志和状态文件。
 func DefaultDataDir() string {
+	return filepath.Join(DefaultInstallDir(), "data")
+}
+
+// fallbackDataDir 是客户端在安装目录写不进去时会退回的位置，卸载时一并清掉。
+func fallbackDataDir() string {
 	if pd := os.Getenv("ProgramData"); pd != "" {
 		return filepath.Join(pd, "AntAppLink")
 	}
@@ -100,7 +107,7 @@ func Installed() (Options, bool) {
 	if err != nil || loc == "" {
 		return Options{}, false
 	}
-	return Options{InstallDir: loc, DataDir: DefaultDataDir()}, true
+	return Options{InstallDir: loc, DataDir: filepath.Join(loc, "data")}, true
 }
 
 func Install(opts Options, log func(string)) error {
@@ -169,7 +176,15 @@ func Uninstall(opts Options, log func(string)) error {
 	}
 
 	log("删除程序文件")
+	dataDir := filepath.Join(opts.InstallDir, "data")
+	if opts.RemoveData {
+		log("  删除数据目录 " + dataDir)
+		_ = os.RemoveAll(dataDir)
+	} else {
+		log("  保留数据目录 " + dataDir + "（连接码与日志）")
+	}
 	_ = os.Remove(filepath.Join(opts.InstallDir, AppExeName))
+	_ = os.Remove(filepath.Join(opts.InstallDir, "wintun.dll"))
 	// 目录非空时会失败，忽略即可 —— 不强行删掉用户自己放进去的东西
 	_ = os.Remove(opts.InstallDir)
 
@@ -178,13 +193,12 @@ func Uninstall(opts Options, log func(string)) error {
 		log("  删除失败（可能本来就没有）：" + err.Error())
 	}
 
-	if opts.RemoveData {
-		log("删除数据目录 " + opts.DataDir)
-		if err := os.RemoveAll(opts.DataDir); err != nil {
-			return fmt.Errorf("删除数据目录: %w", err)
+	// 客户端在安装目录写不进去时会把数据退回到这里，顺手一起清掉
+	if fb := fallbackDataDir(); fb != "" {
+		if _, err := os.Stat(fb); err == nil {
+			log("清理回退数据目录 " + fb)
+			_ = os.RemoveAll(fb)
 		}
-	} else {
-		log("保留数据目录 " + opts.DataDir + "（连接码与日志）")
 	}
 	return nil
 }

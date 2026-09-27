@@ -167,11 +167,11 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 | `tunnel` | TLS 连接、帧编解码、心跳、重连（指数退避 1s→2s→4s…上限 30s） |
 | `netcfg` | IP / 路由 / DNS 配置与还原，快照记录 |
 | `tray` | 托盘图标、状态、菜单 |
-| `store` | 配置读写 `%ProgramData%\AntAppLink\node.conf` |
+| `store` | 配置读写 `<安装目录>\data\node.conf` |
 | `import` | 导入连接码（粘贴单行或选文件） |
 | `autostart` | 计划任务注册（要提权，注册表 Run 项不够） |
 
-日志：客户端写 `%ProgramData%\AntAppLink\logs\client.log`（按大小轮转，保留最近 2 份）；服务端走 journald（`journalctl -u antapp-linkd`），另有 `antapp-linkd status` 看隧道与转发状态。
+日志：客户端写 `<安装目录>\data\logs\client.log`（按大小轮转，保留最近 2 份）；服务端走 journald（`journalctl -u antapp-linkd`），另有 `antapp-linkd status` 看隧道与转发状态。
 
 托盘菜单：
 
@@ -186,7 +186,7 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 退出
 ```
 
-**Wintun 说明**：虚拟网卡用 WireGuard 官方的 Wintun。`wintun.dll` 用 `go:embed` 内嵌进 exe，运行时释放到 `%ProgramData%\AntAppLink\` 再动态加载，**分发物只有一个 exe**；内嵌的 dll 必须与 exe 架构一致（amd64 / arm64 分开构建）。它是操作系统的网络适配器驱动，不是「要用户另外安装的工具/服务」——用户双击就能用，不需要装 OpenVPN、不需要装 TAP 驱动、不需要单独跑安装程序。
+**Wintun 说明**：虚拟网卡用 WireGuard 官方的 Wintun。`wintun.dll` 用 `go:embed` 内嵌进 exe，运行时释放到 `<安装目录>\data\` 再动态加载，**分发物只有一个 exe**；内嵌的 dll 必须与 exe 架构一致（amd64 / arm64 分开构建）。它是操作系统的网络适配器驱动，不是「要用户另外安装的工具/服务」——用户双击就能用，不需要装 OpenVPN、不需要装 TAP 驱动、不需要单独跑安装程序。
 
 **许可已核实**（原计划是「实现前确认」，现已确认）：Wintun 的**源码**是 GPLv2，但从 wintun.net 下载的**预编译 `wintun.dll` 适用单独的 Prebuilt Binaries License**，其中第 3.d 条明确允许「随其他软件一起分发」，前提是只通过 `wintun.h` 暴露的 API 使用它 —— 我们的用法正好落在许可范围内，商业分发没问题。两条要求必须遵守：发行包要附上该许可原文（条款 c 禁止移除版权声明），且**不得分发改名后的驱动文件**，用原始的 `wintun.dll`。
 
@@ -194,7 +194,7 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 
 连接时按顺序执行，断开时逆序还原：
 
-1. 快照现场：默认路由（网关 + 接口）、**到达云服所用的下一跳**、所有活动网卡的 IPv4 DNS 列表 → 先落盘到 `%ProgramData%\AntAppLink\state.json`，**再动网络**（崩在半路也还能靠它救回来）
+1. 快照现场：默认路由（网关 + 接口）、**到达云服所用的下一跳**、所有活动网卡的 IPv4 DNS 列表 → 先落盘到 `<安装目录>\data\state.json`，**再动网络**（崩在半路也还能靠它救回来）
 2. 创建 Wintun 适配器 `AntApp Link`，配 IP `10.10.0.2/24`、MTU 1400
 3. 查隧道网卡的接口索引（路由必须显式绑定它，见下）
 4. 加防自噬路由：`<云服 IP>/32` 走**现场探测到的下一跳**（否则承载隧道的 TLS/TCP 自己会被送进隧道，死循环）。云服就在直连网段里时**不加**这条 —— 现成的直连路由已经比默认路由更具体，硬加一条指向默认网关的 `/32` 反而会覆盖它

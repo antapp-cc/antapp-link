@@ -108,7 +108,17 @@ func run() int {
 	return 0
 }
 
+// dataDir 默认放在程序自己旁边（安装后就是 C:\Program Files\AntApp Link\data），
+// 这样翻一下安装目录就能看到连接码、日志和状态文件，不用去 ProgramData 里找。
+//
+// 目录建不出来时（程序被放在只读位置之类的）退回 %ProgramData%\AntAppLink。
 func defaultDataDir() string {
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Join(filepath.Dir(exe), "data")
+		if err := os.MkdirAll(dir, 0o700); err == nil {
+			return dir
+		}
+	}
 	if pd := os.Getenv("ProgramData"); pd != "" {
 		return filepath.Join(pd, "AntAppLink")
 	}
