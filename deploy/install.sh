@@ -52,15 +52,19 @@ mv -f "$BIN.new" "$BIN"
 log "初始化配置与 PKI（已存在的一律不动）"
 "$BIN" init -c "$CONF"
 
-if [[ "$FORWARD_START" != "31400" || "$FORWARD_END" != "31409" ]]; then
-  current_start="$(sed -n 's/.*"start": *\([0-9]*\).*/\1/p' "$CONF" | head -n1)"
-  current_end="$(sed -n 's/.*"end": *\([0-9]*\).*/\1/p' "$CONF" | head -n1)"
-  if [[ "$current_start" != "$FORWARD_START" || "$current_end" != "$FORWARD_END" ]]; then
-    log "转发端口段 $current_start-$current_end -> $FORWARD_START-$FORWARD_END"
-    # 先撤旧规则再改配置：否则 down 会按新端口段去删、旧规则留在链里
-    "$BIN" down -c "$CONF" >/dev/null 2>&1 || true
-    sed -i "s/\"start\": *$current_start/\"start\": $FORWARD_START/; s/\"end\": *$current_end/\"end\": $FORWARD_END/" "$CONF"
-  fi
+# 把配置里的端口段同步成目标值。
+#
+# 这里不判断「目标值是不是默认」—— 老机器上的 server.json 可能写死了验证期的
+# 31410-31419，早先只在传了非默认值时才去改，于是重跑脚本也纠正不过来。
+# 现在一律对准目标值。
+current_start="$(sed -n 's/.*"start": *\([0-9]*\).*/\1/p' "$CONF" | head -n1)"
+current_end="$(sed -n 's/.*"end": *\([0-9]*\).*/\1/p' "$CONF" | head -n1)"
+if [[ -n "$current_start" && -n "$current_end" ]] &&
+   [[ "$current_start" != "$FORWARD_START" || "$current_end" != "$FORWARD_END" ]]; then
+  log "转发端口段 $current_start-$current_end -> $FORWARD_START-$FORWARD_END"
+  # 先撤旧规则再改配置：否则 down 会按新端口段去删、旧规则留在链里
+  "$BIN" down -c "$CONF" >/dev/null 2>&1 || true
+  sed -i "s/\"start\": *$current_start/\"start\": $FORWARD_START/; s/\"end\": *$current_end/\"end\": $FORWARD_END/" "$CONF"
 fi
 
 log "安装 systemd 服务"
