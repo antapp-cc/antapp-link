@@ -495,23 +495,51 @@ func (u *UI) applyUpdate(newExe string) {
 // 卸载入口刻意不放在这个托盘菜单里：它紧挨着「退出」，而卸载是不可逆的，
 // 误点代价太大。改由安装目录里的「卸载 AntApp Link」快捷方式承担。
 
-// onImport 从剪贴板取连接码。
+// onImport 导入连接码：先问来源，再走对应的读取方式。
 //
-// 界面上做不了「粘贴一大段文本」的输入体验（那需要多行对话框），而连接码本来就是
-// 从聊天窗口复制来的，直接读剪贴板是最顺手也最不容易出错的方式。
+// 两条路都得有 —— 服务端 invite 出来的是文件，用户拷到节点机上得能选；
+// 而单行 antapp:// 码通常是从聊天窗口复制的，读剪贴板最省事。
 func (u *UI) onImport() {
-	go func() {
-		code, err := ReadClipboard()
+	fromFile, ok := u.askImportSource()
+	if !ok {
+		return
+	}
+
+	var raw string
+	if fromFile {
+		dlg := new(walk.FileDialog)
+		dlg.Title = "选择连接码文件"
+		dlg.Filter = "连接码文件 (*.json;*.conf;*.txt)|*.json;*.conf;*.txt|所有文件 (*.*)|*.*"
+		chosen, err := dlg.ShowOpen(u.mw)
+		if err != nil {
+			u.alert("打开文件对话框失败", err.Error())
+			return
+		}
+		if !chosen {
+			return
+		}
+		raw = dlg.FilePath
+	} else {
+		text, err := ReadClipboard()
 		if err != nil {
 			u.alert("读取剪贴板失败", err.Error())
 			return
 		}
-		inv, err := LoadInvite(code)
-		if err != nil {
-			u.alert("剪贴板里没有可用的连接码",
-				"请先复制整行 antapp:// 连接码（或整个 json 文件的内容），再点这个按钮。\n\n"+err.Error())
-			return
+		raw = text
+	}
+
+	inv, err := LoadInvite(raw)
+	if err != nil {
+		where := "剪贴板里没有可用的连接码"
+		if fromFile {
+			where = "这个文件里没有可用的连接码"
 		}
+		u.alert(where, "需要服务端生成的 .json/.conf 文件，或整行 antapp:// 连接码。\n\n"+err.Error())
+		return
+	}
+
+	// 保存与切换连接会先断开再重连，别卡住界面线程
+	go func() {
 		if err := SaveInvite(u.app.RootDir(), inv); err != nil {
 			u.alert("保存连接码失败", err.Error())
 			return
@@ -527,6 +555,48 @@ func (u *UI) onImport() {
 				walk.MsgBoxIconInformation)
 		})
 	}()
+}
+
+// askImportSource 问连接码从哪来。ok=false 表示用户取消。
+func (u *UI) askImportSource() (fromFile bool, ok bool) {
+	var dlg *walk.Dialog
+
+	if err := (Dialog{
+		AssignTo: &dlg,
+		Title:    "导入连接码",
+		Icon:     u.icon,
+		Size:     Size{Width: 470, Height: 210},
+		MinSize:  Size{Width: 430, Height: 190},
+		Layout:   VBox{Margins: Margins{Left: 16, Top: 16, Right: 16, Bottom: 16}, Spacing: 10},
+		Children: []Widget{
+			Label{Text: "连接码从哪里来？", Font: Font{PointSize: 10}},
+			Label{Text: "服务端生成的文件（.json / .conf / .txt），\n或者聊天窗口里复制好的整行 antapp:// 连接码。"},
+			Composite{
+				Layout: HBox{MarginsZero: true, Spacing: 8},
+				Children: []Widget{
+					PushButton{
+						Text: "从文件导入…", MinSize: Size{Width: 120}, MaxSize: Size{Width: 120},
+						OnClicked: func() { fromFile, ok = true, true; dlg.Accept() },
+					},
+					PushButton{
+						Text: "从剪贴板导入", MinSize: Size{Width: 120}, MaxSize: Size{Width: 120},
+						OnClicked: func() { fromFile, ok = false, true; dlg.Accept() },
+					},
+					HSpacer{},
+					PushButton{
+						Text: "取消", MinSize: Size{Width: 80}, MaxSize: Size{Width: 80},
+						OnClicked: func() { dlg.Cancel() },
+					},
+				},
+			},
+		},
+	}).Create(u.mw); err != nil {
+		u.alert("打开导入窗口失败", err.Error())
+		return false, false
+	}
+
+	dlg.Run()
+	return fromFile, ok
 }
 
 func (u *UI) onOpenDataDir() {
