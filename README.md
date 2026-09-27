@@ -50,7 +50,7 @@ C:\Program Files\AntApp Link\
   wintun.dll            首次运行时释放
   卸载 AntApp Link.lnk   卸载入口
   config\
-    node.conf           连接码（内含私钥）
+    node.antapp           连接码（内含私钥）
   logs\
     client.log          运行日志，按大小轮转
   data\
@@ -101,7 +101,7 @@ C:\Program Files\AntApp Link\
 
 **`.antapp` 是连接码的专属后缀，双击就能导入。** 安装时会把它关联到客户端，所以从服务端拿到 `antapp-node-xxx.antapp` 之后，拷到节点机上双击即可，不必打开客户端找导入按钮。
 
-- 客户端**没在运行**时：新进程读到文件、写进 `config\node.conf`，然后正常启动并连接
+- 客户端**没在运行**时：新进程读到文件、写进 `config\node.antapp`，然后正常启动并连接
 - 客户端**已在运行**时：新进程把文件写进 `config\`，正在跑的那个实例靠比对文件修改时间发现变化，自动换用新连接码并重连（两秒内）
 
 刻意不用 `.conf` —— 那个后缀系统里一堆程序都在用，关联过去会打架。

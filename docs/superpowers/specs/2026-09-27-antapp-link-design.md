@@ -167,7 +167,7 @@ DNAT 的回包由 conntrack 自动反向转换，不需要额外 SNAT 规则。�
 | `tunnel` | TLS 连接、帧编解码、心跳、重连（指数退避 1s→2s→4s…上限 30s） |
 | `netcfg` | IP / 路由 / DNS 配置与还原，快照记录 |
 | `tray` | 托盘图标、状态、菜单 |
-| `store` | 配置读写 `<安装目录>\data\node.conf` |
+| `store` | 配置读写 `<安装目录>\data\node.antapp` |
 | `import` | 导入连接码（粘贴单行或选文件） |
 | `autostart` | 计划任务注册（要提权，注册表 Run 项不够） |
 

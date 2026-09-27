@@ -176,7 +176,7 @@ func (u *UI) build() error {
 	return nil
 }
 
-// watchInvite 盯着 config\node.conf，发现被外部改过就重载并重连。
+// watchInvite 盯着 config\node.antapp，发现被外部改过就重载并重连。
 //
 // 用户在客户端已经运行时双击一个 .antapp 文件，那个新进程只会把连接码写进文件
 // 然后退出（单实例闸门挡着）。真正的切换得由这里完成 —— 否则双击看起来毫无反应。

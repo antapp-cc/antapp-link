@@ -39,8 +39,14 @@ func LoadInvite(pathOrCode string) (pki.Invite, error) {
 	return inv, nil
 }
 
+// InviteFileName 是连接码在 config\ 下的名字。
+//
+// 用 .antapp 而不是通用的 .conf：这个后缀已经关联到客户端，用户想手动换连接码时
+// 直接双击这个文件就行 —— 跟从别处拿到的连接码文件是同一种东西，没必要两套命名。
+const InviteFileName = "node.antapp"
+
 // InviteFilePath 是客户端保存连接码的位置。
-func InviteFilePath(root string) string { return filepath.Join(ConfigDir(root), "node.conf") }
+func InviteFilePath(root string) string { return filepath.Join(ConfigDir(root), InviteFileName) }
 
 // SaveInvite 把连接码存下来，这样下次启动不用再导入一次。
 func SaveInvite(root string, inv pki.Invite) error {

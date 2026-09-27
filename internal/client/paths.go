@@ -10,7 +10,7 @@ const (
 	DataDirName   = "data"   // 运行时数据：网络快照、界面图标、更新包
 )
 
-// ConfigDir 是配置文件目录（连接码 node.conf）。
+// ConfigDir 是配置文件目录（连接码 node.antapp）。
 func ConfigDir(root string) string { return filepath.Join(root, ConfigDirName) }
 
 // LogsDir 是日志目录。
