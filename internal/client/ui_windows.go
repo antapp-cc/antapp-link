@@ -325,10 +325,13 @@ func (u *UI) refresh() {
 		u.lastLogText = text
 		u.txtLog.SetText(text)
 
-		// 滚到最后一行。这里刻意不用 SetTextSelection(n, n) 去「把光标挪到末尾」：
-		// EM_SETSEL 之后 TextLength 确实报出空选择（诊断实测 165,165），但光标落在
-		// 末尾时这个只读文本框会把整片日志画成蓝底高亮 —— 截图能看到，而选择状态
-		// 读出来是正常的，所以只能绕开它。直接用滚动条消息，不碰选择。
+		// 写完必须显式把选择清成 (0,0)，再滚到最后一行。
+		//
+		// SetText 之后只读文本框的选择会变成「全选」，它一拿到焦点就整片画成蓝底 ——
+		// 而 EM_GETSEL 读出来可能还是空的，看状态查不出来（踩过两次）。
+		// 试过 (n,n) 把光标放末尾，一样会高亮；只有 (0,0) 是干净的。
+		u.txtLog.SetTextSelection(0, 0)
+
 		const (
 			wmVScroll = 0x0115
 			sbBottom  = 7
