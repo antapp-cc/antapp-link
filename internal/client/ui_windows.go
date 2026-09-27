@@ -47,6 +47,7 @@ type UI struct {
 	btnHide    *walk.PushButton
 
 	quitting    bool
+	trayHinted  bool
 	lastLogText string
 	done        chan struct{}
 	pending     *update.Manifest
@@ -123,9 +124,17 @@ func (u *UI) build() error {
 
 	// 关窗口只是收进托盘，不是退出 —— 否则隧道会跟着一起断
 	u.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
-		if !u.quitting {
-			*canceled = true
-			u.mw.Hide()
+		if u.quitting {
+			return
+		}
+		*canceled = true
+		u.mw.Hide()
+		// 第一次收进托盘时说一声。不说的话用户会以为程序已经关了，
+		// 但隧道其实还在后台跑着。
+		if !u.trayHinted {
+			u.trayHinted = true
+			_ = u.ni.ShowInfo("AntApp Link 仍在运行",
+				"窗口已收进托盘，专线保持连接。\n双击托盘图标可以重新打开，右键菜单里可以退出。")
 		}
 	})
 
@@ -304,8 +313,15 @@ func (u *UI) refresh() {
 	if text != u.lastLogText {
 		u.lastLogText = text
 		u.txtLog.SetText(text)
-		// 光标挪到末尾再滚过去，让最新一行始终可见
-		u.txtLog.SetTextSelection(len(text), len(text))
+
+		// 光标挪到末尾再滚过去，让最新一行始终可见。
+		//
+		// 这里必须用 TextLength()（字符数），不能用 len(text) —— Go 的 len 对 string
+		// 是字节数，中文日志下远超实际字符数，越界的值会被 Edit 控件当成「选到最尾」，
+		// 结果整片日志变成全选高亮（实测 start=0 end=全文）。
+		if n := u.txtLog.TextLength(); n > 0 {
+			u.txtLog.SetTextSelection(n, n)
+		}
 		u.txtLog.ScrollToCaret()
 	}
 }
