@@ -24,14 +24,15 @@ type App struct {
 	log       *slog.Logger
 	noNetCfg  bool
 
-	mu        sync.Mutex
-	snapshot  Snapshot
-	cfg       NetConfig
-	dev       Device
-	tunnel    *Tunnel
-	cancel    context.CancelFunc
-	running   bool
-	lastError string
+	mu         sync.Mutex
+	snapshot   Snapshot
+	cfg        NetConfig
+	dev        Device
+	tunnel     *Tunnel
+	cancel     context.CancelFunc
+	running    bool
+	connecting bool
+	lastError  string
 
 	checker *update.Checker
 	pending *update.Manifest
@@ -93,6 +94,10 @@ func (a *App) HealIfNeeded() error {
 		return nil
 	}
 
+	a.mu.Lock()
+	inv := a.inv
+	a.mu.Unlock()
+
 	snap, exists, err := LoadSnapshot(a.statePath)
 	if !exists {
 		return nil
@@ -102,13 +107,13 @@ func (a *App) HealIfNeeded() error {
 		// 快照本身坏了，DNS 原值已无从得知。至少把接管路由和隧道地址撤掉，
 		// 否则用户会一直卡在「所有流量都进了一条没人读的网卡」。
 		a.log.Warn("状态文件损坏，做一次保守还原（DNS 可能需要手动确认）", "err", err)
-		_ = Snapshot{}.Restore(BuildNetConfig(a.inv))
+		_ = Snapshot{}.Restore(BuildNetConfig(inv))
 		_ = RemoveSnapshot(a.statePath)
 		return err
 	}
 
 	a.log.Info("发现上次残留的网络配置，先还原", "captured_at", snap.CapturedAt)
-	if err := snap.Restore(BuildNetConfig(a.inv)); err != nil {
+	if err := snap.Restore(BuildNetConfig(inv)); err != nil {
 		return fmt.Errorf("还原上次的网络配置失败: %w", err)
 	}
 	if err := RemoveSnapshot(a.statePath); err != nil {
@@ -118,41 +123,62 @@ func (a *App) HealIfNeeded() error {
 }
 
 // Connect 接管网络并启动隧道。幂等：已经连上时直接返回。
+//
+// 这里刻意只把「检查状态 / 置标志 / 拷贝出需要的字段」放在锁里，真正的连接过程
+// （探测服务端、抓网络现场、改路由）全在锁外做。早先整段都持锁，而界面每秒都会
+// 调 Status() 抢同一把锁 —— 结果点几下按钮界面就「未响应」。
 func (a *App) Connect() error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.running {
+	switch {
+	case a.running:
+		a.mu.Unlock()
 		return nil
+	case a.connecting:
+		a.mu.Unlock()
+		return errors.New("正在连接，请稍候")
+	case !a.configuredLocked():
+		a.mu.Unlock()
+		return errors.New("还没有连接码，请先在界面上点「导入连接码」")
 	}
-	if !a.configuredLocked() {
-		return errors.New("还没有连接码，请先在界面上点「从剪贴板导入连接码」")
-	}
+	a.connecting = true
+	inv, noNetCfg, statePath := a.inv, a.noNetCfg, a.statePath
+	a.mu.Unlock()
 
-	cfg := BuildNetConfig(a.inv)
-	dev, err := OpenDevice()
+	err := a.connectSlow(inv, noNetCfg, statePath)
+
+	a.mu.Lock()
+	a.connecting = false
 	if err != nil {
 		a.lastError = err.Error()
+	}
+	a.mu.Unlock()
+	return err
+}
+
+// connectSlow 干连接这件慢活，全程不持有 a.mu。
+func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error {
+	cfg := BuildNetConfig(inv)
+	dev, err := OpenDevice()
+	if err != nil {
 		return err
 	}
 
-	if a.noNetCfg {
+	if noNetCfg {
 		if err := ConfigureAdapter(cfg); err != nil {
 			_ = dev.Close()
-			a.lastError = err.Error()
 			return fmt.Errorf("配置隧道网卡失败: %w", err)
 		}
-		return a.startTunnelLocked(cfg, dev)
+		return a.startTunnel(cfg, dev, inv, nil)
 	}
 
 	// 先确认服务端真的连得上，再动用户的网络。
 	// 顺序反过来的话，服务端不可达时用户要白白经历「网络被接管 → 自检失败 → 再还原」
 	// 这十几秒的断网 —— 这种体验不能有第二次。
 	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 12*time.Second)
-	probeErr := a.probeServer(probeCtx)
+	probeErr := a.probeServer(inv, probeCtx)
 	cancelProbe()
 	if probeErr != nil {
 		_ = dev.Close()
-		a.lastError = "连接服务端失败：" + probeErr.Error()
 		return fmt.Errorf("连接服务端失败，未改动网络: %w", probeErr)
 	}
 
@@ -162,7 +188,7 @@ func (a *App) Connect() error {
 		return fmt.Errorf("抓取网络现场失败: %w", err)
 	}
 	// 先落盘再动网络：之后任何一步崩掉，下次启动都还能靠它把网络救回来
-	if err := SaveSnapshot(a.statePath, snap); err != nil {
+	if err := SaveSnapshot(statePath, snap); err != nil {
 		_ = dev.Close()
 		return fmt.Errorf("写状态文件失败: %w", err)
 	}
@@ -170,38 +196,43 @@ func (a *App) Connect() error {
 		// 网络已经改了一半，立刻还原，别把用户留在半截状态
 		_ = snap.Restore(cfg)
 		_ = dev.Close()
-		_ = RemoveSnapshot(a.statePath)
-		a.lastError = err.Error()
+		_ = RemoveSnapshot(statePath)
 		return fmt.Errorf("接管网络失败（已还原）: %w", err)
 	}
 
-	a.snapshot = snap
-	return a.startTunnelLocked(cfg, dev)
+	return a.startTunnel(cfg, dev, inv, &snap)
 }
 
-// startTunnelLocked 在网卡（必要时还有网络）就绪之后拉起隧道循环。调用方必须持有 a.mu。
-func (a *App) startTunnelLocked(cfg NetConfig, dev Device) error {
+// startTunnel 登记隧道并拉起循环。只在写状态字段时短暂持锁。
+func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snapshot) error {
 	ctx, cancel := context.WithCancel(context.Background())
-	tunnel := NewTunnel(a.inv, dev, a.log)
+	tunnel := NewTunnel(inv, dev, a.log)
 
+	a.mu.Lock()
 	a.cfg = cfg
 	a.dev = dev
 	a.tunnel = tunnel
 	a.cancel = cancel
 	a.running = true
 	a.lastError = ""
+	if snap != nil {
+		a.snapshot = *snap
+	}
+	noNetCfg := a.noNetCfg
+	a.mu.Unlock()
 
 	go func() {
 		if err := tunnel.Run(ctx); err != nil {
 			a.log.Warn("隧道循环退出", "err", err)
 		}
 	}()
-	a.log.Info("已连接", "server", a.inv.Server, "tunnel_ip", cfg.TunnelIP)
+	a.log.Info("已连接", "server", inv.Server, "tunnel_ip", cfg.TunnelIP)
 
 	// 只有真接管了网络才自检：联调模式没动用户网络，出不去也不该由我们背
-	if !a.noNetCfg {
-		go a.watchHealth(ctx)
+	if noNetCfg {
+		return nil
 	}
+	go a.watchHealth(ctx)
 	return nil
 }
 
@@ -241,15 +272,16 @@ func (a *App) watchHealth(ctx context.Context) {
 // probeServer 只做一次 TLS 握手，用来确认「服务端可达且证书可信」。
 //
 // 它存在的意义是保住顺序：连不上服务端时，一点都不要碰用户的网络。
-func (a *App) probeServer(ctx context.Context) error {
-	tlsCfg, err := pki.ClientTLSConfig(a.inv)
+// 邀请码由调用方传进来 —— 这个方法在锁外跑，不能去读 a.inv。
+func (a *App) probeServer(inv pki.Invite, ctx context.Context) error {
+	tlsCfg, err := pki.ClientTLSConfig(inv)
 	if err != nil {
 		return err
 	}
 	d := net.Dialer{Timeout: 8 * time.Second}
-	raw, err := d.DialContext(ctx, "tcp", a.inv.Server)
+	raw, err := d.DialContext(ctx, "tcp", inv.Server)
 	if err != nil {
-		return fmt.Errorf("连接 %s: %w", a.inv.Server, err)
+		return fmt.Errorf("连接 %s: %w", inv.Server, err)
 	}
 	defer raw.Close()
 
@@ -263,9 +295,16 @@ func (a *App) probeServer(ctx context.Context) error {
 }
 
 // healthCheck 探两件事：隧道内通不通，以及下发的 DNS 能不能真的解析。
+//
+// 调用方须保证此刻隧道仍在运行；读 a.inv 是安全的（不持锁读单个字段，
+// 而 inv 只会被 UpdateInvite 换掉，换的时候会先断开）。
 func (a *App) healthCheck(ctx context.Context) error {
+	a.mu.Lock()
+	inv := a.inv
+	a.mu.Unlock()
+
 	// 第一级：连服务端在隧道里的监听地址 —— 这条一定走隧道，不受出口影响
-	tunnelAddr := net.JoinHostPort(a.inv.Gateway, tunnelPortOf(a.inv))
+	tunnelAddr := net.JoinHostPort(inv.Gateway, tunnelPortOf(inv))
 	if err := probeTCP(ctx, tunnelAddr, 5*time.Second); err != nil {
 		return fmt.Errorf("隧道内不通（%s）: %w", tunnelAddr, err)
 	}
@@ -273,8 +312,8 @@ func (a *App) healthCheck(ctx context.Context) error {
 	// 第二级：用下发的 DNS 真解析一次。这正是整套方案存在的理由 ——
 	// DNS 查不通，用户看到的就是「连上了但网页打不开」。
 	dnsServer := "8.8.8.8"
-	if len(a.inv.DNS) > 0 {
-		dnsServer = a.inv.DNS[0]
+	if len(inv.DNS) > 0 {
+		dnsServer = inv.DNS[0]
 	}
 	resolver := &net.Resolver{
 		PreferGo: true,
@@ -309,40 +348,44 @@ func tunnelPortOf(inv pki.Invite) string {
 }
 
 // Disconnect 停隧道并把网络还原回去。幂等：没连上时直接返回。
+//
+// 跟 Connect 同样的道理：先把内部状态清干净（界面立刻就能显示「未连接」），
+// 再在锁外慢慢还原网络。整段持锁的话，还原路由那几秒界面是死的。
 func (a *App) Disconnect() error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if !a.running && a.dev == nil {
+		a.mu.Unlock()
 		return nil
 	}
+	cancel, dev := a.cancel, a.dev
+	snap, cfg, noNetCfg := a.snapshot, a.cfg, a.noNetCfg
 
-	if a.cancel != nil {
-		a.cancel()
-		a.cancel = nil
+	a.cancel, a.dev, a.tunnel = nil, nil, nil
+	a.running, a.snapshot, a.cfg = false, Snapshot{}, NetConfig{}
+	a.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
 	}
-	if a.dev != nil {
+	if dev != nil {
 		// 给搬运 goroutine 一点时间退出，免得一边还原网络一边往里写包
 		time.Sleep(150 * time.Millisecond)
-		_ = a.dev.Close()
-		a.dev = nil
+		_ = dev.Close()
 	}
-	a.running = false
-	a.tunnel = nil
 
 	// 联调模式本来就没动过路由和 DNS，没什么可还原的
-	if a.noNetCfg {
-		a.cfg = NetConfig{}
+	if noNetCfg {
 		a.log.Info("已断开")
 		return nil
 	}
 
-	if err := a.snapshot.Restore(a.cfg); err != nil {
+	if err := snap.Restore(cfg); err != nil {
 		// 还原失败就留着 state.json，让下次启动继续尝试自愈
+		a.mu.Lock()
 		a.lastError = err.Error()
+		a.mu.Unlock()
 		return fmt.Errorf("还原网络配置失败: %w", err)
 	}
-	a.snapshot = Snapshot{}
-	a.cfg = NetConfig{}
 	if err := RemoveSnapshot(a.statePath); err != nil {
 		a.log.Warn("删除状态文件失败", "err", err)
 	}
