@@ -136,6 +136,23 @@ func (u *UI) build() error {
 		return err
 	}
 
+	// 窗口每次重新显示都清一次日志框的选择。
+	//
+	// 只读文本框在重新获得焦点时会把整片日志画成蓝底高亮 —— 而 EM_GETSEL 读出来
+	// 选择是空的（诊断实测过 165,165），所以这不是"选中"，是控件自己的绘制行为。
+	// 既然选择状态没错，就只能每次显示时主动清掉再滚到底。
+	u.mw.VisibleChanged().Attach(func() {
+		if !u.mw.Visible() {
+			return
+		}
+		u.txtLog.SetTextSelection(0, 0)
+		const (
+			wmVScroll = 0x0115
+			sbBottom  = 7
+		)
+		u.txtLog.SendMessage(wmVScroll, sbBottom, 0)
+	})
+
 	// 没有新版本时这个按钮不该占着位置
 	u.btnUpdate.SetVisible(false)
 
