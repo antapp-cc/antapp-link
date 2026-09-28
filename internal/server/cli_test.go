@@ -147,8 +147,8 @@ func TestCLIStatusWithoutTunnel(t *testing.T) {
 	if !strings.Contains(s, "31400-31409") {
 		t.Errorf("status 应显示转发端口段:\n%s", s)
 	}
-	if !strings.Contains(s, "DNAT") {
-		t.Errorf("status 应显示 DNAT 规则:\n%s", s)
+	if !strings.Contains(s, "经隧道转给节点机") {
+		t.Errorf("status 应显示转发说明:\n%s", s)
 	}
 }
 

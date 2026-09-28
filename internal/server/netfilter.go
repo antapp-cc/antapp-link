@@ -34,7 +34,6 @@ func TableOrDefault(t string) string {
 // 而云服上真正生效的定义与测试断言的永远是同一份。
 func Rules(cfg Config, wanIface string) []Rule {
 	network := cfg.Tunnel.Network
-	client := cfg.Tunnel.ClientIP
 	portRange := fmt.Sprintf("%d:%d", cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
 	_, listenPort, err := net.SplitHostPort(cfg.Listen)
 	if err != nil {
@@ -58,23 +57,9 @@ func Rules(cfg Config, wanIface string) []Rule {
 		{Chain: "INPUT", Args: []string{"-i", cfg.Tunnel.Device, "-p", "udp", "--dport", "53", "-j", "ACCEPT"}},
 		{Chain: "INPUT", Args: []string{"-i", cfg.Tunnel.Device, "-p", "tcp", "--dport", "53", "-j", "ACCEPT"}},
 
-		// 端口转发交给内核，只做 TCP。
-		//
-		// 曾经 TCP 和 UDP 各一条，后来按需求去掉了 UDP：Pi Node 那边只用 TCP，
-		// 多开一条 UDP 规则等于平白多一个对外暴露的面。
-		{Table: "nat", Chain: ChainName, Args: []string{
-			"-p", "tcp", "--dport", portRange, "-j", "DNAT", "--to-destination", client}},
-		{Table: "nat", Chain: "PREROUTING", Args: []string{"-p", "tcp", "--dport", portRange, "-j", ChainName}},
+		// 转发端口段对公网开放：服务端转发器（relay）在本机监听这些端口，
+		// 收到连接立即应答、再经隧道转给节点机。握手在本机完成，外部检查器
+		// 量到的延迟只到云服为止（DNAT 方案会量到节点机，翻一倍）。
+		{Chain: "INPUT", Args: []string{"-p", "tcp", "--dport", portRange, "-j", "ACCEPT"}},
 	}
-}
-
-// DNATRules 单独取出来，方便日志和 status 只显示与端口转发相关的部分。
-func DNATRules(cfg Config) []Rule {
-	var out []Rule
-	for _, r := range Rules(cfg, "") {
-		if r.Chain == ChainName {
-			out = append(out, r)
-		}
-	}
-	return out
 }

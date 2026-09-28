@@ -36,6 +36,9 @@ func Up(cfg Config, logger *slog.Logger, force bool) error {
 
 	// 自定义链已存在时这条会报错，忽略即可
 	_ = iptables("-t", "nat", "-N", ChainName)
+	// 整链清空重铺：这条链完全归本项目管理，历史上装过 DNAT 规则，
+	// 换成转发器架构后一次性清掉旧机器上的残留。
+	_ = iptables("-t", "nat", "-F", ChainName)
 
 	for _, r := range Rules(cfg, wan) {
 		if err := ensureRule(r); err != nil {
@@ -55,6 +58,7 @@ func Down(cfg Config, logger *slog.Logger) error {
 		logger = slog.Default()
 	}
 	removeJumpsTo("nat", "PREROUTING", ChainName)
+	_ = iptables("-t", "nat", "-F", ChainName)
 	_ = iptables("-t", "nat", "-F", ChainName)
 	_ = iptables("-t", "nat", "-X", ChainName)
 

@@ -85,6 +85,15 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 
 	go s.pumpTun(ctx)
 	go s.reportStatus(ctx)
+
+	// 端口转发：本机应答式转发器（握手在云服完成，延迟只算到云服为止；
+	// 连接再经隧道转给节点机）。替代内核 DNAT。
+	stopRelay, err := startPortRelay(ctx, cfg, logger)
+	if err != nil {
+		logger.Warn("端口转发监听启动失败", "err", err)
+	} else {
+		defer stopRelay()
+	}
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()

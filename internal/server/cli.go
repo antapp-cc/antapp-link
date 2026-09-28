@@ -377,9 +377,8 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 		fmt.Fprintln(stdout, "\n隧道进程    : 状态文件不存在，可能没在运行（systemctl status antapp-linkd）")
 	}
 
-	fmt.Fprintf(stdout, "\n端口转发规则（内核 DNAT）:\n")
-	for _, r := range DNATRules(cfg) {
-		fmt.Fprintf(stdout, "  %s\n", r.String())
-	}
+	fmt.Fprintf(stdout, "\n端口转发（服务端应答，经隧道转给节点机）:\n")
+	fmt.Fprintf(stdout, "  %d-%d/TCP → %s（同端口）\n",
+		cfg.ForwardPorts.Start, cfg.ForwardPorts.End, cfg.Tunnel.ClientIP)
 	return 0
 }
