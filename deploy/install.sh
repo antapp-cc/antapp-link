@@ -123,11 +123,18 @@ sleep 2
 log "当前状态"
 "$BIN" status -c "$CONF" || true
 
+if [[ -f /root/pinode.antapp ]]; then
+  log "连接码文件已存在：/root/pinode.antapp（保留不覆盖；重签执行: $BIN invite pi-node-01 -o /root）"
+else
+  log "自动签发连接码文件到 /root"
+  "$BIN" invite pi-node-01 -o /root || log "警告: 签发失败，可手动执行: $BIN invite pi-node-01 -o /root"
+fi
+
 cat <<EOF
 
 [antapp-link] --------------------------------------------------
-[antapp-link] 安装完成。给节点机签发连接码：
-[antapp-link]   $BIN invite pi-node-01 -o /root
-[antapp-link] 输出的单行 antapp:// 连接码发给节点机导入即可。
+[antapp-link] 安装完成。连接码文件：/root/pinode.antapp
+[antapp-link] 把它发给节点机双击导入即可（内含私钥，等同密码，注意保管）。
+[antapp-link] 重签或多节点：$BIN invite <客户端名> -o <输出目录>
 [antapp-link] --------------------------------------------------
 EOF
