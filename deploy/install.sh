@@ -61,7 +61,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$(id -u)" -eq 0 ]] || die "请用 root 运行"
-[[ -f "$SRC_DIR/antapp-linkd" ]] || die "同目录下没有 antapp-linkd，请把它和本脚本一起上传"
+if [[ ! -f "$SRC_DIR/antapp-linkd" ]]; then
+	log "目录下没有 antapp-linkd，从 GitHub Release 自动下载……"
+	curl -fsSL "https://github.com/antapp-cc/antapp-link/releases/latest/download/antapp-linkd" -o "$SRC_DIR/antapp-linkd" 		|| die "下载失败：检查网络后重试，或手动上传 antapp-linkd 到同目录"
+	chmod +x "$SRC_DIR/antapp-linkd"
+fi
 
 # 全新 VPS 上真实踩到的两件事：
 # 1) Debian 12 默认不带 iptables（它转向 nftables 了），而 DNAT 规则要用它；
