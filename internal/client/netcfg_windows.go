@@ -45,6 +45,43 @@ func runCommand(c Command) error {
 //   - 绕行路由必须先于接管路由，且云服直连时不加 → 见 routePlan
 //   - 还原必须先解 DNS 再拆路由，尽力而为不中断 → 见 Restore
 
+// refreshSplitRoutesHook 由平台侧注入：按最新网段表热重铺国内分流路由。
+var refreshSplitRoutesHook func(gw string, ifIndex int, table []string)
+
+func init() {
+	refreshSplitRoutesHook = refreshSplitRoutesFor
+}
+
+// refreshSplitRoutesFor 按给定网段表重铺国内直连路由（原生，毫秒级）。
+// 由 routeTableRefresher 在拉到新表后调用；与 watcher 的迁移路径共用
+// sweepSplitRoutes，过滤条件（下一跳=网关 且 metric=5）保证只动自己的。
+func refreshSplitRoutesFor(gw string, ifIndex int, table []string) {
+	gwAddr, err := netip.ParseAddr(gw)
+	if err != nil || ifIndex <= 0 {
+		return
+	}
+	a, ok, err := adapterByIndex(uint32(ifIndex))
+	if err != nil || !ok {
+		return
+	}
+	sweepSplitRoutes(gwAddr)
+	failed := 0
+	for _, p := range table {
+		prefix, err := netip.ParsePrefix(p)
+		if err != nil {
+			failed++
+			continue
+		}
+		if err := a.LUID.AddRoute(prefix.Masked(), gwAddr, splitRouteMetric); err != nil &&
+			!errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) {
+			failed++
+		}
+	}
+	if failed > 0 {
+		logf("国内分流重铺：%d 条失败（这些网段暂走隧道，不影响可用）", failed)
+	}
+}
+
 // runCommand / hiddenProcAttr 仅供 schtasks（开机自启）这类低频操作使用。
 
 // ---------- 现场抓取 ----------
@@ -298,7 +335,7 @@ func (s Snapshot) applyOnce(cfg NetConfig) error {
 	gwAddr, gwErr := netip.ParseAddr(s.DefaultGateway)
 	if gwErr == nil && haveDef {
 		added, failed := 0, 0
-		for _, p := range CNRoutes() {
+		for _, p := range ActiveCNRoutes() {
 			prefix, err := netip.ParsePrefix(p)
 			if err != nil {
 				continue

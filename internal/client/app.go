@@ -67,6 +67,9 @@ func NewApp(inv pki.Invite, rootDir string, logger *slog.Logger, opts ...Option)
 	for _, opt := range opts {
 		opt(app)
 	}
+	// 分流网段表：外部文件优先，内置兜底；后台每天自动刷新
+	SetRouteTablePath(filepath.Join(RuntimeDir(rootDir), routeTableFileName))
+	go app.routeTableRefresher()
 	return app
 }
 
@@ -263,6 +266,53 @@ func (a *App) updateSnapshot(s Snapshot) {
 	a.mu.Lock()
 	a.snapshot = s
 	a.mu.Unlock()
+}
+
+// routeTableRefresher 让分流网段表长期保持最新：连接成功 1 分钟后拉一次，
+// 之后每 24 小时一次；失败半小时后重试。拉取在后台协程执行，启动与
+// 连接路径零影响。拉到新表且处于连接状态时，热重铺国内分流；
+// 不在连接状态则落盘等下次连接生效。
+func (a *App) routeTableRefresher() {
+	a.waitConnected()
+	time.Sleep(time.Minute)
+	for {
+		updated := fetchAndStoreRouteTable()
+		if updated {
+			a.hotApplyRouteTable()
+		}
+		if updated {
+			time.Sleep(24 * time.Hour)
+		} else {
+			time.Sleep(30 * time.Minute)
+		}
+	}
+}
+
+// waitConnected 阻塞到隧道进入连接状态（轮询，1 秒粒度）。
+func (a *App) waitConnected() {
+	for !a.runningFast() {
+		time.Sleep(time.Second)
+	}
+}
+
+func (a *App) runningFast() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.running
+}
+
+// hotApplyRouteTable 连接状态下按最新网段表热重铺国内分流。
+func (a *App) hotApplyRouteTable() {
+	a.mu.Lock()
+	running := a.running
+	gw := a.snapshot.DefaultGateway
+	ifIndex := a.snapshot.DefaultIfIndex
+	table := ActiveCNRoutes()
+	a.mu.Unlock()
+	if !running || gw == "" || ifIndex == 0 || refreshSplitRoutesHook == nil {
+		return
+	}
+	refreshSplitRoutesHook(gw, ifIndex, table)
 }
 
 // watchHealth 在接管网络后确认「真的能出去」，失败就自动回退。

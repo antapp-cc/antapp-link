@@ -235,7 +235,7 @@ func (w *sessionWatcher) reconcile() {
 		}
 	}
 	failed := 0
-	for _, p := range CNRoutes() {
+	for _, p := range ActiveCNRoutes() {
 		if prefix, err := netip.ParsePrefix(p); err == nil {
 			if err := newDef.LUID.AddRoute(prefix.Masked(), gw, splitRouteMetric); err != nil &&
 				!errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) {
