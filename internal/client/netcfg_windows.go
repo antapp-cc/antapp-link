@@ -194,6 +194,23 @@ func (s Snapshot) Apply(cfg NetConfig) error {
 			return err
 		}
 	}
+
+	// 智能分流：国内网段走原网关直连，其余才进隧道。
+	//
+	// 好处是服务端出口出问题时国内网络照常可用，不会「连上就没有网」。
+	if splitRoutesSupported(s) {
+		routes := CNRoutes()
+		cmds := splitRouteCommands(routes, s.DefaultIfIndex, s.DefaultGateway, true)
+		ok := 0
+		for _, c := range cmds {
+			if err := runCommand(c); err == nil {
+				ok++
+			}
+		}
+		logf("智能分流：%d/%d 条国内网段走 %s 直连", ok, len(routes), describeSplit(s))
+	} else {
+		logf("智能分流未启用：%s", describeSplit(s))
+	}
 	return nil
 }
 
@@ -219,6 +236,12 @@ func (s Snapshot) Restore(cfg NetConfig) error {
 	for _, c := range RestoreCommands(s, cfg) {
 		if err := runCommand(c); err != nil && firstErr == nil {
 			firstErr = err
+		}
+	}
+	// 国内直连路由也要撤掉，否则断开后它们还留在表里
+	if splitRoutesSupported(s) {
+		for _, c := range splitRouteCommands(CNRoutes(), s.DefaultIfIndex, s.DefaultGateway, false) {
+			_ = runCommand(c)
 		}
 	}
 	return firstErr

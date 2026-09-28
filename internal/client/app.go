@@ -52,6 +52,9 @@ func NewApp(inv pki.Invite, rootDir string, logger *slog.Logger, opts ...Option)
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// netcfg 那层不持有 logger，但「分流写了多少条路由」必须能看见，
+	// 否则路由没生效就只能靠猜。
+	logf = func(format string, args ...any) { logger.Info(fmt.Sprintf(format, args...)) }
 	app := &App{
 		inv:       inv,
 		rootDir:   rootDir,

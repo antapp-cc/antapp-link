@@ -20,6 +20,13 @@ type Command struct {
 	Args []string
 }
 
+// logf 是包级日志钩子。
+//
+// 这一层不持有 logger（logger 在 App 里），但「分流到底写进去多少条路由」
+// 是排障时第一个要看的东西 —— 没有它，路由没生效就只能靠猜。
+// 默认空实现，NewApp 时接上真实 logger；测试环境保持安静。
+var logf = func(format string, args ...any) {}
+
 func (c Command) String() string {
 	parts := append([]string{c.Name}, c.Args...)
 	for i, p := range parts {
