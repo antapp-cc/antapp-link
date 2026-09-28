@@ -40,8 +40,8 @@ func TestLoadConfigFillsDefaults(t *testing.T) {
 	if cfg.Tunnel.Device != "antapp0" {
 		t.Errorf("未覆盖的字段应保留默认值，Device = %q", cfg.Tunnel.Device)
 	}
-	if len(cfg.DNS) != 2 {
-		t.Errorf("未覆盖的 DNS 应保留默认值，实际 %v", cfg.DNS)
+	if len(cfg.DNS) != 1 || cfg.DNS[0] != "10.10.0.1" {
+		t.Errorf("默认 DNS 应指向隧道网关（服务端 dnsmasq filter-AAAA 中继），实际 %v", cfg.DNS)
 	}
 	if cfg.Listen != "0.0.0.0:62233" {
 		t.Errorf("未覆盖的 Listen 应保留默认值，实际 %q", cfg.Listen)

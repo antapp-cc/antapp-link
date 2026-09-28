@@ -53,6 +53,11 @@ func Rules(cfg Config, wanIface string) []Rule {
 
 		{Chain: "INPUT", Args: []string{"-p", "tcp", "--dport", listenPort, "-j", "ACCEPT"}},
 
+		// 隧道客户端的 DNS 查询发往网关上的 dnsmasq（filter-AAAA）——
+		// v4-only 隧道绝不能返回 AAAA，否则客户端拿 v6 地址直连死路。
+		{Chain: "INPUT", Args: []string{"-i", cfg.Tunnel.Device, "-p", "udp", "--dport", "53", "-j", "ACCEPT"}},
+		{Chain: "INPUT", Args: []string{"-i", cfg.Tunnel.Device, "-p", "tcp", "--dport", "53", "-j", "ACCEPT"}},
+
 		// 端口转发交给内核，只做 TCP。
 		//
 		// 曾经 TCP 和 UDP 各一条，后来按需求去掉了 UDP：Pi Node 那边只用 TCP，

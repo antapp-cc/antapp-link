@@ -75,6 +75,14 @@ bash install.sh --forward 31400-31409
 
 如果你的云服还有别的防火墙前端（安全组 / ufw），记得放行隧道端口。
 
+## 隧道 DNS 中继（dnsmasq + filter-AAAA）
+
+`install.sh` 会安装 dnsmasq，`antapp-linkd install` 写入 `/etc/dnsmasq.d/antapp.conf`：dnsmasq 监听隧道网关（默认 `10.10.0.1`），上游 8.8.8.8 / 1.1.1.1，并开启 **`filter-AAAA`**。签发的连接码里 DNS 就是网关地址——隧道客户端的全部解析都走这条中继。
+
+**为什么必须过滤 AAAA**：隧道只接管 IPv4。把 AAAA（v6 地址）发给客户端，浏览器内核会拿它直连（完全绕开隧道），而 v6 直连多数情况是死路——实测会造成 Chromium 内核应用（如 Pi Desktop）整批内嵌页面白屏。
+
+排障：`dig @10.10.0.1 <域名> A`（应有答案）；`dig @10.10.0.1 <域名> AAAA`（应为空）；`systemctl status dnsmasq`。dnsmasq 用 `bind-dynamic` 绑定，开机时 antapp0 还没建起来也不会启动失败。
+
 ## 排障
 
 | 现象 | 先看这里 |

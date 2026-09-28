@@ -53,7 +53,10 @@ func Default() Config {
 			ClientIP: "10.10.0.2",
 			MTU:      1400,
 		},
-		DNS:          []string{"8.8.8.8", "149.112.112.112"},
+		// 客户端的 DNS 指向隧道网关：服务端在网关上跑 dnsmasq（filter-AAAA）。
+		// 隧道只接管 IPv4，绝不能把 AAAA 发给客户端 —— 浏览器拿到 v6 地址会
+		// 直连（绕开隧道）死路，实测就是 Pi Desktop 内嵌页面全白屏的根因。
+		DNS:          []string{"10.10.0.1"},
 		ForwardPorts: PortRange{Start: 31400, End: 31409},
 		PKIDir:       "/etc/antapp-link/pki",
 	}
@@ -128,6 +131,8 @@ func (c *Config) ApplyOverrides(o Overrides) {
 			c.Tunnel.Network = fmt.Sprintf("%s/%d", base.String(), ones)
 			c.Tunnel.ServerIP = server.String()
 			c.Tunnel.ClientIP = client.String()
+			// DNS 跟着网关走：中继（dnsmasq filter-AAAA）永远绑在隧道网关上
+			c.DNS = []string{c.Tunnel.ServerIP}
 		}
 	}
 }

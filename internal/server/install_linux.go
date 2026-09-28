@@ -17,6 +17,7 @@ const (
 	daemonUnit = "/etc/systemd/system/antapp-linkd.service"
 	upUnit     = "/etc/systemd/system/antapp-link-up.service"
 	sysctlFile = "/etc/sysctl.d/99-antapp-link.conf"
+	dnsConf    = "/etc/dnsmasq.d/antapp.conf"
 )
 
 // BBR + fq：Pi 节点上传流量占比高，换成 BBR 对丢包链路改善明显。
@@ -41,12 +42,21 @@ func Install(stdout, stderr io.Writer, args []string) int {
 		return 1
 	}
 
+	// 先读配置并校验：DNS 中继配置要从这里取网关地址，配置不合法就别往下走
+	cfg, err := LoadConfig(*cfgPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+
 	steps := []struct {
 		desc string
 		fn   func() error
 	}{
 		{"安装二进制到 " + binaryPath, installBinary},
 		{"写 " + sysctlFile, func() error { return os.WriteFile(sysctlFile, []byte(sysctlContent), 0o644) }},
+		{"写 " + dnsConf, func() error { return os.WriteFile(dnsConf, []byte(dnsRelayConfContent(cfg)), 0o644) }},
+		{"启用 dnsmasq DNS 中继", enableDNSRelay},
 		{"写 " + daemonUnit, func() error { return os.WriteFile(daemonUnit, []byte(daemonUnitContent(*cfgPath)), 0o644) }},
 		{"写 " + upUnit, func() error { return os.WriteFile(upUnit, []byte(upUnitContent(*cfgPath)), 0o644) }},
 		{"systemctl daemon-reload", func() error { return runSystemctl("daemon-reload") }},
@@ -132,4 +142,34 @@ func runSystemctl(args ...string) error {
 		return fmt.Errorf("systemctl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// dnsRelayConfContent 生成隧道 DNS 中继（dnsmasq）的配置。
+//
+// 关键是 filter-AAAA：隧道只接管 IPv4，把 AAAA 发给客户端，Chromium 等
+// 浏览器内核会拿 v6 地址直连（完全绕开隧道）—— 全部死路，实测就是
+// Pi Desktop 内嵌页面整批白屏的根因。bind-dynamic 让 dnsmasq 在开机时
+// （antapp0 尚未建起）也能正常启动，隧道就绪后自动绑定网关地址。
+func dnsRelayConfContent(cfg Config) string {
+	return fmt.Sprintf(`# AntApp Link 隧道 DNS（由 antapp-linkd install 生成，可手改但会被覆盖）
+# v4-only 隧道：必须 filter-AAAA，客户端拿到 AAAA 会绕开隧道直连 v6 死路
+listen-address=%s
+bind-dynamic
+no-resolv
+server=8.8.8.8
+server=1.1.1.1
+filter-AAAA
+no-hosts
+cache-size=1000
+`, cfg.Tunnel.ServerIP)
+}
+
+// enableDNSRelay 启动并自启 dnsmasq。包不存在时不报错（install.sh 负责
+// 安装；个别精简系统有自己的 DNS 方案），只打印提示。
+func enableDNSRelay() error {
+	if _, err := exec.LookPath("dnsmasq"); err != nil {
+		fmt.Println("提示: 未安装 dnsmasq，隧道 DNS 中继未启用（deploy/install.sh 会自动安装）")
+		return nil
+	}
+	return runSystemctl("enable", "--now", "dnsmasq")
 }

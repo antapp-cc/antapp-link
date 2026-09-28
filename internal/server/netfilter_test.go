@@ -53,6 +53,14 @@ func TestRulesOpenTunnelPort(t *testing.T) {
 	mustContain(t, ruleStrings(Default(), "eth0"), "-A INPUT -p tcp --dport 62233 -j ACCEPT")
 }
 
+// 隧道客户端的 DNS 查询发往网关上的 dnsmasq（filter-AAAA，v4-only 隧道
+// 不能返回 AAAA，否则客户端拿 v6 直连死路），INPUT 必须放行。
+func TestRulesAllowTunnelDNS(t *testing.T) {
+	rules := ruleStrings(Default(), "eth0")
+	mustContain(t, rules, "-A INPUT -i antapp0 -p udp --dport 53 -j ACCEPT")
+	mustContain(t, rules, "-A INPUT -i antapp0 -p tcp --dport 53 -j ACCEPT")
+}
+
 func TestRulesFollowConfig(t *testing.T) {
 	cfg := Default()
 	cfg.Tunnel.ClientIP = "10.10.0.9"

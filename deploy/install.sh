@@ -66,10 +66,12 @@ done
 # 全新 VPS 上真实踩到的两件事：
 # 1) Debian 12 默认不带 iptables（它转向 nftables 了），而 DNAT 规则要用它；
 # 2) tun 模块在精简系统上不会自动加载，/dev/net/tun 也就不会出现。
+# 3) dnsmasq 提供隧道 DNS 中继（filter-AAAA：v4-only 隧道不能把 AAAA 发给客户端）。
 log "检查系统依赖"
 missing=()
 command -v iptables >/dev/null || missing+=(iptables)
 command -v modprobe >/dev/null || missing+=(kmod)
+command -v dnsmasq >/dev/null || missing+=(dnsmasq)
 if [[ ${#missing[@]} -gt 0 ]]; then
   log "缺少 ${missing[*]}，尝试安装"
   if command -v apt-get >/dev/null; then
@@ -104,6 +106,9 @@ init_args=(-c "$CONF")
 
 log "安装 systemd 服务"
 "$BIN" install -c "$CONF"
+
+# 隧道 DNS 中继（配置由 `antapp-linkd install` 写入 /etc/dnsmasq.d/antapp.conf）
+systemctl enable --now dnsmasq >/dev/null 2>&1 || log "警告: dnsmasq 未启动，隧道 DNS 中继不可用"
 
 log "配置 netfilter（幂等）"
 "$BIN" up -c "$CONF"
