@@ -3,7 +3,6 @@ package client
 import (
 	"fmt"
 	"net"
-	"strings"
 )
 
 // 智能分流：国内网段走原网关直连，其余才进隧道。
@@ -54,12 +53,4 @@ func splitRouteCommands(prefixes []string, ifIndex int, nextHop string, add bool
 func splitRoutesSupported(s Snapshot) bool {
 	return s.DefaultGateway != "" && s.DefaultIfIndex != 0 &&
 		net.ParseIP(s.DefaultGateway) != nil
-}
-
-// describeSplit 给日志用一句话摘要。
-func describeSplit(s Snapshot) string {
-	if !splitRoutesSupported(s) {
-		return fmt.Sprintf("未启用（默认网关 %q，接口 %d）", s.DefaultGateway, s.DefaultIfIndex)
-	}
-	return strings.TrimSpace(fmt.Sprintf("%s（接口 %d）", s.DefaultGateway, s.DefaultIfIndex))
 }

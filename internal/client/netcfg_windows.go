@@ -207,9 +207,13 @@ func (s Snapshot) Apply(cfg NetConfig) error {
 				ok++
 			}
 		}
-		logf("智能分流：%d/%d 条国内网段走 %s 直连", ok, len(routes), describeSplit(s))
-	} else {
-		logf("智能分流未启用：%s", describeSplit(s))
+		// 只报结论。写了多少条是实现细节，用户不需要看，而且会把日志撑出好几行。
+		if ok == len(cmds) {
+			logf("智能分流已启用：国内流量直连，其余走隧道")
+		} else {
+			logf("智能分流部分生效：%d 条直连路由没写进去（这些网段会走隧道，不影响可用）",
+				len(cmds)-ok)
+		}
 	}
 	return nil
 }
