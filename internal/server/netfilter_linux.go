@@ -137,10 +137,11 @@ func defaultInterface() (string, error) {
 	return "", errors.New("找不到默认出口网卡，云服可能没配默认路由")
 }
 
-// CheckForwardPortsFree 在接管端口段之前确认没人在监听。
+// CheckForwardPortsFree 在接管端口段之前确认没有外部程序在监听。
 //
-// 冲突时 DNAT 会抢在本地 socket 之前生效，占用方（典型是现网的 rinetd）会静默收不到流量 ——
-// 老节点看起来「突然连不上」却没有任何报错。所以这里必须显式拦一下。
+// 本守护进程自己的转发器监听不算占用（升级场景下旧进程还持着端口）；
+// 外部程序（典型是现网还在跑的 rinetd）占用会导致外部流量被它抢答、
+// 节点机收不到 —— 老节点看起来「突然连不上」却没有任何报错。所以这里必须显式拦一下。
 func CheckForwardPortsFree(cfg Config) error {
 	ports, err := listeningPorts()
 	if err != nil {
@@ -149,36 +150,54 @@ func CheckForwardPortsFree(cfg Config) error {
 	}
 	var busy []int
 	for p := cfg.ForwardPorts.Start; p <= cfg.ForwardPorts.End; p++ {
-		if ports[p] {
+		proc := ports[p]
+		if proc != "" && proc != daemonProcessName {
 			busy = append(busy, p)
 		}
 	}
 	if len(busy) > 0 {
-		return fmt.Errorf("转发端口 %v 已被占用（通常是现网还在跑的 rinetd）。"+
-			"DNAT 会抢在本地监听之前生效，占用方将静默失效；"+
+		return fmt.Errorf("转发端口 %v 已被外部程序占用（通常是现网还在跑的 rinetd）。"+
+			"转发器将无法监听这些端口，外部流量进不了隧道；"+
 			"迁移时请先停掉占用方，或先用另一段端口验证", busy)
 	}
 	return nil
 }
 
-func listeningPorts() (map[int]bool, error) {
-	out, err := exec.Command("ss", "-ltnH").Output()
+// listeningPorts 返回当前 LISTEN 的 TCP 端口 → 监听进程名（需要 root；
+// 拿不到进程名的行忽略）。
+func listeningPorts() (map[int]string, error) {
+	out, err := exec.Command("ss", "-lntpH").Output()
 	if err != nil {
 		return nil, err
 	}
-	ports := make(map[int]bool)
+	ports := make(map[int]string)
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 4 {
+		if len(fields) < 4 || fields[0] != "LISTEN" {
 			continue
 		}
 		_, portStr, err := net.SplitHostPort(fields[3])
 		if err != nil {
 			continue
 		}
-		if p, err := strconv.Atoi(portStr); err == nil {
-			ports[p] = true
+		p, err := strconv.Atoi(portStr)
+		if err != nil {
+			continue
 		}
+		ports[p] = listenerProcess(line)
 	}
 	return ports, nil
+}
+
+// listenerProcess 从 ss -p 的 users 字段里取监听进程名（可能为空）。
+func listenerProcess(line string) string {
+	i := strings.Index(line, `users:(("`)
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+len(`users:(("`):]
+	if j := strings.Index(rest, `"`); j >= 0 {
+		return rest[:j]
+	}
+	return ""
 }

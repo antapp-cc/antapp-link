@@ -10,6 +10,10 @@ import (
 // 是为了 down 时能整体清干净，不留残渣。
 const ChainName = "ANTAPP_LINK"
 
+// daemonProcessName 是本守护进程的进程名：端口占用检查时用它区分
+// 「自家转发器的监听」与「外部程序的占用」。
+const daemonProcessName = "antapp-linkd"
+
 // Rule 是一条 iptables 规则。Table 为空表示 filter 表。
 type Rule struct {
 	Table string
