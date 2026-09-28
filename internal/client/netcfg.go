@@ -161,13 +161,62 @@ func RouteCommands(snap Snapshot, cfg NetConfig, ifIndex int) []Command {
 	for _, iface := range snap.Interfaces {
 		cmds = append(cmds, setDNSCommands(iface.Name, cfg.DNS)...)
 	}
-	return append(cmds, Command{"ipconfig", []string{"/flushdns"}})
+	cmds = append(cmds, Command{"ipconfig", []string{"/flushdns"}})
+
+	// 改完 DNS 再上锁，否则中间那几毫秒系统还能往隧道外发查询。
+	var ifaceNames []string
+	for _, iface := range snap.Interfaces {
+		ifaceNames = append(ifaceNames, iface.Name)
+	}
+	return append(cmds, dnsLockCommands(ifaceNames)...)
+}
+
+// dnsLockPrefix 是 DNS 锁定防火墙规则的显示名前缀，解锁时按前缀整体删除。
+const dnsLockPrefix = "AntApp Link 锁定 DNS"
+
+// dnsLockCommands 生成「DNS 只许走隧道」的防火墙规则。
+//
+// 为什么必须有这一步：只把网卡的 DNS 改成隧道地址是「建议」不是「强制」。
+// 系统照样可以把查询发给路由器下发的 IPv6 DNS —— 那条路在隧道外面，会被劫持，
+// 于是域名解析出假 IP、网站打不开，看起来就像「连上一会就没网了」。
+// OpenVPN 用 block-outside-dns、Clash 用 dns-hijack:any:53 解决的是同一件事。
+//
+// 按**网卡**挡，而不是禁用 IPv6：禁用网卡绑定会重置整张网卡并清掉 DNS 配置，
+// 实测直接把机器弄成完全无法解析。这里网卡不动、DNS 配置不动，
+// 只掐掉指定网卡发出的 53，隧道网卡上的查询不受影响。
+func dnsLockCommands(ifaceNames []string) []Command {
+	var out []Command
+	for _, name := range ifaceNames {
+		for _, proto := range []string{"UDP", "TCP"} {
+			display := fmt.Sprintf("%s (%s %s)", dnsLockPrefix, name, proto)
+			script := fmt.Sprintf(
+				"try { Remove-NetFirewallRule -DisplayName '%s' -ErrorAction SilentlyContinue } catch { }; "+
+					"try { New-NetFirewallRule -DisplayName '%s' -Direction Outbound -Action Block "+
+					"-Protocol %s -RemotePort 53 -InterfaceAlias '%s' -Profile Any -ErrorAction Stop | Out-Null } catch { }; "+
+					"exit 0",
+				display, display, proto, name)
+			out = append(out, Command{"powershell", []string{
+				"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script}})
+		}
+	}
+	return out
+}
+
+// dnsUnlockCommands 删掉全部锁定规则。按前缀删，不依赖当时锁了哪几张网卡，
+// 所以即使快照损坏也能把规则清干净。
+func dnsUnlockCommands() []Command {
+	return []Command{{"powershell", []string{
+		"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+		fmt.Sprintf("try { Get-NetFirewallRule -DisplayName '%s*' -ErrorAction SilentlyContinue | "+
+			"Remove-NetFirewallRule -ErrorAction SilentlyContinue } catch { }; exit 0", dnsLockPrefix)}}}
 }
 
 // RestoreCommands 与 RouteCommands 逆序：先撤接管路由，再撤绕行路由。
 // 反过来会留下一个「流量正被送进一条已经不通的隧道」的窗口。
 func RestoreCommands(snap Snapshot, cfg NetConfig) []Command {
-	var cmds []Command
+	// 先解 DNS 锁定：万一后面的还原卡住，至少不会把用户留在「DNS 被锁死、
+	// 但隧道已经拆掉」的状态 —— 那等于完全没法解析域名。
+	cmds := dnsUnlockCommands()
 
 	for _, iface := range snap.Interfaces {
 		cmds = append(cmds, restoreDNSCommands(iface)...)
