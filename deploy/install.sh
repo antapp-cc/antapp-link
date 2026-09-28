@@ -52,6 +52,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$(id -u)" -eq 0 ]] || die "请用 root 运行"
+if [[ -f $CONF ]]; then
+  log "检测到已安装 AntApp Link——本次按升级处理：只更新程序与配置，CA、已签发证书和 /root/pinode.antapp 全部原样保留，老连接码继续有效"
+fi
 if [[ ! -f "$SRC_DIR/antapp-linkd" ]]; then
   log "目录下没有 antapp-linkd，从 GitHub Release 自动下载（约 7 MB）……"
   url="https://github.com/antapp-cc/antapp-link/releases/latest/download/antapp-linkd"
@@ -124,9 +127,9 @@ log "当前状态"
 "$BIN" status -c "$CONF" || true
 
 if [[ -f /root/pinode.antapp ]]; then
-  log "连接码文件已存在：/root/pinode.antapp（保留不覆盖；重签执行: $BIN invite pi-node-01 -o /root）"
+  log "已签发过连接码：/root/pinode.antapp 继续有效，本次不重签（确认要重签才执行: $BIN invite pi-node-01 -o /root）"
 else
-  log "自动签发连接码文件到 /root"
+  log "首次安装，自动签发连接码文件到 /root（只签这一个）"
   "$BIN" invite pi-node-01 -o /root || log "警告: 签发失败，可手动执行: $BIN invite pi-node-01 -o /root"
 fi
 
@@ -135,6 +138,6 @@ cat <<EOF
 [antapp-link] --------------------------------------------------
 [antapp-link] 安装完成。连接码文件：/root/pinode.antapp
 [antapp-link] 把它发给节点机双击导入即可（内含私钥，等同密码，注意保管）。
-[antapp-link] 重签或多节点：$BIN invite <客户端名> -o <输出目录>
+[antapp-link] 升级重装不会动这个文件；确认要重签才执行: $BIN invite pi-node-01 -o /root
 [antapp-link] --------------------------------------------------
 EOF
