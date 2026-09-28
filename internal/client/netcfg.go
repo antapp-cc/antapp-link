@@ -164,11 +164,7 @@ func RouteCommands(snap Snapshot, cfg NetConfig, ifIndex int) []Command {
 	cmds = append(cmds, Command{"ipconfig", []string{"/flushdns"}})
 
 	// 改完 DNS 再上锁，否则中间那几毫秒系统还能往隧道外发查询。
-	var ifaceNames []string
-	for _, iface := range snap.Interfaces {
-		ifaceNames = append(ifaceNames, iface.Name)
-	}
-	return append(cmds, dnsLockCommands(ifaceNames)...)
+	return append(cmds, dnsLockCommands(snap.Interfaces, cfg.DNS)...)
 }
 
 // dnsLockPrefix 是 DNS 锁定防火墙规则的显示名前缀，解锁时按前缀整体删除。
@@ -181,20 +177,52 @@ const dnsLockPrefix = "AntApp Link 锁定 DNS"
 // 于是域名解析出假 IP、网站打不开，看起来就像「连上一会就没网了」。
 // OpenVPN 用 block-outside-dns、Clash 用 dns-hijack:any:53 解决的是同一件事。
 //
-// 按**网卡**挡，而不是禁用 IPv6：禁用网卡绑定会重置整张网卡并清掉 DNS 配置，
-// 实测直接把机器弄成完全无法解析。这里网卡不动、DNS 配置不动，
-// 只掐掉指定网卡发出的 53，隧道网卡上的查询不受影响。
-func dnsLockCommands(ifaceNames []string) []Command {
+// **按目标地址封堵，不按网卡名封堵** —— 这一点是照着 OpenVPN 的做法来的：
+// 它枚举每张非隧道网卡自己的 DNS 服务器地址，逐个封堵。实测 Windows 防火墙的
+// -InterfaceAlias 对出站 DNS 查询**不起作用**（规则显示 Enabled，查询照样出去），
+// 而 -RemoteAddress 立刻生效。按接口挡是条死路。
+//
+// 不能禁用网卡的 IPv6 来达成同一目的：Disable-NetAdapterBinding 会重置整张网卡、
+// 清掉 DNS 配置，实测直接把机器弄成完全无法解析。
+func dnsLockCommands(ifaces []IfaceDNS, tunnelDNS []string) []Command {
+	// 隧道自己的 DNS 不能封，否则隧道内的查询也断了
+	isTunnel := func(addr string) bool {
+		for _, t := range tunnelDNS {
+			if addr == t {
+				return true
+			}
+		}
+		return false
+	}
+
+	// 同一个 DNS 地址可能被多张网卡共用，去重后每条只封一次
+	seen := map[string]bool{}
+	var outside []string
+	for _, iface := range ifaces {
+		for _, d := range iface.DNS {
+			d = strings.TrimSpace(d)
+			if d == "" || isTunnel(d) || seen[d] {
+				continue
+			}
+			seen[d] = true
+			outside = append(outside, d)
+		}
+	}
+	if len(outside) == 0 {
+		return nil
+	}
+
 	var out []Command
-	for _, name := range ifaceNames {
+	for _, addr := range outside {
 		for _, proto := range []string{"UDP", "TCP"} {
-			display := fmt.Sprintf("%s (%s %s)", dnsLockPrefix, name, proto)
+			display := fmt.Sprintf("%s (%s %s)", dnsLockPrefix, addr, proto)
+			// 先删同名规则再建，重复执行是幂等的
 			script := fmt.Sprintf(
 				"try { Remove-NetFirewallRule -DisplayName '%s' -ErrorAction SilentlyContinue } catch { }; "+
 					"try { New-NetFirewallRule -DisplayName '%s' -Direction Outbound -Action Block "+
-					"-Protocol %s -RemotePort 53 -InterfaceAlias '%s' -Profile Any -ErrorAction Stop | Out-Null } catch { }; "+
+					"-Protocol %s -RemotePort 53 -RemoteAddress '%s' -Profile Any -ErrorAction Stop | Out-Null } catch { }; "+
 					"exit 0",
-				display, display, proto, name)
+				display, display, proto, addr)
 			out = append(out, Command{"powershell", []string{
 				"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script}})
 		}
@@ -202,7 +230,7 @@ func dnsLockCommands(ifaceNames []string) []Command {
 	return out
 }
 
-// dnsUnlockCommands 删掉全部锁定规则。按前缀删，不依赖当时锁了哪几张网卡，
+// dnsUnlockCommands 删掉全部锁定规则。按前缀删，不依赖当时封了哪些地址，
 // 所以即使快照损坏也能把规则清干净。
 func dnsUnlockCommands() []Command {
 	return []Command{{"powershell", []string{
