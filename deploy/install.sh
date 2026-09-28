@@ -112,8 +112,11 @@ init_args=(-c "$CONF")
 log "安装 systemd 服务"
 "$BIN" install -c "$CONF"
 
-# 隧道 DNS 中继（配置由 `antapp-linkd install` 写入 /etc/dnsmasq.d/antapp.conf）
-systemctl enable --now dnsmasq >/dev/null 2>&1 || log "警告: dnsmasq 未启动，隧道 DNS 中继不可用"
+# 隧道 DNS 中继（配置由 `antapp-linkd install` 写入 /etc/dnsmasq.d/antapp.conf）。
+# 必须 restart 而非 start：apt 装 dnsmasq 时 Debian 会立刻自启它，那时 antapp.conf
+# 还没写入，之后的 enable --now 是空操作——全新安装会一直跑着没有 filter-AAAA 的裸配置。
+systemctl enable dnsmasq >/dev/null 2>&1 || true
+systemctl restart dnsmasq >/dev/null 2>&1 || log "警告: dnsmasq 未启动，隧道 DNS 中继不可用"
 
 log "配置 netfilter（幂等）"
 "$BIN" up -c "$CONF"
