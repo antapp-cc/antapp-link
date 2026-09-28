@@ -99,7 +99,6 @@ func startSessionWatcher(ctx context.Context, snap Snapshot, cfg NetConfig,
 	}
 	w.unregs = append(w.unregs, cbi.Unregister)
 
-	logf("出口守护已启动（事件通知 + 每 %s 对账）", pollInterval)
 	go w.loop(ctx)
 	return w, nil
 }
@@ -170,12 +169,6 @@ func (w *sessionWatcher) reconcile() {
 	gw, ifIndex, err := bestDefaultRoute(tunLUID)
 	if err != nil || gw.IsUnspecified() {
 		return // 眼下没有出口（断网中），等下次事件
-	}
-
-	// 出口没变也可能只是出口的 MTU 变了（人为调整、驱动重置、便携设备换网络），
-	// 动态 MTU 每次对账都要刷新；已经是目标值时它是空操作。
-	if def, ok, _ := adapterByIndex(ifIndex); ok {
-		applyDynamicMTU(def.LUID, tunLUID, w.cfg.MTU)
 	}
 
 	if watcherDebug {
@@ -249,7 +242,6 @@ func (w *sessionWatcher) reconcile() {
 			}
 		}
 	}
-	applyDynamicMTU(newDef.LUID, w.tunLUID(), w.cfg.MTU)
 
 	// 6) 更新现场 + 唤醒隧道立刻重连
 	w.snap = newSnapshot(gw.Unmap().String(), int(ifIndex), serverNextHop,

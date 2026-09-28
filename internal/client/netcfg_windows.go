@@ -161,7 +161,6 @@ func configureAdapterLUID(cfg NetConfig) error {
 		return fmt.Errorf("读隧道网卡接口参数: %w", err)
 	}
 	row.NLMTU = uint32(cfg.MTU)
-	effectiveMTU.Store(int64(cfg.MTU))
 	// 接口跃点压到最低：Windows 按接口跃点挑 DNS 服务器，不压低的话
 	// 解析还可能落到本地网卡上。
 	row.Metric = 1
@@ -277,11 +276,6 @@ func (s Snapshot) applyOnce(cfg NetConfig) error {
 		}
 	}
 
-	// 1.5) 动态 MTU：出口比连接码预设的更小（PPPoE/4G）时自动收缩，避免大包黑洞
-	if haveDef {
-		applyDynamicMTU(def.LUID, tunLUID, cfg.MTU)
-	}
-
 	// 2) DNS 改写到隧道地址 + 刷新缓存
 	for _, iface := range s.Interfaces {
 		a, ok, err := adapterByName(iface.Name)
@@ -329,30 +323,6 @@ func (s Snapshot) applyOnce(cfg NetConfig) error {
 		}
 	}
 	return nil
-}
-
-// applyDynamicMTU 按当前默认出口的 MTU 调整隧道 MTU，已经是目标值时不动。
-// 网络出口迁移时由 watcher 再次调用（同 WireGuard 的 monitorMTU）。
-func applyDynamicMTU(egressLUID, tunLUID winipcfg.LUID, inviteMTU int) {
-	ifrow, err := egressLUID.Interface()
-	if err != nil || ifrow.MTU == 0 {
-		return
-	}
-	target := targetTunnelMTU(ifrow.MTU, uint32(inviteMTU))
-	row, err := tunLUID.IPInterface(windows.AF_INET)
-	if err != nil {
-		return
-	}
-	if row.NLMTU == target {
-		return
-	}
-	row.NLMTU = target
-	effectiveMTU.Store(int64(target))
-	if err := row.Set(); err != nil {
-		logf("隧道 MTU 调整到 %d 失败: %v", target, err)
-		return
-	}
-	logf("隧道 MTU 跟随出口调整为 %d（出口 MTU %d）", target, ifrow.MTU)
 }
 
 // setAdapterDNS 把一张网卡的 IPv4 DNS 指到给定的服务器（原生 dnsapi 调用）。

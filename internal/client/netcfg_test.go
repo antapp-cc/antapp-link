@@ -31,26 +31,6 @@ func testNetConfig() NetConfig {
 	}
 }
 
-// 动态 MTU：出口变小（PPPoE/4G/套 VPN）时自动收缩避免大包黑洞，
-// 出口够大时用连接码的值，读不到出口（0）时也退回连接码值，下限 576。
-func TestTargetTunnelMTU(t *testing.T) {
-	cases := []struct {
-		egress, invite, want uint32
-	}{
-		{1500, 1400, 1400}, // 家用以太网：用连接码值
-		{1492, 1400, 1400}, // PPPoE：1400 依然安全
-		{1400, 1400, 1344}, // 出口本身小：收缩
-		{1300, 1400, 1244}, // 更小
-		{600, 1400, 576},   // 触底：IPv4 最小重组单位
-		{0, 1400, 1400},    // 读不到出口：退回连接码值
-	}
-	for _, c := range cases {
-		if got := targetTunnelMTU(c.egress, c.invite); got != c.want {
-			t.Errorf("targetTunnelMTU(%d, %d) = %d, want %d", c.egress, c.invite, got, c.want)
-		}
-	}
-}
-
 func TestBuildNetConfigSplitsServerAddress(t *testing.T) {
 	inv := testInvite(t)
 	cfg := BuildNetConfig(inv)

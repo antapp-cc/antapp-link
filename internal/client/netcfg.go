@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/antapp-cc/antapp-link/internal/pki"
@@ -103,30 +102,6 @@ func BuildNetConfig(inv pki.Invite) NetConfig {
 // splitRouteMetric 是国内直连路由的 route metric。还原时按
 // 「下一跳 = 原默认网关 且 metric = 此值」整批扫除，网段表更新过也能清干净。
 const splitRouteMetric = 5
-
-// tunnelOverheadBytes 是承载内层 IP 包的外层开销估算：
-// 外层 IPv4 头 20 + TCP 头 20 + TLS 记录头与认证标签约 16~22。
-const tunnelOverheadBytes = 56
-
-// effectiveMTU 是隧道网卡当前实际生效的 MTU。配置值（连接码里的）是固定数，
-// 实际值会跟随出口链路自动收缩/回升 —— 日志要显示的是这个，不是配置值。
-// 非 Windows 平台无人写入，恒为 0（调用方按 0 = 未接管处理）。
-var effectiveMTU atomic.Int64
-
-// targetTunnelMTU 跟随出口计算隧道 MTU（WireGuard monitorMTU 同思路）：
-// 取连接码 MTU 与「出口 MTU - 隧道开销」的较小值，下限 576（IPv4 主机必须
-// 能重组的最小值）。出口变小（PPPoE/4G/套了层 VPN）时自动收缩避免大包黑洞，
-// 出口恢复后自动回升。egressMTU 为 0（读不到）时退回连接码值。
-func targetTunnelMTU(egressMTU, inviteMTU uint32) uint32 {
-	target := inviteMTU
-	if egressMTU > tunnelOverheadBytes && egressMTU-tunnelOverheadBytes < target {
-		target = egressMTU - tunnelOverheadBytes
-	}
-	if target < 576 {
-		target = 576
-	}
-	return target
-}
 
 // dnsLockPrefix 是旧版 DNS 锁定防火墙规则的显示名前缀。新版本不再创建这类规则，
 // 只在启动自愈时按这个前缀清理旧版残留。
