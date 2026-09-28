@@ -40,7 +40,6 @@ var (
 	routeTableMu     sync.RWMutex
 	routeTablePath   string   // data\cn_routes.txt，NewApp 时注入
 	activeRouteTable []string // 当前生效的网段表
-	routeTableSource string   // 当前表来源："内置" / "云端"
 )
 
 // SetRouteTablePath 注入外部网段表的落盘路径并加载初始表。
@@ -78,7 +77,6 @@ var (
 // 调用方须持有 routeTableMu。
 func initActiveRouteTableLocked() {
 	activeRouteTable = nil
-	routeTableSource = ""
 	if routeTablePath == "" {
 		return
 	}
@@ -92,7 +90,6 @@ func initActiveRouteTableLocked() {
 		return // 内容不合法：用内置表
 	}
 	activeRouteTable = table
-	routeTableSource = "云端"
 }
 
 // parseRouteTableLines 解析网段表：每行一个 IPv4 CIDR，跳过注释与空行，
@@ -158,9 +155,8 @@ func fetchAndStoreRouteTable() bool {
 		// 落盘成功后同步换掉内存中的现行表 —— 否则热重铺拿到的还是旧表
 		routeTableMu.Lock()
 		activeRouteTable = table
-		routeTableSource = sourceLabel(src)
 		routeTableMu.Unlock()
-		logf("分流网段表已更新：%d 条（来源 %s）", len(table), sourceLabel(src))
+		logf("分流网段表已更新：%d 条", len(table))
 		return true
 	}
 	if lastErr != nil {
@@ -209,16 +205,4 @@ func storeRouteTableFile(path string, table []string) error {
 		return err
 	}
 	return os.Rename(tmp, path)
-}
-
-// sourceLabel 把拉取源 URL 转成短标签用于日志。
-func sourceLabel(src string) string {
-	switch {
-	case strings.Contains(src, "jsdelivr"):
-		return "jsDelivr"
-	case strings.Contains(src, "github"):
-		return "GitHub"
-	default:
-		return src
-	}
 }
