@@ -52,6 +52,27 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$(id -u)" -eq 0 ]] || die "请用 root 运行"
+
+ver_ge() {
+  local lo
+  lo=$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)
+  [[ "$lo" == "$2" ]]
+}
+[[ -r /etc/os-release ]] || die "不支持该系统：读不到 /etc/os-release，仅支持 Debian 11+ / Ubuntu 22.04+"
+. /etc/os-release
+case "${ID:-}" in
+  debian)
+    ver_ge "${VERSION_ID:-0}" "11" || die "Debian 版本过旧（检测到 ${VERSION_ID:-未知}），需要 Debian 11 及以上"
+    ;;
+  ubuntu)
+    ver_ge "${VERSION_ID:-0}" "22.04" || die "Ubuntu 版本过旧（检测到 ${VERSION_ID:-未知}），需要 Ubuntu 22.04 及以上"
+    ;;
+  *)
+    die "不支持该系统（检测到 ${PRETTY_NAME:-${ID:-未知}}）：仅支持 Debian 11+ / Ubuntu 22.04+"
+    ;;
+esac
+log "系统检查通过：${PRETTY_NAME:-$ID $VERSION_ID}"
+
 if [[ -f $CONF ]]; then
   log "检测到已安装 AntApp Link——本次按升级处理：只更新程序与配置，CA、已签发证书和 /root/pinode.antapp 全部原样保留，老连接码继续有效"
 fi
