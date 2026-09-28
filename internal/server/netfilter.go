@@ -58,8 +58,7 @@ func Rules(cfg Config, wanIface string) []Rule {
 		{Chain: "INPUT", Args: []string{"-i", cfg.Tunnel.Device, "-p", "tcp", "--dport", "53", "-j", "ACCEPT"}},
 
 		// 转发端口段对公网开放：服务端转发器（relay）在本机监听这些端口，
-		// 收到连接立即应答、再经隧道转给节点机。握手在本机完成，外部检查器
-		// 量到的延迟只到云服为止（DNAT 方案会量到节点机，翻一倍）。
+		// 收到连接立即应答、再经隧道转给节点机。
 		{Chain: "INPUT", Args: []string{"-p", "tcp", "--dport", portRange, "-j", "ACCEPT"}},
 	}
 }

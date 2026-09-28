@@ -11,8 +11,8 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
-// 本文件是网络接管的底层原语，全部走进程内系统调用（iphlpapi/dnsapi），
-// 不再拉起 powershell / netsh / route.exe 等外部进程。
+// 本文件是网络接管的底层原语：全部为进程内系统调用（iphlpapi/dnsapi），
+// 不依赖任何外部命令。
 // 路由与地址读写用 WireGuard 官方封装的 winipcfg 包，久经实战。
 
 // adapterInfo 是一次适配器枚举的快照。

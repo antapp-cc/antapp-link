@@ -14,8 +14,8 @@ import (
 	"github.com/antapp-cc/antapp-link/internal/pki"
 )
 
-// Command 是一条要执行的外部命令。如今只剩低频路径还在用
-// （schtasks 开机自启、旧版防火墙规则扫尾），网络接管已全部原生化。
+// Command 是一条要执行的外部命令。如今只剩 schtasks（开机自启）这类
+// 低频路径还在用，网络接管已全部原生化。
 type Command struct {
 	Name string
 	Args []string
@@ -102,10 +102,6 @@ func BuildNetConfig(inv pki.Invite) NetConfig {
 // splitRouteMetric 是国内直连路由的 route metric。还原时按
 // 「下一跳 = 原默认网关 且 metric = 此值」整批扫除，网段表更新过也能清干净。
 const splitRouteMetric = 5
-
-// dnsLockPrefix 是旧版 DNS 锁定防火墙规则的显示名前缀。新版本不再创建这类规则，
-// 只在启动自愈时按这个前缀清理旧版残留。
-const dnsLockPrefix = "AntApp Link 锁定 DNS"
 
 // nrptRuleComment 是 NRPT 规则的识别标记，增删都按它筛，不碰别人的规则。
 const nrptRuleComment = "AntApp Link DNS"

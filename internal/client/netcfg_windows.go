@@ -25,8 +25,7 @@ func hiddenProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 }
 
-// runCommand 执行外部命令。如今只剩 schtasks（开机自启）和旧版防火墙
-// 规则扫尾这类低频路径还在用。
+// runCommand 执行外部命令。如今只剩 schtasks（开机自启）这类低频路径。
 func runCommand(c Command) error {
 	cmd := exec.Command(c.Name, c.Args...)
 	cmd.SysProcAttr = hiddenProcAttr()
@@ -40,15 +39,13 @@ func runCommand(c Command) error {
 
 // 网络接管的 Windows 实现：地址、MTU、跃点、路由、DNS、NRPT 全部走
 // 进程内系统调用（winipcfg / iphlpapi / dnsapi / 注册表），
-// 连接与断开不再拉起 powershell / netsh / route.exe 等外部进程。
 //
 // 历史教训都还适用，只是换了更可靠的执行手段：
 //   - /1 路由必须显式绑定隧道网卡 → AddRoute 挂在隧道 LUID 上，结构上不可能挂错
 //   - 绕行路由必须先于接管路由，且云服直连时不加 → 见 routePlan
 //   - 还原必须先解 DNS 再拆路由，尽力而为不中断 → 见 Restore
 
-// runCommand / hiddenProcAttr 仍保留：schtasks（开机自启）和旧版防火墙
-// 残留清理这类低频操作还借道外部命令。
+// runCommand / hiddenProcAttr 仅供 schtasks（开机自启）这类低频操作使用。
 
 // ---------- 现场抓取 ----------
 
@@ -435,7 +432,7 @@ func (s Snapshot) Restore(cfg NetConfig) error {
 
 // nrptApply 写入 Pi 域名的解析规则。规则本体是 DnsPolicyConfig 下一个固定
 // GUID 的注册表键（实测 Dnscache 无需重启即时生效），重写即覆盖，天然幂等。
-// 旧版用 PowerShell WMI 创建的规则 GUID 随机，由 nrptSweepLegacy 按标记扫除。
+// 旧版用 PowerShell WMI 创建的规则 GUID 随机，由 nrptRemove 按标记扫除。
 func nrptApply(gateway string) error {
 	keyPath := nrptKeyPath + `\` + nrptRuleGUID
 	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, keyPath, registry.SET_VALUE)
@@ -490,7 +487,3 @@ func nrptRemove() {
 		_ = registry.DeleteKey(registry.LOCAL_MACHINE, nrptKeyPath+`\`+name)
 	}
 }
-
-// 旧版「DNS 锁定」防火墙规则的清理已整体移除：新版本不再创建任何防火墙
-// 规则；旧规则封的是旧架构下记录的 DNS 地址，新架构解析走隧道网卡，那些
-// 地址不会被查询，残留无副作用（PowerShell 依赖随之下线）。

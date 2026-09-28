@@ -36,8 +36,8 @@ func Up(cfg Config, logger *slog.Logger, force bool) error {
 
 	// 自定义链已存在时这条会报错，忽略即可
 	_ = iptables("-t", "nat", "-N", ChainName)
-	// 整链清空重铺：这条链完全归本项目管理，历史上装过 DNAT 规则，
-	// 换成转发器架构后一次性清掉旧机器上的残留。
+	// 整链清空重铺：这条链完全归本项目管理，升级机器上遗留的历史规则
+	// 也一并清掉。
 	_ = iptables("-t", "nat", "-F", ChainName)
 
 	for _, r := range Rules(cfg, wan) {
