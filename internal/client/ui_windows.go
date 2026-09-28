@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,15 +50,16 @@ type UI struct {
 	mw *walk.MainWindow
 	ni *walk.NotifyIcon
 
-	lblState   *walk.Label
-	lblIP      *walk.Label
-	lblTraffic *walk.Label
-	lblVersion *walk.Label
-	txtLog     *walk.TextEdit
-	btnPrimary *walk.PushButton
-	btnReconn  *walk.PushButton
-	btnUpdate  *walk.PushButton
-	btnHide    *walk.PushButton
+	lblState    *walk.Label
+	lblIP       *walk.Label
+	lblTraffic  *walk.Label
+	lblVersion  *walk.Label
+	txtLog      *walk.TextEdit
+	btnPrimary  *walk.PushButton
+	btnReconn   *walk.PushButton
+	btnPortTest *walk.PushButton
+	btnUpdate   *walk.PushButton
+	btnHide     *walk.PushButton
 
 	quitting      bool
 	trayHinted    bool
@@ -147,6 +149,7 @@ func (u *UI) build() error {
 				Children: []Widget{
 					PushButton{AssignTo: &u.btnPrimary, Text: "连接", MinSize: Size{Width: 100}, OnClicked: u.onPrimary},
 					PushButton{AssignTo: &u.btnReconn, Text: "重新连接", MinSize: Size{Width: 100}, OnClicked: u.onReconnect},
+					PushButton{AssignTo: &u.btnPortTest, Text: "Node端口测试", MinSize: Size{Width: 110}, OnClicked: u.onPortTest},
 					PushButton{AssignTo: &u.btnUpdate, Text: "立即更新", MinSize: Size{Width: 100}, OnClicked: u.onUpdate},
 					HSpacer{},
 					PushButton{AssignTo: &u.btnHide, Text: "隐藏", MinSize: Size{Width: 100}, OnClicked: u.onHide},
@@ -371,6 +374,8 @@ func (u *UI) refresh() {
 		state = "当前状态: 未配置连接码"
 	case busyOp == "disconnect":
 		state = "当前状态: 正在断开…"
+	case busyOp == "porttest":
+		state = "当前状态: 正在测试节点端口…"
 	case busyOp == "connect" || busyOp == "reconnect":
 		state = "当前状态: 正在连接…"
 	case !st.Running:
@@ -415,6 +420,9 @@ func (u *UI) refresh() {
 	case busyOp == "disconnect":
 		u.btnPrimary.SetText("断开中…")
 		u.btnPrimary.SetEnabled(false)
+	case busyOp == "porttest":
+		u.btnPrimary.SetText("断开连接")
+		u.btnPrimary.SetEnabled(false)
 	case busyOp == "connect" || busyOp == "reconnect":
 		u.btnPrimary.SetText("连接中…")
 		u.btnPrimary.SetEnabled(false)
@@ -429,6 +437,13 @@ func (u *UI) refresh() {
 		u.btnPrimary.SetEnabled(true)
 	}
 	u.btnReconn.SetEnabled(configured && st.Running && busyOp == "")
+	if busyOp == "porttest" {
+		u.btnPortTest.SetText("测试中…")
+		u.btnPortTest.SetEnabled(false)
+	} else {
+		u.btnPortTest.SetText("Node端口测试")
+		u.btnPortTest.SetEnabled(configured && st.Running)
+	}
 
 	if u.ni != nil {
 		// 托盘颜色 = 隧道通没通：已连接鲜绿，其余（未连/连接中/未配置）黑灰。
@@ -525,6 +540,44 @@ func (u *UI) onReconnect() {
 func (u *UI) onHide() {
 	u.mw.Hide()
 	u.hintTray()
+}
+
+// onPortTest 借 Pi 官方 checker 容器把 10 个转发端口完整测一遍。
+// 隧道必须在线（测试要穿过云服转发），期间所有操作按钮锁死防重入。
+func (u *UI) onPortTest() {
+	if u.busyOp != "" {
+		return
+	}
+	st := u.app.Status()
+	if !st.Running {
+		u.app.Log().Warn("隧道未连接，先连接后再测试端口")
+		return
+	}
+	host, _, err := net.SplitHostPort(st.Server)
+	if err != nil {
+		host = st.Server
+	}
+	u.busyOp = "porttest"
+	u.refresh()
+	go func() {
+		log := u.app.Log()
+		results, err := RunPortTest(host, log)
+		u.mw.Synchronize(func() {
+			if err != nil {
+				log.Warn(fmt.Sprintf("节点端口测试未完成: %v", err))
+			} else {
+				ok := 0
+				for _, r := range results {
+					if r.OK {
+						ok++
+					}
+				}
+				log.Info(fmt.Sprintf("节点端口测试完成：%d 个端口中 %d 个通，节点已恢复运行", len(results), ok))
+			}
+			u.busyOp = ""
+			u.refresh()
+		})
+	}()
 }
 
 // hintTray 第一次收进托盘时说一声，之后不再打扰。
