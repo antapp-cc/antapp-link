@@ -99,6 +99,7 @@ func startSessionWatcher(ctx context.Context, snap Snapshot, cfg NetConfig,
 	}
 	w.unregs = append(w.unregs, cbi.Unregister)
 
+	logf("出口守护已启动")
 	go w.loop(ctx)
 	return w, nil
 }
