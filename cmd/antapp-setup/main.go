@@ -159,7 +159,7 @@ func runInstallUI(icon *walk.Icon, dirFlag string) int {
 
 	if err := (MainWindow{
 		AssignTo: &mw,
-		Title:    "安装 AntApp Link",
+		Title:    "安装 AntApp Link v" + setup.Version,
 		Icon:     icon,
 		Size:     Size{Width: 600, Height: 540},
 		MinSize:  Size{Width: 540, Height: 480},
