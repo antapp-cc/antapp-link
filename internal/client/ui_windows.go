@@ -25,10 +25,14 @@ import (
 //go:embed assets/antapp.ico
 var appIcon []byte
 
-// 灰色版图标：托盘在未连接时用它，连上换回彩色——用户扫一眼托盘就知道隧道通没通。
+// 托盘变色版：黑灰=未连接，鲜绿=已连接——用户扫一眼托盘就知道隧道通没通。
+// 由 tools/grayico 从 antapp.ico 生成，换 logo 后记得重新生成这两个文件。
 //
 //go:embed assets/antapp-gray.ico
 var appIconGray []byte
+
+//go:embed assets/antapp-green.ico
+var appIconGreen []byte
 
 // UI 是主窗口加托盘。托盘用 walk 自带的 NotifyIcon，跟主窗口共用同一个消息循环 ——
 // 换成独立的托盘库就得处理两个消息循环抢主线程的问题。
@@ -36,10 +40,11 @@ var appIconGray []byte
 // 窗口布局照用户已经在 Pi 节点机上用惯的那个 OpenVPN 客户端来：
 // 状态行 → 大日志区 → 分配 IP 与版本 → 三个按钮。
 type UI struct {
-	app      *App
-	logs     *LogBuffer
-	icon     *walk.Icon
-	iconGray *walk.Icon
+	app       *App
+	logs      *LogBuffer
+	icon      *walk.Icon
+	iconGray  *walk.Icon
+	iconGreen *walk.Icon
 
 	mw *walk.MainWindow
 	ni *walk.NotifyIcon
@@ -85,8 +90,16 @@ func RunUI(app *App, logs *LogBuffer, rootDir string) error {
 	if err != nil {
 		return fmt.Errorf("加载灰色图标 %s: %w", grayPath, err)
 	}
+	greenPath, err := ensureIconFile(rootDir, "antapp-green.ico", appIconGreen)
+	if err != nil {
+		return err
+	}
+	iconGreen, err := walk.NewIconFromFile(greenPath)
+	if err != nil {
+		return fmt.Errorf("加载绿色图标 %s: %w", greenPath, err)
+	}
 
-	u := &UI{app: app, logs: logs, icon: icon, iconGray: iconGray, done: make(chan struct{})}
+	u := &UI{app: app, logs: logs, icon: icon, iconGray: iconGray, iconGreen: iconGreen, done: make(chan struct{})}
 	if err := u.build(); err != nil {
 		return err
 	}
@@ -249,10 +262,10 @@ func (u *UI) buildTray() error {
 		return fmt.Errorf("创建托盘图标: %w", err)
 	}
 	u.ni = ni
-	// 初始就用对状态的图标，避免启动瞬间彩色→灰色闪一下；之后由 refresh() 在切换时换。
+	// 初始就用对状态的图标，避免启动瞬间闪一下；之后由 refresh() 在切换时换。
 	u.trayConnected = u.app.Status().Online
 	if u.trayConnected {
-		err = ni.SetIcon(u.icon)
+		err = ni.SetIcon(u.iconGreen)
 	} else {
 		err = ni.SetIcon(u.iconGray)
 	}
@@ -418,13 +431,13 @@ func (u *UI) refresh() {
 	u.btnReconn.SetEnabled(configured && st.Running && busyOp == "")
 
 	if u.ni != nil {
-		// 托盘颜色 = 隧道通没通：已连接彩色，其余（未连/连接中/未配置）灰色。
+		// 托盘颜色 = 隧道通没通：已连接鲜绿，其余（未连/连接中/未配置）黑灰。
 		// 只在状态切换时 SetIcon，每秒重设会让图标闪烁。
 		if color := busyOp == "" && st.Online; color != u.trayConnected {
 			u.trayConnected = color
 			icon := u.iconGray
 			if color {
-				icon = u.icon
+				icon = u.iconGreen
 			}
 			_ = u.ni.SetIcon(icon)
 		}
