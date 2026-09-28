@@ -25,6 +25,17 @@
   </application>
 
   <!--
+    声明支持的 Windows 版本：让系统按现代模式对待本程序（版本探测不再拿到假版本号）。
+    Win10 的 GUID 同时覆盖 Win11 和 Server 2016/2019/2022/2025。
+  -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+
+  <!--
     创建虚拟网卡、改路由表、写系统 DNS 都要管理员权限。
     在这里声明，UAC 会在双击时就弹出来；否则要等用户点了「连接」才失败。
   -->
