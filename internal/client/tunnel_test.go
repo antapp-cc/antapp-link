@@ -2,8 +2,11 @@ package client
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,5 +131,21 @@ func TestAckParsesServerHandshake(t *testing.T) {
 	}
 	if len(ack.DNS) != 1 || ack.DNS[0] != "8.8.8.8" {
 		t.Errorf("DNS = %v", ack.DNS)
+	}
+}
+
+// 会话结束的原因归类：EOF（服务端干净关闭）降为信息级并写明常见原因，
+// 网络类异常保持警告级。这行日志是排障的第一入口，级别和原因不能含糊。
+func TestSessionEndInfo(t *testing.T) {
+	lvl, reason := sessionEndInfo(fmt.Errorf("读隧道: EOF"))
+	if lvl != slog.LevelInfo || reason == "" {
+		t.Errorf("EOF 应为信息级且带原因，实际 lvl=%v reason=%q", lvl, reason)
+	}
+	lvl, reason = sessionEndInfo(fmt.Errorf("连接 1.2.3.4: i/o timeout"))
+	if lvl != slog.LevelWarn || !strings.Contains(reason, "超时") {
+		t.Errorf("超时应为警告级且带原因，实际 lvl=%v reason=%q", lvl, reason)
+	}
+	if _, reason := sessionEndInfo(fmt.Errorf("其它未知错误")); reason != "" {
+		t.Errorf("未知错误不该编造原因，实际 %q", reason)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,6 +101,27 @@ func (t *Tunnel) Kick() {
 	}
 }
 
+// sessionEndInfo 把会话结束的错误归类成日志级别和人话原因，
+// 让「会话结束」这行日志一眼能看出断线是什么造成的。
+func sessionEndInfo(err error) (slog.Level, string) {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "EOF"):
+		// 对端干净关闭：典型为云服重启或部署新版本
+		return slog.LevelInfo, "服务端关闭了连接（常见原因：云服重启或部署新版本）"
+	case strings.Contains(msg, "unreachable"):
+		return slog.LevelWarn, "网络不可达（本机网络变动或出口中断）"
+	case strings.Contains(msg, "refused"):
+		return slog.LevelWarn, "连接被拒绝（服务端未运行或端口未放行）"
+	case strings.Contains(msg, "timeout"):
+		return slog.LevelWarn, "网络超时"
+	case strings.Contains(msg, "reset"):
+		return slog.LevelWarn, "连接被重置"
+	default:
+		return slog.LevelWarn, ""
+	}
+}
+
 // Run 保持隧道可用，断线自动重连，直到 ctx 结束。
 //
 // 网卡与路由在整个过程中保持不动：隧道断掉时靠「原默认路由仍在、只是 metric 更高」
@@ -119,7 +141,12 @@ func (t *Tunnel) Run(ctx context.Context) error {
 			attempt = 0
 		}
 		if err != nil {
-			t.log.Warn("会话结束", "err", err, "retry_in", Backoff(attempt))
+			lvl, reason := sessionEndInfo(err)
+			args := []any{"err", err, "retry_in", Backoff(attempt)}
+			if reason != "" {
+				args = append(args, "reason", reason)
+			}
+			t.log.Log(ctx, lvl, "会话结束", args...)
 		}
 		select {
 		case <-ctx.Done():
