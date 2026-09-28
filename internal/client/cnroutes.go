@@ -2,12 +2,15 @@ package client
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -26,10 +29,12 @@ import (
 var embeddedRoutesRaw string
 
 const (
-	routeTableFileName     = "cn_routes.txt"
-	routeTableMaxLines     = 50000 // 网段表行数上限（防喂垃圾）
-	routeTableMinLines     = 100   // 合法表的下限（社区 CN 列表有数千条）
-	routeTableMaxBytes     = 4 << 20
+	routeTableFileName   = "cnr.cache"     // 混淆缓存（二进制，只应由本程序读写）
+	legacyRouteTableName = "cn_routes.txt" // 旧版明文表（仅历史机器上可能存在）
+	routeTableMaxLines   = 50000           // 网段表行数上限（防喂垃圾）
+	routeTableMinLines   = 100             // 合法表的下限（社区 CN 列表有数千条）
+	routeTableMaxBytes   = 4 << 20
+
 	routeTableFetchTimeout = 60 * time.Second
 
 	routeTableSourcePrimary   = "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/cn.txt"
@@ -80,16 +85,23 @@ func initActiveRouteTableLocked() {
 	if routeTablePath == "" {
 		return
 	}
-	f, err := os.Open(routeTablePath)
-	if err != nil {
-		return // 文件不存在：用内置表
+	// 现行表：混淆缓存
+	if data, err := os.ReadFile(routeTablePath); err == nil {
+		if text, err := openSealedCache(data); err == nil {
+			if table := parseRouteTableLines(strings.NewReader(string(text))); len(table) >= routeTableMinLines {
+				activeRouteTable = table
+				return
+			}
+		}
 	}
-	defer f.Close()
-	table := parseRouteTableLines(f)
-	if len(table) < routeTableMinLines {
-		return // 内容不合法：用内置表
+	// 缓存缺失/损坏：尝试旧版明文表（仅升级机器上可能存在，一次性迁移）
+	legacyPath := filepath.Join(filepath.Dir(routeTablePath), legacyRouteTableName)
+	if data, err := os.ReadFile(legacyPath); err == nil {
+		if table := parseRouteTableLines(strings.NewReader(string(data))); len(table) >= routeTableMinLines {
+			activeRouteTable = table
+			return
+		}
 	}
-	activeRouteTable = table
 }
 
 // parseRouteTableLines 解析网段表：每行一个 IPv4 CIDR，跳过注释与空行，
@@ -157,6 +169,8 @@ func fetchAndStoreRouteTable() bool {
 		activeRouteTable = table
 		routeTableMu.Unlock()
 		logf("分流网段表已更新：%d 条", len(table))
+		// 旧版明文表已由混淆缓存取代，顺手清掉（仅升级机器上有）
+		_ = os.Remove(filepath.Join(filepath.Dir(path), legacyRouteTableName))
 		return true
 	}
 	if lastErr != nil {
@@ -186,23 +200,64 @@ func downloadRouteTable(ctx context.Context, src string) ([]string, error) {
 	return table, nil
 }
 
-// storeRouteTableFile 原子落盘（tmp + rename），格式与内置表一致。
+// storeRouteTableFile 序列化、压缩加扰后原子落盘（tmp + rename）。
 func storeRouteTableFile(path string, table []string) error {
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
+	var text bytes.Buffer
 	for _, line := range table {
-		if _, err := f.WriteString(line + "\n"); err != nil {
-			f.Close()
-			os.Remove(tmp)
-			return err
-		}
+		text.WriteString(line)
+		text.WriteByte('\n')
 	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+	sealed := sealCache(text.Bytes())
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, sealed, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// loadSealedCacheFile 读取并解出混淆缓存里的网段表文本。
+func loadSealedCacheFile(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return openSealedCache(data)
+}
+
+// cacheObfuscateKey 是缓存混淆密钥：数据本身是公开的 APNIC 分配表，
+// 压缩加扰只为不让人随手打开可读，不构成加密。
+var cacheObfuscateKey = []byte("AntAppLink")
+
+const cacheFormatVer byte = 0x01
+
+// sealCache 序列化并混淆：格式版本字节 + gzip 压缩 + 逐字节异或。
+// 异或只防「随手打开」，不防逆向 —— 数据本身是公开的。
+func sealCache(text []byte) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(cacheFormatVer)
+	gz := gzip.NewWriter(&buf)
+	_, _ = gz.Write(text)
+	_ = gz.Close()
+	out := buf.Bytes()
+	for i := 1; i < len(out); i++ {
+		out[i] ^= cacheObfuscateKey[i%len(cacheObfuscateKey)]
+	}
+	return out
+}
+
+// openSealedCache 还原 sealCache 的输出。
+func openSealedCache(sealed []byte) ([]byte, error) {
+	if len(sealed) < 2 || sealed[0] != cacheFormatVer {
+		return nil, fmt.Errorf("cache: 格式不符")
+	}
+	body := make([]byte, len(sealed)-1)
+	for i := 1; i < len(sealed); i++ {
+		body[i-1] = sealed[i] ^ cacheObfuscateKey[(i-1)%len(cacheObfuscateKey)]
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer gz.Close()
+	return io.ReadAll(gz)
 }
