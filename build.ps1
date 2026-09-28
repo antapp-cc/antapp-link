@@ -55,6 +55,34 @@ Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-setup.exe' -Pkg './cmd
 # 合规要求：Wintun 的预编译二进制许可要求随包附上原文
 Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') $distDir -Force
 
+# 代码签名：蚁巢证书（装在本机证书库），安装器和客户端都签，时间戳保证证书过期后签名仍有效
+$thumbprint = '58075F4CBD7592BB7A79B6B3F210A2AE551213D8'
+$timestampUrl = 'http://timestamp.digicert.com'
+$signtool = @(
+    (Get-Command signtool -ErrorAction SilentlyContinue).Source,
+    "${env:ProgramFiles(x86)}\Windows Kits\10\App Certification Kit\signtool.exe"
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if (-not $signtool) {
+    $kitDir = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+    if (Test-Path $kitDir) {
+        $signtool = Get-ChildItem $kitDir -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'x64' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+    }
+}
+if ($signtool) {
+    Write-Host '== 代码签名 ==' -ForegroundColor Cyan
+    foreach ($exe in @('antapp-setup.exe', 'antapp-link.exe')) {
+        $path = Join-Path $distDir $exe
+        & $signtool sign /v /fd SHA256 /sha1 $thumbprint /tr $timestampUrl /td SHA256 $path | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "$exe 签名失败" }
+        Write-Host "  $exe 已签名（CN=Antapp）"
+    }
+} else {
+    Write-Warning '没找到 signtool，本次构建不签名'
+}
+
 # 打成安装包：setup.exe 会去同目录找 antapp-link.exe
 $pkgDir = Join-Path $distDir 'AntAppLink-Setup'
 if (Test-Path $pkgDir) { Remove-Item $pkgDir -Recurse -Force }
