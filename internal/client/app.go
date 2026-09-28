@@ -24,15 +24,17 @@ type App struct {
 	log       *slog.Logger
 	noNetCfg  bool
 
-	mu         sync.Mutex
-	snapshot   Snapshot
-	cfg        NetConfig
-	dev        Device
-	tunnel     *Tunnel
-	cancel     context.CancelFunc
-	running    bool
-	connecting bool
-	lastError  string
+	mu            sync.Mutex
+	snapshot      Snapshot
+	cfg           NetConfig
+	dev           Device
+	tunnel        *Tunnel
+	watcher       *sessionWatcher
+	cancel        context.CancelFunc
+	running       bool
+	connecting    bool
+	disconnecting bool
+	lastError     string
 
 	checker *update.Checker
 	pending *update.Manifest
@@ -116,6 +118,9 @@ func (a *App) HealIfNeeded() error {
 	}
 
 	a.log.Info("发现上次残留的网络配置，先还原", "captured_at", snap.CapturedAt)
+	// 旧版「DNS 锁定」的防火墙规则只有升级上来的机器才有，扫尾一次即可，
+	// 不进常规连接/断开路径。
+	cleanupLegacyFirewallRules()
 	if err := snap.Restore(BuildNetConfig(inv)); err != nil {
 		return fmt.Errorf("还原上次的网络配置失败: %w", err)
 	}
@@ -133,12 +138,15 @@ func (a *App) HealIfNeeded() error {
 func (a *App) Connect() error {
 	a.mu.Lock()
 	switch {
-	case a.running:
+	case a.disconnecting:
 		a.mu.Unlock()
-		return nil
+		return errors.New("正在断开，请稍候")
 	case a.connecting:
 		a.mu.Unlock()
 		return errors.New("正在连接，请稍候")
+	case a.running:
+		a.mu.Unlock()
+		return nil
 	case !a.configuredLocked():
 		a.mu.Unlock()
 		return errors.New("还没有连接码，请先在界面上点「导入连接码」")
@@ -232,11 +240,32 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 	a.log.Info("已连接", "server", inv.Server, "tunnel_ip", cfg.TunnelIP)
 
 	// 只有真接管了网络才自检：联调模式没动用户网络，出不去也不该由我们背
-	if noNetCfg {
+	if noNetCfg || snap == nil {
 		return nil
 	}
+
+	// 网络出口守护：换 Wi-Fi/插网线/睡眠唤醒时自动迁移绕行路由、DNS、
+	// 国内分流，并唤醒隧道立刻重连。失败不阻断连接，只是降级为旧行为
+	// （出口变化后需手动断开重连）。
+	w, err := startSessionWatcher(ctx, *snap, cfg, a.updateSnapshot, tunnel.Kick)
+	if err != nil {
+		a.log.Warn("网络变化监听启动失败", "err", err)
+	} else {
+		a.mu.Lock()
+		a.watcher = w
+		a.mu.Unlock()
+	}
+
 	go a.watchHealth(ctx)
 	return nil
+}
+
+// updateSnapshot 供 watcher 在迁移网络出口时更新接管现场，
+// 保证断开还原时用的是最新状态。
+func (a *App) updateSnapshot(s Snapshot) {
+	a.mu.Lock()
+	a.snapshot = s
+	a.mu.Unlock()
 }
 
 // watchHealth 在接管网络后确认「真的能出去」，失败就自动回退。
@@ -352,59 +381,86 @@ func tunnelPortOf(inv pki.Invite) string {
 
 // Disconnect 停隧道并把网络还原回去。幂等：没连上时直接返回。
 //
-// 跟 Connect 同样的道理：先把内部状态清干净（界面立刻就能显示「未连接」），
-// 再在锁外慢慢还原网络。整段持锁的话，还原路由那几秒界面是死的。
+// 跟 Connect 互斥：连接进行中点断开会被拒绝 —— 旧版这里存在竞态，断开的还原
+// 和新连接并发跑，批量删路由可能把刚加的新路由删掉。
+//
+// 先把内部状态清干净（界面立刻就能显示「未连接」），再在锁外慢慢还原。
+// 整段持锁的话，还原路由那几秒界面是死的。
 func (a *App) Disconnect() error {
 	a.mu.Lock()
-	if !a.running && a.dev == nil {
+	switch {
+	case a.connecting:
+		a.mu.Unlock()
+		return errors.New("正在连接，请稍候")
+	case a.disconnecting:
+		a.mu.Unlock()
+		return nil // 已经在断开了，别重复跑
+	case !a.running && a.dev == nil:
 		a.mu.Unlock()
 		return nil
 	}
-	cancel, dev := a.cancel, a.dev
-	snap, cfg, noNetCfg := a.snapshot, a.cfg, a.noNetCfg
-
-	a.cancel, a.dev, a.tunnel = nil, nil, nil
-	a.running, a.snapshot, a.cfg = false, Snapshot{}, NetConfig{}
+	a.disconnecting = true
+	cancel, dev, watcher := a.cancel, a.dev, a.watcher
+	a.cancel, a.dev, a.tunnel, a.watcher = nil, nil, nil, nil
+	a.running = false
 	a.mu.Unlock()
 
-	if cancel != nil {
-		cancel()
+	// 先停 watcher：它可能正在把快照迁移到新出口，停完再取才是终态。
+	if watcher != nil {
+		watcher.Stop()
 	}
-	if dev != nil {
-		// 给搬运 goroutine 一点时间退出，免得一边还原网络一边往里写包
-		time.Sleep(150 * time.Millisecond)
-		_ = dev.Close()
-	}
+	a.mu.Lock()
+	snap, cfg, noNetCfg := a.snapshot, a.cfg, a.noNetCfg
+	a.snapshot, a.cfg = Snapshot{}, NetConfig{}
+	a.mu.Unlock()
 
-	// 联调模式本来就没动过路由和 DNS，没什么可还原的
-	if noNetCfg {
+	restoreErr := func() error {
+		if cancel != nil {
+			cancel()
+		}
+		if dev != nil {
+			// 给搬运 goroutine 一点时间退出，免得一边还原网络一边往里写包
+			time.Sleep(150 * time.Millisecond)
+			_ = dev.Close()
+		}
+
+		// 联调模式本来就没动过路由和 DNS，没什么可还原的
+		if noNetCfg {
+			a.log.Info("已断开")
+			return nil
+		}
+
+		if err := snap.Restore(cfg); err != nil {
+			// 还原失败就留着 state.json，让下次启动继续尝试自愈
+			return fmt.Errorf("还原网络配置失败: %w", err)
+		}
+		if err := RemoveSnapshot(a.statePath); err != nil {
+			a.log.Warn("删除状态文件失败", "err", err)
+		}
 		a.log.Info("已断开")
 		return nil
-	}
+	}()
 
-	if err := snap.Restore(cfg); err != nil {
-		// 还原失败就留着 state.json，让下次启动继续尝试自愈
-		a.mu.Lock()
-		a.lastError = err.Error()
-		a.mu.Unlock()
-		return fmt.Errorf("还原网络配置失败: %w", err)
+	a.mu.Lock()
+	a.disconnecting = false
+	if restoreErr != nil {
+		a.lastError = restoreErr.Error()
 	}
-	if err := RemoveSnapshot(a.statePath); err != nil {
-		a.log.Warn("删除状态文件失败", "err", err)
-	}
-	a.log.Info("已断开")
-	return nil
+	a.mu.Unlock()
+	return restoreErr
 }
 
 type AppStatus struct {
-	Running   bool
-	Online    bool
-	TunnelIP  string
-	Server    string
-	RTT       time.Duration
-	RxBytes   uint64
-	TxBytes   uint64
-	LastError string
+	Running       bool
+	Online        bool
+	Connecting    bool
+	Disconnecting bool
+	TunnelIP      string
+	Server        string
+	RTT           time.Duration
+	RxBytes       uint64
+	TxBytes       uint64
+	LastError     string
 }
 
 func (a *App) Status() AppStatus {
@@ -412,13 +468,15 @@ func (a *App) Status() AppStatus {
 	defer a.mu.Unlock()
 
 	st := AppStatus{
-		Running:   a.running,
-		Server:    a.inv.Server,
-		TunnelIP:  a.cfg.TunnelIP,
-		LastError: a.lastError,
+		Running:       a.running,
+		Online:        a.tunnel != nil && a.tunnel.Stats.Connected.Load(),
+		Connecting:    a.connecting,
+		Disconnecting: a.disconnecting,
+		Server:        a.inv.Server,
+		TunnelIP:      a.cfg.TunnelIP,
+		LastError:     a.lastError,
 	}
 	if a.tunnel != nil {
-		st.Online = a.tunnel.Stats.Connected.Load()
 		st.RTT = a.tunnel.Stats.RTT()
 		st.RxBytes = a.tunnel.Stats.RxBytes.Load()
 		st.TxBytes = a.tunnel.Stats.TxBytes.Load()

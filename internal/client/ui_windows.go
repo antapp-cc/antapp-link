@@ -53,6 +53,11 @@ type UI struct {
 	logSeq     uint64
 	done       chan struct{}
 	pending    *update.Manifest
+
+	// busyOp 非空表示一次连接/断开在跑。只允许 UI 线程读写：
+	// 点按钮立刻置上并渲染「连接中/断开中」，操作结束在 Synchronize 里清掉。
+	// 值为 "connect" / "disconnect" / "reconnect"。
+	busyOp string
 }
 
 // RunUI 阻塞运行图形界面，直到用户从托盘菜单退出。
@@ -315,10 +320,24 @@ func (u *UI) refresh() {
 	st := u.app.Status()
 	configured := u.app.Configured()
 
+	// 操作进行中的渲染优先：按钮和状态行立刻给出过渡态，
+	// 绝不能让用户对着一个没变化的界面猜程序死活。
+	busyOp := u.busyOp
+	switch {
+	case busyOp == "" && st.Connecting:
+		busyOp = "connect"
+	case busyOp == "" && st.Disconnecting:
+		busyOp = "disconnect"
+	}
+
 	var state string
 	switch {
 	case !configured:
 		state = "当前状态: 未配置连接码"
+	case busyOp == "disconnect":
+		state = "当前状态: 正在断开…"
+	case busyOp == "connect" || busyOp == "reconnect":
+		state = "当前状态: 正在连接…"
 	case !st.Running:
 		state = "当前状态: 未连接"
 	case st.Online:
@@ -326,7 +345,7 @@ func (u *UI) refresh() {
 	default:
 		state = "当前状态: 连接中…"
 	}
-	if configured && st.Online {
+	if configured && st.Online && busyOp == "" {
 		state += fmt.Sprintf("（延迟 %d ms）", st.RTT.Milliseconds())
 	}
 	if u.pending != nil {
@@ -335,13 +354,16 @@ func (u *UI) refresh() {
 	u.lblState.SetText(state)
 
 	// 上次的错误比「服务端 x」更有用，就摆在状态行下面
-	if configured && !st.Online && st.LastError != "" {
+	switch {
+	case busyOp != "":
+		u.lblIP.SetText("正在交换网络配置，请稍候…")
+	case configured && !st.Online && st.LastError != "":
 		u.lblIP.SetText("上次错误: " + truncateRunes(st.LastError, 46))
-	} else if st.Online {
+	case st.Online:
 		u.lblIP.SetText(fmt.Sprintf("分配 IP: %s", st.TunnelIP))
-	} else if configured {
+	case configured:
 		u.lblIP.SetText("服务端: " + st.Server)
-	} else {
+	default:
 		u.lblIP.SetText("分配 IP: —")
 	}
 
@@ -353,8 +375,14 @@ func (u *UI) refresh() {
 		u.lblTraffic.SetText("发送 — / 接收 —")
 	}
 
-	// 按钮文字跟着状态走：没连接码时主按钮就是导入入口
+	// 按钮文字跟着状态走；操作进行中一律禁用，防重入。
 	switch {
+	case busyOp == "disconnect":
+		u.btnPrimary.SetText("断开中…")
+		u.btnPrimary.SetEnabled(false)
+	case busyOp == "connect" || busyOp == "reconnect":
+		u.btnPrimary.SetText("连接中…")
+		u.btnPrimary.SetEnabled(false)
 	case !configured:
 		u.btnPrimary.SetText("导入连接码")
 		u.btnPrimary.SetEnabled(true)
@@ -365,10 +393,14 @@ func (u *UI) refresh() {
 		u.btnPrimary.SetText("连接")
 		u.btnPrimary.SetEnabled(true)
 	}
-	u.btnReconn.SetEnabled(configured && st.Running)
+	u.btnReconn.SetEnabled(configured && st.Running && busyOp == "")
 
 	if u.ni != nil {
 		switch {
+		case busyOp == "disconnect":
+			u.ni.SetToolTip("AntApp Link · 正在断开…")
+		case busyOp != "" || (st.Running && !st.Online):
+			u.ni.SetToolTip("AntApp Link · 连接中…")
 		case !configured:
 			u.ni.SetToolTip("AntApp Link · 未配置连接码")
 		case !st.Running:
@@ -400,26 +432,48 @@ func (u *UI) refresh() {
 }
 
 // Connect/Disconnect 会做网络操作（探测、改路由、跑 PowerShell），不能卡住界面线程。
+// busyOp 让按钮在点击的一瞬间就给出过渡态并禁用 —— 旧版这里十几秒没有任何变化，
+// 用户以为没点上，反复点击还会跟进行中的网络还原撞车。
 func (u *UI) onPrimary() {
+	if u.busyOp != "" {
+		return
+	}
 	if !u.app.Configured() {
 		u.onImport()
 		return
 	}
+	op := "connect"
+	if u.app.Status().Running {
+		op = "disconnect"
+	}
+	u.busyOp = op
+	u.refresh() // 立刻渲染过渡态，不等下一秒的定时刷新
 	go func() {
-		if u.app.Status().Running {
+		if op == "disconnect" {
 			_ = u.app.Disconnect()
 		} else {
 			_ = u.app.Connect()
 		}
-		u.mw.Synchronize(u.refresh)
+		u.mw.Synchronize(func() {
+			u.busyOp = ""
+			u.refresh()
+		})
 	}()
 }
 
 func (u *UI) onReconnect() {
+	if u.busyOp != "" {
+		return
+	}
+	u.busyOp = "reconnect"
+	u.refresh()
 	go func() {
 		_ = u.app.Disconnect()
 		_ = u.app.Connect()
-		u.mw.Synchronize(u.refresh)
+		u.mw.Synchronize(func() {
+			u.busyOp = ""
+			u.refresh()
+		})
 	}()
 }
 

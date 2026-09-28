@@ -79,13 +79,25 @@ type Tunnel struct {
 	dev   Device
 	log   *slog.Logger
 	Stats Stats
+
+	// wake 在网络出口迁移时被 watcher 触发：把重连从「最长 30s 退避」变成
+	// 「网络一恢复立刻试」。带缓冲，连续多次通知合并成一次。
+	wake chan struct{}
 }
 
 func NewTunnel(inv pki.Invite, dev Device, logger *slog.Logger) *Tunnel {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Tunnel{inv: inv, dev: dev, log: logger}
+	return &Tunnel{inv: inv, dev: dev, log: logger, wake: make(chan struct{}, 1)}
+}
+
+// Kick 唤醒重连循环。非阻塞：正在连接时通知被丢弃，无害。
+func (t *Tunnel) Kick() {
+	select {
+	case t.wake <- struct{}{}:
+	default:
+	}
 }
 
 // Run 保持隧道可用，断线自动重连，直到 ctx 结束。
@@ -112,6 +124,8 @@ func (t *Tunnel) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-t.wake:
+			// 网络出口刚迁移完（watcher 通知），立刻重试而不是干等退避计时
 		case <-time.After(Backoff(attempt)):
 		}
 		if attempt < 10 {

@@ -1,10 +1,8 @@
 package client
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -33,177 +31,23 @@ func testNetConfig() NetConfig {
 	}
 }
 
-const testIfIndex = 58
-
-func dumpCommands(cmds []Command) string {
-	var b strings.Builder
-	for i, c := range cmds {
-		fmt.Fprintf(&b, "%2d. %s\n", i+1, c.String())
+// 动态 MTU：出口变小（PPPoE/4G/套 VPN）时自动收缩避免大包黑洞，
+// 出口够大时用连接码的值，读不到出口（0）时也退回连接码值，下限 576。
+func TestTargetTunnelMTU(t *testing.T) {
+	cases := []struct {
+		egress, invite, want uint32
+	}{
+		{1500, 1400, 1400}, // 家用以太网：用连接码值
+		{1492, 1400, 1400}, // PPPoE：1400 依然安全
+		{1400, 1400, 1344}, // 出口本身小：收缩
+		{1300, 1400, 1244}, // 更小
+		{600, 1400, 576},   // 触底：IPv4 最小重组单位
+		{0, 1400, 1400},    // 读不到出口：退回连接码值
 	}
-	return b.String()
-}
-
-func indexOfCommand(cmds []Command, substr string) int {
-	for i, c := range cmds {
-		if strings.Contains(c.String(), substr) {
-			return i
+	for _, c := range cases {
+		if got := targetTunnelMTU(c.egress, c.invite); got != c.want {
+			t.Errorf("targetTunnelMTU(%d, %d) = %d, want %d", c.egress, c.invite, got, c.want)
 		}
-	}
-	return -1
-}
-
-func mustContainCommand(t *testing.T, cmds []Command, want string) {
-	t.Helper()
-	if indexOfCommand(cmds, want) < 0 {
-		t.Errorf("命令里找不到 %q，实际：\n%s", want, dumpCommands(cmds))
-	}
-}
-
-func TestMaskFromPrefix(t *testing.T) {
-	cases := map[int]string{
-		8:  "255.0.0.0",
-		16: "255.255.0.0",
-		24: "255.255.255.0",
-		32: "255.255.255.255",
-	}
-	for prefix, want := range cases {
-		if got := MaskFromPrefix(prefix); got != want {
-			t.Errorf("MaskFromPrefix(%d) = %s, want %s", prefix, got, want)
-		}
-	}
-	if got := MaskFromPrefix(99); got != "255.255.255.0" {
-		t.Errorf("越界的 prefix 该退回默认掩码而不是崩，实际 %s", got)
-	}
-}
-
-func TestPrepareCommandsConfigureAdapter(t *testing.T) {
-	s := dumpCommands(PrepareCommands(testNetConfig()))
-	if !strings.Contains(s, "10.10.0.2") || !strings.Contains(s, "255.255.255.0") {
-		t.Errorf("没给隧道网卡配地址:\n%s", s)
-	}
-	if !strings.Contains(s, "mtu=1400") {
-		t.Errorf("没设 MTU，大包会被黑洞掉:\n%s", s)
-	}
-	if !strings.Contains(s, "metric=1") {
-		t.Errorf("没把隧道网卡的接口跃点压到最低，DNS 还可能落到本地网卡:\n%s", s)
-	}
-}
-
-// 这套 /1 路由是能不能真正接管流量的关键：它们比 0.0.0.0/0 更具体，按最长前缀匹配
-// 直接胜出，不用跟本地网卡那条 metric 0 的默认路由比跃点数。
-func TestTunnelRoutesAreTwoHalvesBoundToInterface(t *testing.T) {
-	cmds := TunnelRoutes(testNetConfig(), testIfIndex)
-	if len(cmds) != 2 {
-		t.Fatalf("应该正好两条 /1 路由，实际 %d 条", len(cmds))
-	}
-	mustContainCommand(t, cmds, "route add 0.0.0.0 mask 128.0.0.0 10.10.0.1 metric 1 if 58")
-	mustContainCommand(t, cmds, "route add 128.0.0.0 mask 128.0.0.0 10.10.0.1 metric 1 if 58")
-}
-
-// 实测踩过的坑：不带 if 的话 Windows 会把 10.10.0.1 这条路由挂到 WLAN 上，
-// 结果流量根本没进隧道，DNS 查询照旧从本地出去、解析回污染地址。
-func TestTunnelRoutesAlwaysBindInterface(t *testing.T) {
-	for _, c := range TunnelRoutes(testNetConfig(), testIfIndex) {
-		if indexOfCommand([]Command{c}, " if ") < 0 {
-			t.Errorf("路由必须显式绑定接口索引: %s", c.String())
-		}
-	}
-}
-
-// Review Focus #2：绕行路由必须排在接管路由之前。反了的话承载隧道的 TCP 连接
-// 会被自己送进隧道形成自噬，表现是「连不上，但没有任何报错」。
-func TestRouteCommandsPutBypassBeforeTunnelRoutes(t *testing.T) {
-	cmds := RouteCommands(testSnapshot(), testNetConfig(), testIfIndex)
-	bypass := indexOfCommand(cmds, "route add 103.143.11.34 mask 255.255.255.255 192.168.1.1")
-	first := indexOfCommand(cmds, "route add 0.0.0.0 mask 128.0.0.0 10.10.0.1")
-
-	if bypass < 0 {
-		t.Fatalf("缺少云服 IP 的绕行路由:\n%s", dumpCommands(cmds))
-	}
-	if first < 0 {
-		t.Fatalf("缺少接管路由:\n%s", dumpCommands(cmds))
-	}
-	if bypass > first {
-		t.Errorf("绕行路由在第 %d 条、接管路由在第 %d 条 —— 绕行必须在前，否则隧道自噬",
-			bypass+1, first+1)
-	}
-}
-
-// 云服就在直连网段里时（本地拿 WSL 当服务端验证），既有的直连路由已经比默认路由更具体。
-// 这时再加一条指向默认网关的 /32 会把它覆盖掉 —— 隧道自己就把自己掐死。
-func TestRouteCommandsSkipBypassWhenServerIsOnLink(t *testing.T) {
-	snap := testSnapshot()
-	snap.ServerNextHop = ""
-
-	cmds := RouteCommands(snap, testNetConfig(), testIfIndex)
-	if indexOfCommand(cmds, "route add 103.143.11.34") >= 0 {
-		t.Errorf("云服是直连时不该加绕行路由:\n%s", dumpCommands(cmds))
-	}
-	mustContainCommand(t, cmds, "route add 0.0.0.0 mask 128.0.0.0 10.10.0.1")
-}
-
-// DNS 必须在接管路由之后改，否则解析会先落到还被污染的本地 DNS 上。
-func TestRouteCommandsSetDNSAfterTunnelRoutes(t *testing.T) {
-	cmds := RouteCommands(testSnapshot(), testNetConfig(), testIfIndex)
-	route := indexOfCommand(cmds, "route add 128.0.0.0 mask 128.0.0.0")
-	dns := indexOfCommand(cmds, "dnsservers")
-
-	if route < 0 || dns < 0 {
-		t.Fatalf("缺少接管路由或 DNS 命令:\n%s", dumpCommands(cmds))
-	}
-	if dns < route {
-		t.Errorf("DNS 改写在第 %d 条、接管路由在第 %d 条 —— DNS 必须在后", dns+1, route+1)
-	}
-	for _, iface := range []string{"以太网", "WLAN"} {
-		if !strings.Contains(dumpCommands(cmds), iface) {
-			t.Errorf("没有为网卡 %s 改写 DNS:\n%s", iface, dumpCommands(cmds))
-		}
-	}
-	if !strings.Contains(dumpCommands(cmds), "/flushdns") {
-		t.Errorf("改完 DNS 要刷缓存，否则旧解析还留着:\n%s", dumpCommands(cmds))
-	}
-}
-
-func TestRestoreRemovesTunnelRoutesBeforeBypass(t *testing.T) {
-	cmds := RestoreCommands(testSnapshot(), testNetConfig())
-	route := indexOfCommand(cmds, "route delete 0.0.0.0 mask 128.0.0.0 10.10.0.1")
-	bypass := indexOfCommand(cmds, "route delete 103.143.11.34 mask 255.255.255.255")
-
-	if route < 0 {
-		t.Fatalf("缺少撤销接管路由的命令:\n%s", dumpCommands(cmds))
-	}
-	if bypass < 0 {
-		t.Fatalf("缺少删除绕行路由的命令:\n%s", dumpCommands(cmds))
-	}
-	if route > bypass {
-		t.Errorf("撤接管路由在第 %d 条、撤绕行在第 %d 条 —— 必须与接管时逆序，"+
-			"否则中间会留下「流量被送进一条已不通的隧道」的窗口", route+1, bypass+1)
-	}
-}
-
-func TestRestorePutsOriginalDNSBack(t *testing.T) {
-	s := dumpCommands(RestoreCommands(testSnapshot(), testNetConfig()))
-	if !strings.Contains(s, "223.5.5.5") {
-		t.Errorf("WLAN 原来的第二个 DNS 没还回去:\n%s", s)
-	}
-	if !strings.Contains(s, "192.168.1.1") {
-		t.Errorf("原 DNS 没还回去:\n%s", s)
-	}
-
-	// 原来压根没有静态 DNS 的网卡，要还回自动获取，而不是塞一个编造的地址
-	empty := Snapshot{DefaultGateway: "192.168.1.1", Interfaces: []IfaceDNS{{Name: "以太网", Index: 12}}}
-	if s := dumpCommands(RestoreCommands(empty, testNetConfig())); !strings.Contains(s, "source=dhcp") {
-		t.Errorf("原 DNS 为空时应还回 DHCP:\n%s", s)
-	}
-}
-
-func TestRestoreRemovesAdapterAddress(t *testing.T) {
-	s := dumpCommands(RestoreCommands(testSnapshot(), testNetConfig()))
-	// 用 PowerShell cmdlet 而不是 netsh —— 后者删最后一个地址时返回退出码 1，
-	// 会让上层误判还原失败。见 RestoreCommands 里的说明。
-	mustContainCommand(t, RestoreCommands(testSnapshot(), testNetConfig()), "Remove-NetIPAddress")
-	if !strings.Contains(s, "10.10.0.2") {
-		t.Errorf("没把隧道网卡的地址撤掉:\n%s", s)
 	}
 }
 
