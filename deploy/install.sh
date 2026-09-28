@@ -54,7 +54,18 @@ done
 [[ "$(id -u)" -eq 0 ]] || die "请用 root 运行"
 if [[ ! -f "$SRC_DIR/antapp-linkd" ]]; then
   log "目录下没有 antapp-linkd，从 GitHub Release 自动下载……"
-  curl -fsSL "https://github.com/antapp-cc/antapp-link/releases/latest/download/antapp-linkd" -o "$SRC_DIR/antapp-linkd" || die "下载失败：检查网络后重试，或手动上传 antapp-linkd 到同目录"
+  url="https://github.com/antapp-cc/antapp-link/releases/latest/download/antapp-linkd"
+  if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+    log "没有 wget 也没有 curl，先装 wget"
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wget
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO "$SRC_DIR/antapp-linkd" "$url" || die "下载失败：检查网络后重试，或手动上传 antapp-linkd 到同目录"
+  else
+    curl -fsSL "$url" -o "$SRC_DIR/antapp-linkd" || die "下载失败：检查网络后重试，或手动上传 antapp-linkd 到同目录"
+  fi
+  [[ "$(head -c 4 "$SRC_DIR/antapp-linkd")" == $'\x7fELF' ]] || die "下载到的不是有效二进制（网络或 CDN 异常），请手动上传 antapp-linkd 到同目录"
   chmod +x "$SRC_DIR/antapp-linkd"
 fi
 
