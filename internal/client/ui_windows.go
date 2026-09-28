@@ -25,15 +25,21 @@ import (
 //go:embed assets/antapp.ico
 var appIcon []byte
 
+// 灰色版图标：托盘在未连接时用它，连上换回彩色——用户扫一眼托盘就知道隧道通没通。
+//
+//go:embed assets/antapp-gray.ico
+var appIconGray []byte
+
 // UI 是主窗口加托盘。托盘用 walk 自带的 NotifyIcon，跟主窗口共用同一个消息循环 ——
 // 换成独立的托盘库就得处理两个消息循环抢主线程的问题。
 //
 // 窗口布局照用户已经在 Pi 节点机上用惯的那个 OpenVPN 客户端来：
 // 状态行 → 大日志区 → 分配 IP 与版本 → 三个按钮。
 type UI struct {
-	app  *App
-	logs *LogBuffer
-	icon *walk.Icon
+	app      *App
+	logs     *LogBuffer
+	icon     *walk.Icon
+	iconGray *walk.Icon
 
 	mw *walk.MainWindow
 	ni *walk.NotifyIcon
@@ -48,11 +54,12 @@ type UI struct {
 	btnUpdate  *walk.PushButton
 	btnHide    *walk.PushButton
 
-	quitting   bool
-	trayHinted bool
-	logSeq     uint64
-	done       chan struct{}
-	pending    *update.Manifest
+	quitting      bool
+	trayHinted    bool
+	trayConnected bool
+	logSeq        uint64
+	done          chan struct{}
+	pending       *update.Manifest
 
 	// busyOp 非空表示一次连接/断开在跑。只允许 UI 线程读写：
 	// 点按钮立刻置上并渲染「连接中/断开中」，操作结束在 Synchronize 里清掉。
@@ -62,7 +69,7 @@ type UI struct {
 
 // RunUI 阻塞运行图形界面，直到用户从托盘菜单退出。
 func RunUI(app *App, logs *LogBuffer, rootDir string) error {
-	iconPath, err := ensureIconFile(rootDir)
+	iconPath, err := ensureIconFile(rootDir, "antapp.ico", appIcon)
 	if err != nil {
 		return err
 	}
@@ -70,8 +77,16 @@ func RunUI(app *App, logs *LogBuffer, rootDir string) error {
 	if err != nil {
 		return fmt.Errorf("加载图标 %s: %w", iconPath, err)
 	}
+	grayPath, err := ensureIconFile(rootDir, "antapp-gray.ico", appIconGray)
+	if err != nil {
+		return err
+	}
+	iconGray, err := walk.NewIconFromFile(grayPath)
+	if err != nil {
+		return fmt.Errorf("加载灰色图标 %s: %w", grayPath, err)
+	}
 
-	u := &UI{app: app, logs: logs, icon: icon, done: make(chan struct{})}
+	u := &UI{app: app, logs: logs, icon: icon, iconGray: iconGray, done: make(chan struct{})}
 	if err := u.build(); err != nil {
 		return err
 	}
@@ -234,7 +249,14 @@ func (u *UI) buildTray() error {
 		return fmt.Errorf("创建托盘图标: %w", err)
 	}
 	u.ni = ni
-	if err := ni.SetIcon(u.icon); err != nil {
+	// 初始就用对状态的图标，避免启动瞬间彩色→灰色闪一下；之后由 refresh() 在切换时换。
+	u.trayConnected = u.app.Status().Online
+	if u.trayConnected {
+		err = ni.SetIcon(u.icon)
+	} else {
+		err = ni.SetIcon(u.iconGray)
+	}
+	if err != nil {
 		return err
 	}
 
@@ -396,6 +418,16 @@ func (u *UI) refresh() {
 	u.btnReconn.SetEnabled(configured && st.Running && busyOp == "")
 
 	if u.ni != nil {
+		// 托盘颜色 = 隧道通没通：已连接彩色，其余（未连/连接中/未配置）灰色。
+		// 只在状态切换时 SetIcon，每秒重设会让图标闪烁。
+		if color := busyOp == "" && st.Online; color != u.trayConnected {
+			u.trayConnected = color
+			icon := u.iconGray
+			if color {
+				icon = u.icon
+			}
+			_ = u.ni.SetIcon(icon)
+		}
 		switch {
 		case busyOp == "disconnect":
 			u.ni.SetToolTip("AntApp Link · 正在断开…")
@@ -772,12 +804,12 @@ func truncateRunes(s string, n int) string {
 
 // ensureIconFile 把内嵌的图标释放出来，供 walk 按路径加载。
 // 它是从 exe 提取的缓存，放运行时数据目录，不跟配置混在一起。
-func ensureIconFile(root string) (string, error) {
-	if len(appIcon) == 0 {
+func ensureIconFile(root, name string, data []byte) (string, error) {
+	if len(data) == 0 {
 		return "", errors.New("没有内嵌图标数据")
 	}
-	path := filepath.Join(RuntimeDir(root), "antapp.ico")
-	want := sha256.Sum256(appIcon)
+	path := filepath.Join(RuntimeDir(root), name)
+	want := sha256.Sum256(data)
 	if existing, err := os.ReadFile(path); err == nil && sha256.Sum256(existing) == want {
 		return path, nil
 	}
@@ -785,7 +817,7 @@ func ensureIconFile(root string) (string, error) {
 		return "", err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, appIcon, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return "", err
 	}
 	if err := os.Rename(tmp, path); err != nil {
