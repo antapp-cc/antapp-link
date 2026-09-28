@@ -1,6 +1,6 @@
 # AntApp Link
 
-Pi 节点虚拟专线：**服务端（Linux 单二进制）+ 客户端（Windows 单 exe）全自研**。TLS 1.3 双向认证隧道 + Wintun 虚拟网卡 + 内核端口转发，不依赖 OpenVPN、rinetd、easy-rsa，节点机零运行时依赖。
+Pi 节点虚拟专线：**服务端（Linux 单二进制）+ 客户端（Windows 单 exe）全自研**。TLS 1.3 双向认证隧道 + Wintun 虚拟网卡 + 内核端口转发。
 
 ## 架构
 
