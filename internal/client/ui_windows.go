@@ -22,7 +22,7 @@ import (
 	"github.com/antapp-cc/antapp-link/internal/update"
 )
 
-//go:embed assets/antapp.ico
+//go:embed assets/antapp-fill.ico
 var appIcon []byte
 
 // 托盘变色版：黑灰=未连接，鲜绿=已连接——用户扫一眼托盘就知道隧道通没通。
@@ -74,7 +74,7 @@ type UI struct {
 
 // RunUI 阻塞运行图形界面，直到用户从托盘菜单退出。
 func RunUI(app *App, logs *LogBuffer, rootDir string) error {
-	iconPath, err := ensureIconFile(rootDir, "antapp.ico", appIcon)
+	iconPath, err := ensureIconFile(rootDir, "antapp-fill.ico", appIcon)
 	if err != nil {
 		return err
 	}
