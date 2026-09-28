@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -49,7 +50,7 @@ func RunPortTest(serverIP string, log *slog.Logger) ([]PortTestResult, error) {
 	run := func(timeout time.Duration, args ...string) (string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		out, err := exec.CommandContext(ctx, docker, args...).CombinedOutput()
+		out, err := quietCmd(ctx, docker, args...).CombinedOutput()
 		return string(out), err
 	}
 
@@ -179,15 +180,23 @@ func findProcess(name string) (pid uint32, exe string, running bool) {
 // closeApp 退出 Pi Network 的全部进程。它是多进程 Electron 应用，且点 × 常常只是
 // 缩托盘不退出——必须按映像名杀干净并确认，留一个守护进程在就会把节点拉回去。
 func closeApp(log *slog.Logger) {
-	_ = exec.Command("taskkill", "/IM", piAppName).Run()
+	_ = quietCmd(context.Background(), "taskkill", "/IM", piAppName).Run()
 	if waitGone(8 * time.Second) {
 		return
 	}
-	_ = exec.Command("taskkill", "/F", "/IM", piAppName).Run()
+	_ = quietCmd(context.Background(), "taskkill", "/F", "/IM", piAppName).Run()
 	if waitGone(5 * time.Second) {
 		return
 	}
 	log.Warn("Pi 界面程序未能完全退出，测试结果可能不准")
+}
+
+// quietCmd 启动外部命令但不弹控制台黑框：客户端是图形界面程序，子进程默认
+// 会新建自己的控制台窗口，CREATE_NO_WINDOW 把它压掉。
+func quietCmd(ctx context.Context, name string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
+	return cmd
 }
 
 func waitGone(within time.Duration) bool {
