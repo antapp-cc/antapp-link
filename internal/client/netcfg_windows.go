@@ -161,6 +161,7 @@ func configureAdapterLUID(cfg NetConfig) error {
 		return fmt.Errorf("读隧道网卡接口参数: %w", err)
 	}
 	row.NLMTU = uint32(cfg.MTU)
+	effectiveMTU.Store(int64(cfg.MTU))
 	// 接口跃点压到最低：Windows 按接口跃点挑 DNS 服务器，不压低的话
 	// 解析还可能落到本地网卡上。
 	row.Metric = 1
@@ -184,17 +185,15 @@ func configureAdapterLUID(cfg NetConfig) error {
 	if err := setAdapterDNS(luid, cfg.DNS); err != nil {
 		return fmt.Errorf("设置隧道网卡 DNS: %w", err)
 	}
-	// 读回验证：这套 API 在部分机器上会「返回成功但实际没写入」（实测静默失败）。
-	// DNS 排序是整套接管能不能用的关键 —— 它没写上，查询就会漏回路由器那台
-	// 对国外域名挂死的 v6 DNS，页面全白。回退到 cmdlet（实测必成）。
+	// 读回校验：API 返回成功不代表写进去了。实测原生写入有效（探针验证），
+	// 这里留一道保险：万一某台机器没写上，重试几次；仍失败就记日志
+	// （解析会漏回物理网卡的 DNS，功能降级但不阻断连接）。
+	for retry := 0; retry < 3 && len(adapterDNS(luid)) == 0; retry++ {
+		time.Sleep(300 * time.Millisecond)
+		_ = setAdapterDNS(luid, cfg.DNS)
+	}
 	if len(adapterDNS(luid)) == 0 {
-		logf("隧道网卡 DNS 原生写入未生效，回退到 cmdlet")
-		if err := runCommand(Command{"powershell", []string{"-NoProfile", "-NonInteractive",
-			"-ExecutionPolicy", "Bypass", "-Command",
-			fmt.Sprintf("Set-DnsClientServerAddress -InterfaceAlias '%s' -ServerAddresses '%s'",
-				AdapterName, strings.Join(cfg.DNS, ","))}}); err != nil {
-			return fmt.Errorf("设置隧道网卡 DNS（回退）: %w", err)
-		}
+		logf("警告：隧道网卡的 DNS 未能写入（解析将回落到物理网卡的 DNS）")
 	}
 	return nil
 }
@@ -348,6 +347,7 @@ func applyDynamicMTU(egressLUID, tunLUID winipcfg.LUID, inviteMTU int) {
 		return
 	}
 	row.NLMTU = target
+	effectiveMTU.Store(int64(target))
 	if err := row.Set(); err != nil {
 		logf("隧道 MTU 调整到 %d 失败: %v", target, err)
 		return
@@ -521,14 +521,6 @@ func nrptRemove() {
 	}
 }
 
-// ---------- 旧版防火墙残留（唯一保留的外部命令路径）----------
-
-// cleanupLegacyFirewallRules 删除旧版「DNS 锁定」创建的防火墙规则。
-// 新版本已不再创建任何防火墙规则；这条只为升级上来的机器扫尾，
-// 所以只在启动自愈时跑一次，不进常规连接/断开路径。
-func cleanupLegacyFirewallRules() {
-	script := fmt.Sprintf("try { Get-NetFirewallRule -DisplayName '%s*' -ErrorAction SilentlyContinue | "+
-		"Remove-NetFirewallRule -ErrorAction SilentlyContinue } catch { }; exit 0", dnsLockPrefix)
-	_ = runCommand(Command{"powershell", []string{
-		"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script}})
-}
+// 旧版「DNS 锁定」防火墙规则的清理已整体移除：新版本不再创建任何防火墙
+// 规则；旧规则封的是旧架构下记录的 DNS 地址，新架构解析走隧道网卡，那些
+// 地址不会被查询，残留无副作用（PowerShell 依赖随之下线）。

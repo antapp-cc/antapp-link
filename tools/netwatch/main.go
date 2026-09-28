@@ -1,8 +1,6 @@
 //go:build windows
 
-// Command netwatch 验证 winipcfg 的系统回调与 bestDefaultRoute 的判定输入：
-// 注册与客户端完全相同的回调，打印收到的每个事件和 /0 路由的合成 metric 视角，
-// 30 秒后自动退出。
+// Command netwatch 验证 winipcfg 回调与 MTU 写入链路（客户端 applyDynamicMTU 同款调用序列）。
 package main
 
 import (
@@ -14,83 +12,121 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
-const adapterName = "AntApp Link"
-
 func main() {
+	const adapterName = "AntApp Link"
 	var tunLUID winipcfg.LUID
-	if aas, err := winipcfg.GetAdaptersAddresses(windows.AF_UNSPEC, winipcfg.GAAFlagDefault); err == nil {
-		for _, aa := range aas {
-			if aa.FriendlyName() == adapterName {
-				tunLUID = aa.LUID
-				fmt.Printf("隧道网卡 LUID=%d（被排除）\n", tunLUID)
-			}
+	aas, err := winipcfg.GetAdaptersAddresses(windows.AF_UNSPEC, winipcfg.GAAFlagDefault)
+	if err != nil {
+		fmt.Println("枚举网卡失败:", err)
+		return
+	}
+	var wlanLUID winipcfg.LUID
+	for _, aa := range aas {
+		switch aa.FriendlyName() {
+		case adapterName:
+			tunLUID = aa.LUID
+		case "WLAN":
+			wlanLUID = aa.LUID
 		}
 	}
-	if tunLUID == 0 {
-		fmt.Println("（隧道网卡不存在，排除列表为空）")
+	fmt.Printf("隧道 LUID=%d  WLAN LUID=%d\n", tunLUID, wlanLUID)
+
+	ifrow, err := wlanLUID.Interface()
+	fmt.Printf("WLAN  MibIfRow2.MTU=%d err=%v\n", ifrowMTU(ifrow, err), err)
+	row, err := tunLUID.IPInterface(windows.AF_INET)
+	fmt.Printf("隧道  IPInterface.NLMTU=%d err=%v\n", rowNLMTU(row, err), err)
+
+	if err == nil {
+		const target = 1344
+		row.NLMTU = target
+		fmt.Println("尝试 row.Set() → 1344 …")
+		if serr := row.Set(); serr != nil {
+			fmt.Println("  Set 失败:", serr)
+		} else {
+			row2, _ := tunLUID.IPInterface(windows.AF_INET)
+			fmt.Printf("  Set 成功，读回 NLMTU=%d\n", rowNLMTU(row2, nil))
+			row.NLMTU = 1400
+			_ = row.Set()
+			row3, _ := tunLUID.IPInterface(windows.AF_INET)
+			fmt.Printf("  已恢复 1400，读回 NLMTU=%d\n", rowNLMTU(row3, nil))
+		}
 	}
 
-	dump := func(tag string) {
-		rows, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
-		if err != nil {
-			fmt.Println("读路由表失败:", err)
-			return
+	// DNS 写入链路验证：清空 → LUID.SetDNS 写 10.10.0.1 → 读回。
+	if tunLUID != 0 {
+		fmt.Println("DNS 写入链路验证：")
+		if err := tunLUID.FlushDNS(windows.AF_INET); err != nil {
+			fmt.Println("  FlushDNS err:", err)
 		}
-		best := ^uint64(0)
-		found := false
-		var bnh netip.Addr
-		var bidx uint32
-		for i := range rows {
-			r := &rows[i]
-			if r.DestinationPrefix.PrefixLength != 0 || r.InterfaceLUID == tunLUID {
-				continue
-			}
-			nh := r.NextHop.Addr()
-			if !nh.IsValid() || nh.IsUnspecified() {
-				continue
-			}
-			ifrow, err := r.InterfaceLUID.Interface()
-			if err != nil || ifrow.OperStatus != winipcfg.IfOperStatusUp {
-				fmt.Printf("  /0 via %s if=%d row=%d —— 接口不可用(%v)\n", nh, r.InterfaceIndex, r.Metric, err)
-				continue
-			}
-			ipif, err := r.InterfaceLUID.IPInterface(windows.AF_INET)
-			ifm := uint32(0)
-			if err == nil {
-				ifm = ipif.Metric
-			}
-			combined := uint64(r.Metric) + uint64(ifm)
-			fmt.Printf("  /0 via %s if=%d row=%d ifmetric=%d combined=%d alias=%s\n",
-				nh, r.InterfaceIndex, r.Metric, ifm, combined, ifrow.Alias())
-			if !found || combined < best {
-				best, found, bnh, bidx = combined, true, nh, r.InterfaceIndex
-			}
+		time.Sleep(300 * time.Millisecond)
+		fmt.Printf("  清空后 DNS=%v\n", dnsV4(tunLUID))
+		gw := netip.MustParseAddr("10.10.0.1")
+		if err := tunLUID.SetDNS(windows.AF_INET, []netip.Addr{gw}, nil); err != nil {
+			fmt.Println("  SetDNS err:", err)
 		}
-		if found {
-			fmt.Printf("  ==> 判定出口: %s if=%d\n", bnh, bidx)
-		} else {
-			fmt.Println("  ==> 没有可用默认路由")
-		}
+		time.Sleep(300 * time.Millisecond)
+		fmt.Printf("  写入后 DNS=%v\n", dnsV4(tunLUID))
 	}
 
 	cbr, err := winipcfg.RegisterRouteChangeCallback(func(mt winipcfg.MibNotificationType, route *winipcfg.MibIPforwardRow2) {
+		plen := -1
+		nh := "nil"
 		if route != nil {
-			fmt.Printf("%s ROUTE-EVENT %v prefixlen=%d nexthop=%s if=%d\n",
-				time.Now().Format("15:04:05.000"), mt,
-				route.DestinationPrefix.PrefixLength, route.NextHop.Addr(), route.InterfaceIndex)
-		} else {
-			fmt.Printf("%s ROUTE-EVENT %v (nil row)\n", time.Now().Format("15:04:05.000"), mt)
+			plen = int(route.DestinationPrefix.PrefixLength)
+			nh = route.NextHop.Addr().String()
 		}
+		fmt.Printf("%s ROUTE-EVENT %v prefixlen=%d nexthop=%s\n", time.Now().Format("15:04:05.000"), mt, plen, nh)
 	})
 	if err != nil {
 		fmt.Println("注册路由回调失败:", err)
 		return
 	}
 	defer cbr.Unregister()
+	cbi, err := winipcfg.RegisterInterfaceChangeCallback(func(mt winipcfg.MibNotificationType, row *winipcfg.MibIPInterfaceRow) {
+		fam := int32(-1)
+		idx := uint32(0)
+		if row != nil {
+			fam, idx = int32(row.Family), row.InterfaceIndex
+		}
+		fmt.Printf("%s IFACE-EVENT %v family=%d if=%d\n", time.Now().Format("15:04:05.000"), mt, fam, idx)
+	})
+	if err != nil {
+		fmt.Println("注册接口回调失败:", err)
+		return
+	}
+	defer cbi.Unregister()
 
-	fmt.Println("初始视角：")
-	dump("init")
-	fmt.Println("监听中，40 秒后自动退出……")
-	time.Sleep(40 * time.Second)
+	fmt.Println("监听事件 30 秒……（期间去改 WLAN 的 MTU）")
+	time.Sleep(30 * time.Second)
 	fmt.Println("结束")
 }
+
+func ifrowMTU(r *winipcfg.MibIfRow2, err error) uint32 {
+	if err != nil || r == nil {
+		return 0
+	}
+	return r.MTU
+}
+
+func rowNLMTU(r *winipcfg.MibIPInterfaceRow, err error) uint32 {
+	if err != nil || r == nil {
+		return 0
+	}
+	return r.NLMTU
+}
+
+func dnsV4(l winipcfg.LUID) []netip.Addr {
+	addrs, err := l.DNS()
+	if err != nil {
+		return nil
+	}
+	var v4 []netip.Addr
+	for _, a := range addrs {
+		if a.Is4() {
+			v4 = append(v4, a.Unmap())
+		}
+	}
+	return v4
+}
+
+var _ = netip.Addr{}

@@ -181,8 +181,14 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	if err := json.Unmarshal(payload, &ack); err != nil {
 		return false, fmt.Errorf("解析 HELLO_ACK: %w", err)
 	}
+	// 日志显示实际生效的 MTU（跟随出口动态调整），而不是连接码里的固定配置值；
+	// 尚未接管网络时（联调模式）没有动态值，退回配置值。
+	mtu := ack.MTU
+	if v := int(effectiveMTU.Load()); v > 0 {
+		mtu = v
+	}
 	t.log.Info("隧道已建立",
-		"server", t.inv.Server, "tunnel_ip", ack.TunnelIP, "gateway", ack.Gateway, "mtu", ack.MTU)
+		"server", t.inv.Server, "tunnel_ip", ack.TunnelIP, "gateway", ack.Gateway, "mtu", mtu)
 	t.Stats.Connected.Store(true)
 	defer t.Stats.Connected.Store(false)
 

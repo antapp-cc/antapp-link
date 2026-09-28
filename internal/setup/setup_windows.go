@@ -161,9 +161,14 @@ func Install(opts Options, log func(string)) error {
 	}
 
 	dst := filepath.Join(opts.InstallDir, AppExeName)
+	// Windows 不允许覆盖正在运行的 exe，但允许给它改名 —— 覆盖安装时先把手头
+	// 的旧文件挪走再写入（与 update.Apply 同一套路）。否则遇到杀软短时握着
+	// 句柄，覆盖会静默失败，装完还是旧版本。
+	_ = os.Rename(dst, dst+".old")
 	if err := copyFile(src, dst); err != nil {
 		return fmt.Errorf("拷贝程序: %w", err)
 	}
+	_ = os.Remove(dst + ".old")
 	log("已释放 " + dst)
 
 	if err := installUninstaller(log); err != nil {

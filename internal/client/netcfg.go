@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/antapp-cc/antapp-link/internal/pki"
@@ -106,6 +107,11 @@ const splitRouteMetric = 5
 // tunnelOverheadBytes 是承载内层 IP 包的外层开销估算：
 // 外层 IPv4 头 20 + TCP 头 20 + TLS 记录头与认证标签约 16~22。
 const tunnelOverheadBytes = 56
+
+// effectiveMTU 是隧道网卡当前实际生效的 MTU。配置值（连接码里的）是固定数，
+// 实际值会跟随出口链路自动收缩/回升 —— 日志要显示的是这个，不是配置值。
+// 非 Windows 平台无人写入，恒为 0（调用方按 0 = 未接管处理）。
+var effectiveMTU atomic.Int64
 
 // targetTunnelMTU 跟随出口计算隧道 MTU（WireGuard monitorMTU 同思路）：
 // 取连接码 MTU 与「出口 MTU - 隧道开销」的较小值，下限 576（IPv4 主机必须

@@ -118,9 +118,6 @@ func (a *App) HealIfNeeded() error {
 	}
 
 	a.log.Info("发现上次残留的网络配置，先还原", "captured_at", snap.CapturedAt)
-	// 旧版「DNS 锁定」的防火墙规则只有升级上来的机器才有，扫尾一次即可，
-	// 不进常规连接/断开路径。
-	cleanupLegacyFirewallRules()
 	if err := snap.Restore(BuildNetConfig(inv)); err != nil {
 		return fmt.Errorf("还原上次的网络配置失败: %w", err)
 	}

@@ -14,9 +14,6 @@ func ConfigureAdapter(NetConfig) error     { return ErrNoNetCfg }
 func (s Snapshot) Apply(NetConfig) error   { return ErrNoNetCfg }
 func (s Snapshot) Restore(NetConfig) error { return ErrNoNetCfg }
 
-// cleanupLegacyFirewallRules 的 Windows 实现要借道 PowerShell，仅升级扫尾用。
-func cleanupLegacyFirewallRules() {}
-
 // sessionWatcher 只在 Windows 上有实体；其它平台返回 nil，App 按无守护处理。
 type sessionWatcher struct{}
 

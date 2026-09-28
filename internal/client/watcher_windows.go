@@ -7,11 +7,21 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
 	"sync"
 	"time"
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
+)
+
+const (
+	// debounce：网络切换时系统会连续吐出一串事件，等安静下来再对账。
+	debounce = 700 * time.Millisecond
+	// pollInterval：周期兜底对账。实测 NotifyRouteChange2 对 /0 默认路由的
+	// 增删不投递事件（其它前缀正常），不能只依赖回调；对账是一次路由表
+	// 读取，微秒级，常开无负担。
+	pollInterval = 5 * time.Second
 )
 
 // sessionWatcher 在连接期间监听系统网络变化，把「跟出口相关的配置」迁移到
@@ -89,9 +99,14 @@ func startSessionWatcher(ctx context.Context, snap Snapshot, cfg NetConfig,
 	}
 	w.unregs = append(w.unregs, cbi.Unregister)
 
+	logf("出口守护已启动（事件通知 + 每 %s 对账）", pollInterval)
 	go w.loop(ctx)
 	return w, nil
 }
+
+// watcherDebug 决定是否打印每次对账的明细。正常关闭（5 秒一次会刷屏），
+// 排障时设 ANTAPP_WATCHER_DEBUG=1 打开。
+var watcherDebug = func() bool { return os.Getenv("ANTAPP_WATCHER_DEBUG") != "" }()
 
 // notify 请求一次对账。回调线程里非阻塞发送，事件风暴由 loop 里的防抖合并。
 func (w *sessionWatcher) notify() {
@@ -109,10 +124,6 @@ func (w *sessionWatcher) notify() {
 // 一次路由表读取，微秒级，常开无负担。
 func (w *sessionWatcher) loop(ctx context.Context) {
 	defer close(w.done)
-	const (
-		debounce     = 700 * time.Millisecond
-		pollInterval = 5 * time.Second
-	)
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
@@ -159,6 +170,16 @@ func (w *sessionWatcher) reconcile() {
 	gw, ifIndex, err := bestDefaultRoute(tunLUID)
 	if err != nil || gw.IsUnspecified() {
 		return // 眼下没有出口（断网中），等下次事件
+	}
+
+	// 出口没变也可能只是出口的 MTU 变了（人为调整、驱动重置、便携设备换网络），
+	// 动态 MTU 每次对账都要刷新；已经是目标值时它是空操作。
+	if def, ok, _ := adapterByIndex(ifIndex); ok {
+		applyDynamicMTU(def.LUID, tunLUID, w.cfg.MTU)
+	}
+
+	if watcherDebug {
+		logf("对账：出口 %s（if %d），上次 %s（if %d）", gw, ifIndex, w.lastGw, w.lastIdx)
 	}
 	if ifIndex == w.lastIdx && gw.Unmap() == w.lastGw {
 		return // 出口没变
