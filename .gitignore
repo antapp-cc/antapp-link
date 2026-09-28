@@ -5,3 +5,8 @@ dist/
 # 这里只保留哈希与说明用于溯源，避免仓库里塞两份几 MB 的二进制。
 third_party/wintun-0.14.1/
 third_party/wintun-0.14.1.zip
+
+# 误落仓库根目录的外来文件
+/notifications.json
+# 交叉编译产物（GOOS=linux go build 无 -o 时落在根目录）
+/antapp-linkd
