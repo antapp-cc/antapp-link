@@ -125,13 +125,49 @@ type psDNS struct {
 	ServerAddresses []string `json:"ServerAddresses"`
 }
 
+// captureDNS 抓下每张网卡当前的 DNS，IPv4 与 IPv6 分开存。
+//
+// IPv6 那份只用来「封堵」不参与还原：RA 下发的 IPv6 DNS 没法用 netsh ipv4 改掉，
+// 但不封它的话，系统会在 IPv4 DNS 被指向隧道之后转用 IPv6 那条，
+// 查询绕开隧道被劫持。
 func captureDNS() ([]IfaceDNS, error) {
-	const script = `Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue ` +
-		`| Where-Object { $_.ServerAddresses.Count -gt 0 } ` +
-		`| Select-Object InterfaceAlias,InterfaceIndex,ServerAddresses | ConvertTo-Json -Compress`
+	v4, err := captureDNSFamily(4)
+	if err != nil {
+		return nil, err
+	}
+	v6, err := captureDNSFamily(6)
+	if err != nil {
+		// IPv6 抓不到不该阻断接管：没有 IPv6 DNS 的机器本来就查不到东西
+		v6 = nil
+	}
+
+	// 按网卡名合并，IPv4 的顺序和内容保持原样（还原要用它）
+	index := map[string]int{}
+	var out []IfaceDNS
+	for _, r := range v4 {
+		index[r.Name] = len(out)
+		out = append(out, r)
+	}
+	for _, r := range v6 {
+		if i, ok := index[r.Name]; ok {
+			out[i].DNSv6 = r.DNS
+			continue
+		}
+		index[r.Name] = len(out)
+		out = append(out, IfaceDNS{Name: r.Name, Index: r.Index, DNSv6: r.DNS})
+	}
+	return out, nil
+}
+
+func captureDNSFamily(family int) ([]IfaceDNS, error) {
+	script := fmt.Sprintf(
+		`Get-DnsClientServerAddress -AddressFamily IPv%d -ErrorAction SilentlyContinue `+
+			`| Where-Object { $_.ServerAddresses.Count -gt 0 } `+
+			`| Select-Object InterfaceAlias,InterfaceIndex,ServerAddresses | ConvertTo-Json -Compress`,
+		family)
 	out, err := runPowerShell(script)
 	if err != nil {
-		return nil, fmt.Errorf("查询网卡 DNS: %w", err)
+		return nil, fmt.Errorf("查询网卡 IPv%d DNS: %w", family, err)
 	}
 	text := strings.TrimSpace(out)
 	if text == "" {
@@ -143,25 +179,25 @@ func captureDNS() ([]IfaceDNS, error) {
 	if strings.HasPrefix(text, "{") {
 		var one psDNS
 		if err := json.Unmarshal([]byte(text), &one); err != nil {
-			return nil, fmt.Errorf("解析网卡 DNS: %w", err)
+			return nil, fmt.Errorf("解析网卡 IPv%d DNS: %w", family, err)
 		}
 		raw = []psDNS{one}
 	} else if err := json.Unmarshal([]byte(text), &raw); err != nil {
-		return nil, fmt.Errorf("解析网卡 DNS: %w", err)
+		return nil, fmt.Errorf("解析网卡 IPv%d DNS: %w", family, err)
 	}
 
-	var out2 []IfaceDNS
+	var res []IfaceDNS
 	for _, r := range raw {
 		if r.InterfaceAlias == "" || len(r.ServerAddresses) == 0 {
 			continue
 		}
-		out2 = append(out2, IfaceDNS{
+		res = append(res, IfaceDNS{
 			Name:  r.InterfaceAlias,
 			Index: r.InterfaceIndex,
 			DNS:   r.ServerAddresses,
 		})
 	}
-	return out2, nil
+	return res, nil
 }
 
 // ConfigureAdapter 只把隧道网卡本身配起来（地址、MTU、接口跃点），不碰路由和 DNS。
@@ -200,7 +236,7 @@ func (s Snapshot) Apply(cfg NetConfig) error {
 	// 好处是服务端出口出问题时国内网络照常可用，不会「连上就没有网」。
 	if splitRoutesSupported(s) {
 		routes := CNRoutes()
-		cmds := splitRouteCommands(routes, s.DefaultIfIndex, s.DefaultGateway, true)
+		cmds := splitRouteCommands(routes, s.DefaultIfIndex, s.DefaultGateway)
 		ok := 0
 		for _, c := range cmds {
 			if err := runCommand(c); err == nil {
@@ -242,11 +278,13 @@ func (s Snapshot) Restore(cfg NetConfig) error {
 			firstErr = err
 		}
 	}
-	// 国内直连路由也要撤掉，否则断开后它们还留在表里
+	// 国内直连路由也要撤掉，否则断开后它们还留在表里。
+	//
+	// 一条 PowerShell 批量删，绝不逐条 route.exe：后者删不存在的路由会卡住，
+	// 809 条能把整个还原流程堵死 —— 实测客户端卡在自愈那一步，
+	// 连 /1 接管路由都没撤掉，用户就留在「半接管」状态。
 	if splitRoutesSupported(s) {
-		for _, c := range splitRouteCommands(CNRoutes(), s.DefaultIfIndex, s.DefaultGateway, false) {
-			_ = runCommand(c)
-		}
+		_ = runCommand(splitRouteDeleteCommand(s))
 	}
 	return firstErr
 }

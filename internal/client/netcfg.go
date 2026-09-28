@@ -45,6 +45,14 @@ type IfaceDNS struct {
 	Name  string   `json:"name"`
 	Index int      `json:"index"`
 	DNS   []string `json:"dns"`
+
+	// DNSv6 只用于「封堵隧道外的 DNS」，不参与还原。
+	//
+	// 路由器的 IPv6 DNS 是 RA 下发的，netsh 的 ipv4 子命令管不到它、也清不掉，
+	// 所以没法「改」，只能「封」。但不封的后果很严重：系统会在 IPv4 DNS 被改到
+	// 隧道之后转而用 IPv6 那条，查询绕开隧道被劫持 —— 这正是
+	// 「minepi.com 打不开、Edge 新标签页空白」的直接原因。
+	DNSv6 []string `json:"dns_v6,omitempty"`
 }
 
 // Snapshot 是接管网络之前的现场。它必须能完整还原 —— 还原不了就是把用户搞断网。
@@ -199,7 +207,9 @@ func dnsLockCommands(ifaces []IfaceDNS, tunnelDNS []string) []Command {
 	seen := map[string]bool{}
 	var outside []string
 	for _, iface := range ifaces {
-		for _, d := range iface.DNS {
+		// IPv4 和 IPv6 都要封。只封 IPv4 时系统会转用 RA 下发的 IPv6 DNS，
+		// 查询照样绕开隧道 —— 实测踩过这个坑。
+		for _, d := range append(append([]string{}, iface.DNS...), iface.DNSv6...) {
 			d = strings.TrimSpace(d)
 			if d == "" || isTunnel(d) || seen[d] {
 				continue
