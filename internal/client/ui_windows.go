@@ -58,6 +58,7 @@ type UI struct {
 	mSwitchCfg *walk.Action
 
 	lblState    *walk.Label
+	lblCfg      *walk.Label
 	lblIP       *walk.Label
 	lblTraffic  *walk.Label
 	lblVersion  *walk.Label
@@ -136,10 +137,17 @@ func (u *UI) build() error {
 		Size:    Size{Width: 540, Height: 353},
 		Layout:  VBox{Margins: Margins{Left: 10, Top: 10, Right: 10, Bottom: 10}, Spacing: 8},
 		Children: []Widget{
-			Label{
-				AssignTo: &u.lblState,
-				Text:     "当前状态: 未连接",
-				Font:     Font{PointSize: 10},
+			Composite{
+				Layout: HBox{MarginsZero: true},
+				Children: []Widget{
+					Label{
+						AssignTo: &u.lblState,
+						Text:     "当前状态: 未连接",
+						Font:     Font{PointSize: 10},
+					},
+					HSpacer{},
+					Label{AssignTo: &u.lblCfg, Text: ""},
+				},
 			},
 			TextEdit{
 				AssignTo: &u.txtLog,
@@ -513,6 +521,11 @@ func (u *UI) refresh() {
 		state += fmt.Sprintf("　·　有新版本 %s", u.pending.Version)
 	}
 	u.lblState.SetText(state)
+	if src := u.app.CurrentSource(); src != "" {
+		u.lblCfg.SetText("配置文件: " + src)
+	} else {
+		u.lblCfg.SetText("")
+	}
 
 	// 上次的错误比「服务端 x」更有用，就写进日志区（每条错误只记一次，不刷屏），
 	// 状态行保持干净的「服务端 x」。
@@ -524,9 +537,9 @@ func (u *UI) refresh() {
 	case busyOp != "":
 		u.lblIP.SetText("正在交换网络配置，请稍候…")
 	case st.Online:
-		u.lblIP.SetText(fmt.Sprintf("分配 IP: %s · 配置文件: %s", st.TunnelIP, u.app.CurrentSource()))
+		u.lblIP.SetText(fmt.Sprintf("分配 IP: %s", st.TunnelIP))
 	case configured:
-		u.lblIP.SetText(fmt.Sprintf("服务端: %s · 配置文件: %s", st.Server, u.app.CurrentSource()))
+		u.lblIP.SetText("服务端: " + st.Server)
 	default:
 		u.lblIP.SetText("分配 IP: —")
 	}
