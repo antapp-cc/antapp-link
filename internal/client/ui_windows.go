@@ -430,8 +430,6 @@ func (u *UI) pickConfig(currentSource string, names []string) (string, bool) {
 			dlg.Accept()
 		}
 	}
-	// 默认选中第一行：高亮行 = 将使用的配置，所见即所选
-	afterCreate := func() { lb.SetCurrentIndex(0) }
 	if err := (Dialog{
 		AssignTo: &dlg,
 		Title:    "选择要使用的配置",
@@ -466,7 +464,6 @@ func (u *UI) pickConfig(currentSource string, names []string) (string, bool) {
 		u.alert("无法显示选择窗口", err.Error())
 		return "", false
 	}
-	afterCreate()
 	dlg.Run()
 	if !chosen {
 		return "", false
