@@ -891,6 +891,11 @@ func (u *UI) rebuildConfigMenu() {
 	}
 	u.cfgActions = nil
 
+	// 只有一个配置文件时「连接 / 断开」主项就够了，不列出文件项（对齐 OpenVPN）
+	files := ListInviteFiles(u.app.RootDir())
+	if len(files) < 2 {
+		return
+	}
 	insertAt := actions.Index(u.mImport)
 	running := u.app.Status().Running
 	current := u.app.CurrentSource()
@@ -898,7 +903,7 @@ func (u *UI) rebuildConfigMenu() {
 		current = ""
 	}
 
-	for _, name := range ListInviteFiles(u.app.RootDir()) {
+	for _, name := range files {
 		a := walk.NewAction()
 		name := name
 		if name == current {
