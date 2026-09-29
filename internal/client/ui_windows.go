@@ -517,9 +517,9 @@ func (u *UI) refresh() {
 	case busyOp != "":
 		u.lblIP.SetText("正在交换网络配置，请稍候…")
 	case st.Online:
-		u.lblIP.SetText(fmt.Sprintf("分配 IP: %s", st.TunnelIP))
+		u.lblIP.SetText(fmt.Sprintf("分配 IP: %s · 配置文件: %s", st.TunnelIP, u.app.CurrentSource()))
 	case configured:
-		u.lblIP.SetText("服务端: " + st.Server)
+		u.lblIP.SetText(fmt.Sprintf("服务端: %s · 配置文件: %s", st.Server, u.app.CurrentSource()))
 	default:
 		u.lblIP.SetText("分配 IP: —")
 	}
