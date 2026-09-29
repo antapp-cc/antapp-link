@@ -221,22 +221,9 @@ func (u *UI) build() error {
 	// 没有新版本时这个按钮不该占着位置
 	u.btnUpdate.SetVisible(false)
 
-	// config 里摆着多个不同的配置时，先让用户挑，再谈连接 —— 不然客户端
-	// 自作主张连上一个，可能正是别人正在用的那台。
-	if HasAlternateInvites(u.app.RootDir(), u.app.CurrentInvite()) {
-		u.app.Log().Info("检测到多个不同的配置文件，等待选择后再连接")
-		c, changed, ok := u.pickFromAll(u.app.CurrentInvite(), ScanInvites(u.app.RootDir()))
-		u.markSeen(ScanInvites(u.app.RootDir()))
-		if ok && changed {
-			u.adoptCandidate(c) // 内部已按新连接码重连
-		} else {
-			// 取消或选回当前的：用现有配置正常连接
-			go func() {
-				_ = u.app.Connect()
-				u.mw.Synchronize(u.refresh)
-			}()
-		}
-	}
+	// 启动即按 config 里的文件决定连接：一个直接用，多个弹窗让用户挑，
+	// 零个保持未配置等导入。客户端不记录上次连的是哪个文件。
+	u.resolveFromConfigDir()
 
 	go u.refreshLoop()
 	go u.autoCheckUpdate()
@@ -245,13 +232,22 @@ func (u *UI) build() error {
 	return nil
 }
 
-// watchInvite 盯着 config\node.antapp，发现被外部改过就重载并重连。
+// watchInvite 盯着 config\*.antapp 的内容变化：运行期间用户放进新文件、或改了
+// 现有文件的内容，都会在这里被发现并弹列表让用户确认切换。
 //
-// 用户在客户端已经运行时双击一个 .antapp 文件，那个新进程只会把连接码写进文件
-// 然后退出（单实例闸门挡着）。真正的切换得由这里完成 —— 否则双击看起来毫无反应。
+// 用户在客户端已经运行时双击一个 .antapp 文件，那个新进程只会把文件复制进 config\
+// 然后退出（单实例闸门挡着）。真正的切换得由这条链完成 —— 否则双击看起来毫无反应。
 func (u *UI) watchInvite() {
-	path := InviteFilePath(u.app.RootDir())
-	last := inviteModTime(path)
+	snapshot := func() map[string]bool {
+		now := map[string]bool{}
+		for _, c := range ScanInvites(u.app.RootDir()) {
+			if code, err := c.Inv.Encode(); err == nil {
+				now[c.File+" "+code] = true
+			}
+		}
+		return now
+	}
+	last := snapshot()
 
 	for {
 		select {
@@ -260,28 +256,40 @@ func (u *UI) watchInvite() {
 		case <-time.After(2 * time.Second):
 		}
 
-		now := inviteModTime(path)
-		if now.IsZero() || now.Equal(last) {
+		now := snapshot()
+		changed := false
+		for key := range now {
+			if !last[key] {
+				changed = true
+			}
+		}
+		for key := range last {
+			if !now[key] {
+				changed = true // 删了文件也算变化，值得让用户知道
+			}
+		}
+		if !changed {
 			continue
 		}
 		last = now
 
-		inv, err := LoadSavedInvite(u.app.RootDir())
-		if err != nil {
-			u.app.Log().Warn("连接码变了但读不出来", "err", err)
-			continue
-		}
-		if err := u.app.UpdateInvite(inv, InviteFileName); err != nil {
-			u.app.Log().Warn("换用新连接码失败", "err", err)
-			continue
-		}
-		u.app.Log().Info("检测到新的连接码，重新连接",
-			"file", InviteFileName, "server", inv.Server)
-
-		go func() {
-			_ = u.app.Connect()
-			u.mw.Synchronize(u.refresh)
-		}()
+		u.mw.Synchronize(func() {
+			if u.adoptBusy || u.app.Configured() && u.suppressTil.After(time.Now()) {
+				return
+			}
+			cands := ScanInvites(u.app.RootDir())
+			if len(cands) == 0 {
+				return
+			}
+			// 运行中发生变化：弹全量列表让用户确认用哪个（当前项已标注）
+			c, changed, ok := u.pickFromAll(u.app.CurrentInvite(), cands)
+			if !ok || !changed {
+				return
+			}
+			if u.adoptCandidate(c) {
+				u.app.Log().Info(fmt.Sprintf("已切换到配置 %s（服务端 %s）", c.File, c.Inv.Server))
+			}
+		})
 	}
 }
 
@@ -498,14 +506,9 @@ func (u *UI) markSeen(cands []Candidate) {
 	}
 }
 
-// adoptCandidate 把候选写入生效配置并切换，随后立即按新连接码重连。
-// （UpdateInvite 只断开不连——重连由这里统一发起，手动切换和自动识别行为一致。）
-// 返回是否成功。
+// adoptCandidate 采用候选并按它重连。用户的文件保持原名原内容不动 ——
+// 客户端只读它，不复制不改名。返回是否成功。
 func (u *UI) adoptCandidate(c Candidate) bool {
-	if err := SaveInvite(u.app.RootDir(), c.Inv); err != nil {
-		u.alert("采用配置文件失败", err.Error())
-		return false
-	}
 	if err := u.app.UpdateInvite(c.Inv, c.File); err != nil {
 		u.alert("切换配置失败", err.Error())
 		return false
@@ -525,7 +528,7 @@ func (u *UI) pickFromAll(active pki.Invite, cands []Candidate) (Candidate, bool,
 	activeCode, _ := active.Encode()
 	all := cands
 	if active.Server != "" {
-		all = append([]Candidate{{File: InviteFileName, Inv: active}}, cands...)
+		all = append([]Candidate{{File: u.app.CurrentSource(), Inv: active}}, cands...)
 	}
 
 	items := make([]string, len(all))
@@ -742,7 +745,7 @@ func (u *UI) onPrimary() {
 		return
 	}
 	if !u.app.Configured() {
-		u.onImport()
+		u.resolveFromConfigDir()
 		return
 	}
 	op := "connect"
@@ -943,6 +946,35 @@ func (u *UI) applyUpdate(newExe string) {
 // 卸载入口刻意不放在这个托盘菜单里：它紧挨着「退出」，而卸载是不可逆的，
 // 误点代价太大。改由安装目录里的「卸载 AntApp Link」快捷方式承担。
 
+// resolveFromConfigDir 点「连接」时的统一入口：扫描 config\*.antapp 决定连哪个。
+// 恰好一个直接连；多个先提示同名冲突，再弹列表让用户挑；零个引导导入。
+func (u *UI) resolveFromConfigDir() {
+	cands := ScanInvites(u.app.RootDir())
+	if len(cands) == 0 {
+		u.onImport()
+		return
+	}
+	var c Candidate
+	if len(cands) == 1 {
+		c = cands[0]
+	} else {
+		if dups := DuplicateNames(cands); len(dups) > 0 {
+			walk.MsgBox(u.mw, "检测到同名配置",
+				fmt.Sprintf("config 文件夹里有 %d 个同名的配置（%s）。\n\n它们无法凭名字区分，请在下面的列表里选择要使用的；多余的建议删掉。",
+					len(dups), strings.Join(dups, "、")),
+				walk.MsgBoxIconWarning)
+		}
+		picked, _, ok := u.pickFromAll(pki.Invite{}, cands)
+		if !ok {
+			return
+		}
+		c = picked
+	}
+	if u.adoptCandidate(c) {
+		u.app.Log().Info(fmt.Sprintf("已选用配置 %s（服务端 %s）", c.File, c.Inv.Server))
+	}
+}
+
 // onSwitchConfig 手动切换配置文件：弹全量列表（含当前生效项，标注「当前使用」）。
 // 菜单项只在 config 里存在不同配置时可点；adoptBusy 与自动识别互斥，防两个框并发。
 func (u *UI) onSwitchConfig() {
@@ -1007,15 +1039,22 @@ func (u *UI) onImport() {
 		return
 	}
 
-	// 保存与切换连接会先断开再重连，别卡住界面线程
+	// 导入 = 把连接码文件原样复制进 config\（保留你的名字），再切换连接。别卡住界面线程
 	go func() {
-		if err := SaveInvite(u.app.RootDir(), inv); err != nil {
-			u.alert("保存连接码失败", err.Error())
-			return
-		}
-		source := "剪贴板粘贴"
+		var source string
 		if fromFile {
+			if _, err := ImportInviteFile(u.app.RootDir(), raw); err != nil {
+				u.alert("保存连接码失败", err.Error())
+				return
+			}
 			source = filepath.Base(raw)
+		} else {
+			name, err := ImportInviteBytes(u.app.RootDir(), "导入的连接码.antapp", []byte(strings.TrimSpace(raw)))
+			if err != nil {
+				u.alert("保存连接码失败", err.Error())
+				return
+			}
+			source = name
 		}
 		if err := u.app.UpdateInvite(inv, source); err != nil {
 			u.alert("切换连接码失败", err.Error())
