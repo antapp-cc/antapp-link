@@ -405,18 +405,16 @@ func (u *UI) adoptByName(name string) bool {
 	return true
 }
 
-// pickConfig 弹出配置选择列表：只显示文件名（用户要求只看文件名）。
+// pickConfig 弹出配置选择列表：只显示文件名。列表顺序固定按文件名排序，
+// 当前使用的行内标注「（当前使用）」——顺序不能随当前配置变（当前项挪首位会让用户按记忆点错行）。
 // currentSource 非空时列表首位放当前正在用的文件并标注；返回选中的文件名。
 func (u *UI) pickConfig(currentSource string, names []string) (string, bool) {
-	// 当前正在用的文件排首位；其余文件跟在后面。同一个文件只出现一次——
-	// 不然两行同名夹着别的文件，用户点错行提交的就不是心里想的那份。
-	var all []string
-	if currentSource != "" {
-		all = append(all, currentSource)
-	}
-	for _, n := range names {
-		if n != currentSource {
-			all = append(all, n)
+	// 列表顺序固定按文件名排序，当前使用的行内标注「（当前使用）」。
+	items := make([]string, len(names))
+	for i, n := range names {
+		items[i] = n
+		if n == currentSource {
+			items[i] += "　（当前使用）"
 		}
 	}
 
@@ -439,7 +437,7 @@ func (u *UI) pickConfig(currentSource string, names []string) (string, bool) {
 			Label{Text: "config 文件夹里有多个连接码，单击选中一行，再点下面的按钮；双击行直接使用："},
 			ListBox{
 				AssignTo: &lb,
-				Model:    all,
+				Model:    items,
 				OnCurrentIndexChanged: func() {
 					btnOK.SetEnabled(lb.CurrentIndex() >= 0)
 				},
@@ -469,11 +467,11 @@ func (u *UI) pickConfig(currentSource string, names []string) (string, bool) {
 		return "", false
 	}
 	idx := lb.CurrentIndex()
-	if idx < 0 || idx >= len(all) {
+	if idx < 0 || idx >= len(names) {
 		return "", false
 	}
-	u.app.Log().Info(fmt.Sprintf("配置选择结果：列表共 %d 项，用户选定第 %d 项 = %s", len(all), idx+1, all[idx]))
-	return all[idx], true
+	u.app.Log().Info(fmt.Sprintf("配置选择结果：列表共 %d 项，用户选定第 %d 项 = %s", len(names), idx+1, names[idx]))
+	return names[idx], true
 }
 
 func (u *UI) refresh() {
