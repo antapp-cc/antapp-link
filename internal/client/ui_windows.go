@@ -146,7 +146,11 @@ func (u *UI) build() error {
 						Font:     Font{PointSize: 10},
 					},
 					HSpacer{},
-					Label{AssignTo: &u.lblCfg, Text: ""},
+					Label{
+						AssignTo: &u.lblCfg,
+						Text:     "",
+						Font:     Font{PointSize: 9},
+					},
 				},
 			},
 			TextEdit{
