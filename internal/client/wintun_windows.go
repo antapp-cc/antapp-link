@@ -76,6 +76,12 @@ func (d *WintunDevice) Read(p []byte) (int, error) {
 		d.recvMu.Unlock()
 
 		if !errors.Is(err, windows.ERROR_NO_MORE_ITEMS) {
+			// ERROR_HANDLE_EOF（Reached the end of the file）= 适配器/会话在系统层面
+			// 已死（被停用、移除、驱动重置），不是我们自己 Close 的 —— 打上标记，
+			// 让重连循环重建设备，而不是拿死句柄无限重试。
+			if errors.Is(err, windows.ERROR_HANDLE_EOF) {
+				return 0, fmt.Errorf("读网卡: %w: %w", ErrAdapterDead, err)
+			}
 			return 0, fmt.Errorf("读网卡: %w", err)
 		}
 		if err := waitReadable(d.session.ReadWaitEvent(), d.closed); err != nil {
@@ -105,6 +111,9 @@ func (d *WintunDevice) Write(p []byte) (int, error) {
 		d.sendMu.Unlock()
 
 		if !errors.Is(err, windows.ERROR_BUFFER_OVERFLOW) {
+			if errors.Is(err, windows.ERROR_HANDLE_EOF) {
+				return 0, fmt.Errorf("写网卡: %w: %w", ErrAdapterDead, err)
+			}
 			return 0, fmt.Errorf("写网卡: %w", err)
 		}
 		time.Sleep(time.Millisecond)

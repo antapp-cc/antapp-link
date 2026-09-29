@@ -218,6 +218,15 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snapshot) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	tunnel := NewTunnel(inv, dev, a.log)
+	// 适配器被外力干掉时，重拨 TCP 救不了，要走一次完整的断开+连接
+	// （重开设备、重新接管网络）。它是异步的：先 Disconnect 掉本循环，
+	// 再走一遍 connectSlow 的全流程。
+	tunnel.RebuildDevice = func() {
+		go func() {
+			a.Disconnect()
+			_ = a.Connect()
+		}()
+	}
 
 	a.mu.Lock()
 	a.cfg = cfg

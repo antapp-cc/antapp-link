@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -81,6 +82,10 @@ type Tunnel struct {
 	log   *slog.Logger
 	Stats Stats
 
+	// RebuildDevice 在适配器被外力干掉时由重连循环调用（App 注入完整重连）。
+	// 它会 cancel 本循环，所以调用后循环直接退出；nil 则退回普通退避重试。
+	RebuildDevice func()
+
 	// wake 在网络出口迁移时被 watcher 触发：把重连从「最长 30s 退避」变成
 	// 「网络一恢复立刻试」。带缓冲，连续多次通知合并成一次。
 	wake chan struct{}
@@ -141,6 +146,13 @@ func (t *Tunnel) Run(ctx context.Context) error {
 			attempt = 0
 		}
 		if err != nil {
+			// 适配器被外力干掉（系统停用/移除/驱动重置）时，重拨 TCP 救不了 ——
+			// 必须重建整个设备与网络配置。交给 App 的完整重连，本循环随之退出。
+			if errors.Is(err, ErrAdapterDead) && t.RebuildDevice != nil {
+				t.log.Warn("虚拟网卡已失效（可能被系统或其他软件停用），自动重建设备并重连……")
+				go t.RebuildDevice()
+				return nil
+			}
 			lvl, reason := sessionEndInfo(err)
 			args := []any{"err", err, "retry_in", Backoff(attempt)}
 			if reason != "" {
