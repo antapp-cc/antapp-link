@@ -316,67 +316,99 @@ func (u *UI) buildTray() error {
 		return err
 	}
 
-	mShow := walk.NewAction()
-	_ = mShow.SetText("显示主窗口")
-	mShow.Triggered().Attach(u.showWindow)
-	ni.ContextMenu().Actions().Add(mShow)
-	ni.ContextMenu().Actions().Add(walk.NewSeparatorAction())
+	// 菜单每次右键弹出前全量重建（固定项 + config 文件动态区），
+	// 文件增删改名立即反映到菜单里
+	u.rebuildTrayMenu()
 
-	mToggle := walk.NewAction()
-	_ = mToggle.SetText("连接 / 断开")
-	mToggle.Triggered().Attach(u.onPrimary)
-	ni.ContextMenu().Actions().Add(mToggle)
-
-	u.mImport = walk.NewAction()
-	_ = u.mImport.SetText("导入连接码")
-	u.mImport.Triggered().Attach(u.onImport)
-	ni.ContextMenu().Actions().Add(u.mImport)
-
-	// 动态配置区（OpenVPN 式）：config\ 里每个 .antapp 一项，点谁连谁。
-	// 右键菜单每次弹出前刷新，文件数量与名称始终与文件夹一致。
-	u.rebuildConfigMenu()
-
-	mOpenDir := walk.NewAction()
-	_ = mOpenDir.SetText("打开配置目录")
-	mOpenDir.Triggered().Attach(u.onOpenConfigDir)
-	ni.ContextMenu().Actions().Add(mOpenDir)
-
-	mUpdate := walk.NewAction()
-	_ = mUpdate.SetText("检查更新")
-	mUpdate.Triggered().Attach(u.onCheckUpdate)
-	ni.ContextMenu().Actions().Add(mUpdate)
-	ni.ContextMenu().Actions().Add(walk.NewSeparatorAction())
-
-	mAuto := walk.NewAction()
-	_ = mAuto.SetText("开机自启")
-	_ = mAuto.SetChecked(AutostartEnabled())
-	mAuto.Triggered().Attach(func() {
-		go func() {
-			if mAuto.Checked() {
-				_ = DisableAutostart()
-				mAuto.SetChecked(false)
-			} else {
-				_ = EnableAutostart()
-				mAuto.SetChecked(true)
-			}
-		}()
-	})
-	ni.ContextMenu().Actions().Add(mAuto)
-	ni.ContextMenu().Actions().Add(walk.NewSeparatorAction())
-
-	mQuit := walk.NewAction()
-	_ = mQuit.SetText("退出")
-	mQuit.Triggered().Attach(u.quit)
-	ni.ContextMenu().Actions().Add(mQuit)
-
-	// 双击托盘图标回到主窗口
+	// 双击托盘图标回到主窗口；右键弹出前重建菜单（刷新配置文件列表）
 	ni.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
 		if button == walk.LeftButton {
 			u.showWindow()
+			return
+		}
+		if button == walk.RightButton {
+			u.rebuildTrayMenu()
 		}
 	})
 
 	return ni.SetVisible(true)
+}
+
+// rebuildTrayMenu 全量重建托盘右键菜单：固定项 + config\*.antapp 动态配置区
+// （OpenVPN 式——两个及以上文件才列出，正在用的显示「断开」，其余显示「连接」）。
+func (u *UI) rebuildTrayMenu() {
+	menu := u.ni.ContextMenu()
+	_ = menu.Actions().Clear()
+
+	add := func(text string, onClick func()) {
+		a := walk.NewAction()
+		a.SetText(text)
+		a.Triggered().Attach(onClick)
+		menu.Actions().Add(a)
+	}
+
+	add("显示主窗口", u.showWindow)
+	menu.Actions().Add(walk.NewSeparatorAction())
+	add("连接 / 断开", u.onPrimary)
+
+	files := ListInviteFiles(u.app.RootDir())
+	if len(files) >= 2 {
+		running := u.app.Status().Running
+		current := u.app.CurrentSource()
+		if !running {
+			current = "" // 没连着就全部显示「连接」
+		}
+		menu.Actions().Add(walk.NewSeparatorAction())
+		for _, name := range files {
+			name := name
+			if name == current {
+				add("断开 "+name, func() {
+					go func() {
+						_ = u.app.Disconnect()
+						u.mw.Synchronize(u.refresh)
+					}()
+				})
+			} else {
+				add("连接 "+name, func() {
+					if u.adoptBusy {
+						return
+					}
+					u.adoptBusy = true
+					go func() {
+						if u.adoptByName(name) {
+							u.app.Log().Info(fmt.Sprintf("已切换到配置 %s", name))
+						}
+						u.adoptBusy = false
+						u.mw.Synchronize(u.refresh)
+					}()
+				})
+			}
+		}
+	}
+
+	menu.Actions().Add(walk.NewSeparatorAction())
+	add("导入连接码", u.onImport)
+	add("打开配置目录", u.onOpenConfigDir)
+	add("检查更新", u.onCheckUpdate)
+	menu.Actions().Add(walk.NewSeparatorAction())
+
+	autostart := walk.NewAction()
+	autostart.SetText("开机自启")
+	autostart.SetChecked(AutostartEnabled())
+	autostart.Triggered().Attach(func() {
+		go func() {
+			if autostart.Checked() {
+				_ = DisableAutostart()
+				autostart.SetChecked(false)
+			} else {
+				_ = EnableAutostart()
+				autostart.SetChecked(true)
+			}
+		}()
+	})
+	menu.Actions().Add(autostart)
+	menu.Actions().Add(walk.NewSeparatorAction())
+	add("退出", u.quit)
 }
 
 func (u *UI) showWindow() {
