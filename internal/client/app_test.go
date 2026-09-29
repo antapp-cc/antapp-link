@@ -52,7 +52,6 @@ func TestDirLayout(t *testing.T) {
 		{ConfigDir(root), filepath.Join(root, "config"), "ConfigDir"},
 		{LogsDir(root), filepath.Join(root, "logs"), "LogsDir"},
 		{RuntimeDir(root), filepath.Join(root, "data"), "RuntimeDir"},
-		{InviteFilePath(root), filepath.Join(root, "config", "pinode.antapp"), "InviteFilePath"},
 		{StatePath(root), filepath.Join(root, "data", "state.json"), "StatePath"},
 	}
 	for _, c := range cases {

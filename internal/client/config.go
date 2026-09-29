@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/antapp-cc/antapp-link/internal/pki"
@@ -40,50 +39,31 @@ func LoadInvite(pathOrCode string) (pki.Invite, error) {
 	return inv, nil
 }
 
-// InviteFileName 是连接码在 config\ 下的名字。
-//
-// 用 .antapp 而不是通用的 .conf：这个后缀已经关联到客户端，用户想手动换连接码时
-// 直接双击这个文件就行 —— 跟从别处拿到的连接码文件是同一种东西，没必要两套命名。
-// 名字与云服 invite 出的文件保持一致（pinode.antapp），用户复制过来不用改任何东西。
-const InviteFileName = "pinode.antapp"
-
-// legacyInviteFileName 是 0.2.0 之前的生效配置名，启动时迁移到新名字。
-const legacyInviteFileName = "node.antapp"
-
-// MigrateInviteFileName 把旧布局的 node.antapp 迁移成 pinode.antapp（只发生一次）。
-// 新名字已存在时不迁移 —— 那说明用户已经在新布局上工作，旧文件留作候选即可。
-func MigrateInviteFileName(root string) {
-	old := filepath.Join(ConfigDir(root), legacyInviteFileName)
-	if _, err := os.Stat(old); err != nil {
-		return
-	}
-	if _, err := os.Stat(InviteFilePath(root)); err == nil {
-		return
-	}
-	_ = os.Rename(old, InviteFilePath(root))
-}
-
-// InviteFilePath 是客户端保存连接码的位置。
-func InviteFilePath(root string) string { return filepath.Join(ConfigDir(root), InviteFileName) }
-
-// SaveInvite 把连接码存下来，这样下次启动不用再导入一次。
-func SaveInvite(root string, inv pki.Invite) error {
-	code, err := inv.Encode()
+// ImportInviteFile 把用户拿来的连接码文件原样复制进 config\（保留原文件名）。
+// 同名文件直接覆盖 —— 用户把同一个名字的文件换成新内容时，意图就是替换。
+// 返回落地的文件名。
+func ImportInviteFile(root, srcPath string) (string, error) {
+	raw, err := os.ReadFile(srcPath)
 	if err != nil {
-		return err
+		return "", err
 	}
+	return ImportInviteBytes(root, filepath.Base(srcPath), raw)
+}
+
+// ImportInviteBytes 把连接码内容以给定文件名写进 config\（剪贴板导入没有文件形态，用这个落盘）。
+func ImportInviteBytes(root, name string, raw []byte) (string, error) {
 	if err := os.MkdirAll(ConfigDir(root), 0o700); err != nil {
-		return err
+		return "", err
 	}
+	dst := filepath.Join(ConfigDir(root), name)
 	// 内含私钥，权限收紧
-	return os.WriteFile(InviteFilePath(root), []byte(code+"\n"), 0o600)
+	if err := os.WriteFile(dst, raw, 0o600); err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
-func LoadSavedInvite(root string) (pki.Invite, error) {
-	return LoadInvite(InviteFilePath(root))
-}
-
-// Candidate 是 config\ 里发现的一个候选连接码文件（不含当前生效的 node.antapp）。
+// Candidate 是 config\ 里发现的一个候选连接码文件。
 type Candidate struct {
 	File string
 	Inv  pki.Invite
@@ -100,7 +80,7 @@ func ScanInvites(root string) []Candidate {
 	}
 	var out []Candidate
 	for _, e := range entries {
-		if e.IsDir() || e.Name() == InviteFileName || !strings.EqualFold(filepath.Ext(e.Name()), ".antapp") {
+		if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".antapp") {
 			continue
 		}
 		inv, err := LoadInvite(filepath.Join(ConfigDir(root), e.Name()))
@@ -112,21 +92,62 @@ func ScanInvites(root string) []Candidate {
 	return out
 }
 
-// DuplicateNames 返回候选里出现两次及以上的客户端名。两个文件的节点名相同时
-// 没法凭名字区分谁是谁（服务端重签、手工复制都会造成），必须提醒用户自己挑。
-func DuplicateNames(cands []Candidate) []string {
-	count := map[string]int{}
+// NameDup 是一组同名的连接码文件。
+type NameDup struct {
+	Name  string   // 去掉 Windows 复制序号后的原始名
+	Files []string // 同名的文件名列表
+}
+
+// DuplicateFileNames 找出同名的文件组。
+//
+// 云服 invite 出的固定叫 pinode.antapp，用户复制几份进来就成了
+// pinode (2).antapp、pinode (3).antapp —— 去掉 Windows 的复制序号后名字相同，
+// 光看名字分不清谁是谁，必须提醒用户自己挑。
+func DuplicateFileNames(cands []Candidate) []NameDup {
+	groups := map[string][]string{}
+	var order []string
 	for _, c := range cands {
-		count[c.Inv.Name]++
+		n := normalizeCopyName(c.File)
+		if groups[n] == nil {
+			order = append(order, n)
+		}
+		groups[n] = append(groups[n], c.File)
 	}
-	var dups []string
-	for name, n := range count {
-		if n > 1 {
-			dups = append(dups, name)
+	var out []NameDup
+	for _, n := range order {
+		if len(groups[n]) > 1 {
+			out = append(out, NameDup{Name: n, Files: groups[n]})
 		}
 	}
-	sort.Strings(dups)
-	return dups
+	return out
+}
+
+// normalizeCopyName 去掉 Windows 复制粘贴加的「 (2)」序号：pinode (2).antapp → pinode.antapp。
+func normalizeCopyName(name string) string {
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	for {
+		i := strings.LastIndex(base, "(")
+		if i < 0 || !strings.HasSuffix(base, ")") {
+			break
+		}
+		inner := base[i+1 : len(base)-1]
+		if inner == "" {
+			break
+		}
+		allDigits := true
+		for _, r := range inner {
+			if r < '0' || r > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if !allDigits {
+			break
+		}
+		base = strings.TrimSpace(base[:i])
+	}
+	return base + ext
 }
 
 // HasAlternateInvites 报告 config\ 里是否存在与 inv 不同的候选连接码。

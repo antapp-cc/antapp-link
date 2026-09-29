@@ -477,10 +477,10 @@ func (u *UI) adoptFromConfigDir() {
 		return
 	}
 
-	if dups := DuplicateNames(fresh); len(dups) > 0 {
+	if dups := DuplicateFileNames(fresh); len(dups) > 0 {
 		walk.MsgBox(u.mw, "检测到同名配置",
-			fmt.Sprintf("config 文件夹里有 %d 个同名的配置（%s）。\n\n它们无法凭名字区分，请在下面的列表里选择要使用的；多余的建议删掉。",
-				len(dups), strings.Join(dups, "、")),
+			fmt.Sprintf("config 文件夹里有多个同名的文件：%s。\n\n名字一样分不清谁是谁，请在下面的列表里选择要使用的；多余的建议删掉。",
+				strings.Join(dups[0].Files, "、")),
 			walk.MsgBoxIconWarning)
 	}
 	c, _, ok := u.pickFromAll(pki.Invite{}, fresh)
@@ -958,10 +958,10 @@ func (u *UI) resolveFromConfigDir() {
 	if len(cands) == 1 {
 		c = cands[0]
 	} else {
-		if dups := DuplicateNames(cands); len(dups) > 0 {
+		if dups := DuplicateFileNames(cands); len(dups) > 0 {
 			walk.MsgBox(u.mw, "检测到同名配置",
-				fmt.Sprintf("config 文件夹里有 %d 个同名的配置（%s）。\n\n它们无法凭名字区分，请在下面的列表里选择要使用的；多余的建议删掉。",
-					len(dups), strings.Join(dups, "、")),
+				fmt.Sprintf("config 文件夹里有多个同名的文件：%s。\n\n名字一样分不清谁是谁，请在下面的列表里选择要使用的；多余的建议删掉。",
+					strings.Join(dups[0].Files, "、")),
 				walk.MsgBoxIconWarning)
 		}
 		picked, _, ok := u.pickFromAll(pki.Invite{}, cands)

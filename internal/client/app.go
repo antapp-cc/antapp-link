@@ -568,6 +568,13 @@ func (a *App) CurrentInvite() pki.Invite {
 	return a.inv
 }
 
+// CurrentSource 返回当前连接码的来源描述（文件名或「剪贴板粘贴」），日志和列表标注用。
+func (a *App) CurrentSource() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.invSource
+}
+
 // ---------- 在线更新 ----------
 
 // CheckUpdate 询问更新源。返回 nil 表示已经是最新。
