@@ -538,28 +538,39 @@ func (u *UI) pickFromAll(active pki.Invite, cands []Candidate) (Candidate, bool,
 
 	var dlg *walk.Dialog
 	var lb *walk.ListBox
+	var btnOK *walk.PushButton
 	chosen := false
+	pick := func() {
+		if lb.CurrentIndex() >= 0 {
+			chosen = true
+			dlg.Accept()
+		}
+	}
 	if err := (Dialog{
 		AssignTo: &dlg,
 		Title:    "选择要使用的配置",
 		MinSize:  Size{Width: 500, Height: 300},
 		Layout:   VBox{Margins: Margins{Left: 16, Top: 16, Right: 16, Bottom: 16}, Spacing: 10},
 		Children: []Widget{
-			Label{Text: "config 文件夹里有多个连接码，请选择要使用的："},
-			ListBox{AssignTo: &lb, Model: items},
+			Label{Text: "config 文件夹里有多个连接码，单击选中一行，再点下面的按钮；双击行直接使用："},
+			ListBox{
+				AssignTo: &lb,
+				Model:    items,
+				OnCurrentIndexChanged: func() {
+					btnOK.SetEnabled(lb.CurrentIndex() >= 0)
+				},
+				OnItemActivated: pick, // 双击行直接采用
+			},
 			Composite{
 				Layout: HBox{MarginsZero: true, Spacing: 8},
 				Children: []Widget{
 					HSpacer{},
 					PushButton{
-						Text:    "使用选中的",
-						MinSize: Size{Width: 110},
-						OnClicked: func() {
-							if lb.CurrentIndex() >= 0 {
-								chosen = true
-								dlg.Accept()
-							}
-						},
+						AssignTo:  &btnOK,
+						Text:      "使用选中的",
+						MinSize:   Size{Width: 110},
+						Enabled:   false, // 没选中行之前禁用，防止误提交默认行
+						OnClicked: pick,
 					},
 					PushButton{Text: "取消", MinSize: Size{Width: 80}, OnClicked: func() { dlg.Cancel() }},
 				},
@@ -933,11 +944,13 @@ func (u *UI) applyUpdate(newExe string) {
 // 误点代价太大。改由安装目录里的「卸载 AntApp Link」快捷方式承担。
 
 // onSwitchConfig 手动切换配置文件：弹全量列表（含当前生效项，标注「当前使用」）。
-// 菜单项只在 config 里存在不同配置时可点，这里再防御一次避免竞态。
+// 菜单项只在 config 里存在不同配置时可点；adoptBusy 与自动识别互斥，防两个框并发。
 func (u *UI) onSwitchConfig() {
 	if u.adoptBusy || !HasAlternateInvites(u.app.RootDir(), u.app.CurrentInvite()) {
 		return
 	}
+	u.adoptBusy = true
+	defer func() { u.adoptBusy = false }()
 	c, changed, ok := u.pickFromAll(u.app.CurrentInvite(), ScanInvites(u.app.RootDir()))
 	u.markSeen(ScanInvites(u.app.RootDir()))
 	if !ok || !changed {
