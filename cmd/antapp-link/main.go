@@ -96,6 +96,9 @@ func run() int {
 		// 正常双击启动走不到这里。
 		logger.Info("联调模式：只建隧道、只配网卡，不改路由与 DNS")
 	}
+	// 清掉上次在线更新留下的旧程序备份（更新时正在运行删不掉，新进程里删才删得动）
+	update.CleanupOld()
+
 	app := client.NewApp(inv, dataDir, logger, opts...)
 
 	// 上次没干净退出的话，先把网络修回来再谈连接。
