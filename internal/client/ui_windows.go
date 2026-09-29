@@ -50,6 +50,10 @@ type UI struct {
 	mw *walk.MainWindow
 	ni *walk.NotifyIcon
 
+	// 托盘菜单里的动态配置区（OpenVPN 式：每个 .antapp 一项，点谁连谁）
+	mImport    *walk.Action
+	cfgActions []*walk.Action
+
 	// 托盘菜单里的「切换配置文件」：可点状态跟着 config 里的候选变化刷新
 	mSwitchCfg *walk.Action
 
@@ -305,23 +309,14 @@ func (u *UI) buildTray() error {
 	mToggle.Triggered().Attach(u.onPrimary)
 	ni.ContextMenu().Actions().Add(mToggle)
 
-	mImport := walk.NewAction()
-	_ = mImport.SetText("导入连接码")
-	mImport.Triggered().Attach(u.onImport)
-	ni.ContextMenu().Actions().Add(mImport)
+	u.mImport = walk.NewAction()
+	_ = u.mImport.SetText("导入连接码")
+	u.mImport.Triggered().Attach(u.onImport)
+	ni.ContextMenu().Actions().Add(u.mImport)
 
-	// 切换配置文件：config 里有多个不同的配置才可点（状态在菜单弹出前刷新）
-	mSwitchCfg := walk.NewAction()
-	_ = mSwitchCfg.SetText("切换配置文件")
-	mSwitchCfg.SetEnabled(HasMultipleInvites(u.app.RootDir()))
-	mSwitchCfg.Triggered().Attach(u.onSwitchConfig)
-	ni.ContextMenu().Actions().Add(mSwitchCfg)
-	u.mSwitchCfg = mSwitchCfg
-	ni.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
-		if button == walk.RightButton {
-			u.mSwitchCfg.SetEnabled(HasMultipleInvites(u.app.RootDir()))
-		}
-	})
+	// 动态配置区（OpenVPN 式）：config\ 里每个 .antapp 一项，点谁连谁。
+	// 右键菜单每次弹出前刷新，文件数量与名称始终与文件夹一致。
+	u.rebuildConfigMenu()
 
 	mOpenDir := walk.NewAction()
 	_ = mOpenDir.SetText("打开配置目录")
@@ -859,7 +854,52 @@ func (u *UI) resolveFromConfigDir() {
 	}
 }
 
-// onSwitchConfig 手动切换配置文件：弹全量列表（含当前生效项，标注「当前使用」）。
+// rebuildConfigMenu 重建托盘菜单里的动态配置区：config\ 里每个 .antapp 一项。
+// 正在用的显示「断开 xxx」，其余显示「连接 xxx」—— 点谁连谁，和 OpenVPN GUI 一样。
+func (u *UI) rebuildConfigMenu() {
+	actions := u.ni.ContextMenu().Actions()
+	for _, a := range u.cfgActions {
+		actions.Remove(a)
+	}
+	u.cfgActions = nil
+
+	insertAt := actions.Index(u.mImport)
+	running := u.app.Status().Running
+	current := u.app.CurrentSource()
+	if !running {
+		current = ""
+	}
+
+	for _, name := range ListInviteFiles(u.app.RootDir()) {
+		a := walk.NewAction()
+		name := name
+		if name == current {
+			_ = a.SetText("断开 " + name)
+			a.Triggered().Attach(func() {
+				go func() {
+					_ = u.app.Disconnect()
+					u.mw.Synchronize(u.refresh)
+				}()
+			})
+		} else {
+			_ = a.SetText("连接 " + name)
+			a.Triggered().Attach(func() {
+				if u.busyOp != "" {
+					return
+				}
+				if u.adoptByName(name) {
+					u.app.Log().Info(fmt.Sprintf("已切换到配置 %s", name))
+				}
+			})
+		}
+		if err := actions.Insert(insertAt, a); err != nil {
+			return
+		}
+		insertAt++
+		u.cfgActions = append(u.cfgActions, a)
+	}
+}
+
 // 菜单项只在 config 里存在不同配置时可点；adoptBusy 与自动识别互斥，防两个框并发。
 func (u *UI) onSwitchConfig() {
 	if u.adoptBusy || !HasMultipleInvites(u.app.RootDir()) {
