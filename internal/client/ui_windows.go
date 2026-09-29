@@ -271,7 +271,7 @@ func (u *UI) watchInvite() {
 			continue
 		}
 		u.app.Log().Info("检测到新的连接码，重新连接",
-			"file", InviteFileName, "server", inv.Server, "name", inv.Name)
+			"file", InviteFileName, "server", inv.Server)
 
 		go func() {
 			_ = u.app.Connect()
