@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/antapp-cc/antapp-link/internal/pki"
@@ -63,4 +64,50 @@ func SaveInvite(root string, inv pki.Invite) error {
 
 func LoadSavedInvite(root string) (pki.Invite, error) {
 	return LoadInvite(InviteFilePath(root))
+}
+
+// Candidate 是 config\ 里发现的一个候选连接码文件（不含当前生效的 node.antapp）。
+type Candidate struct {
+	File string
+	Inv  pki.Invite
+}
+
+// ScanInvites 扫描 config\ 下除生效配置外的全部 .antapp 文件。
+//
+// 解析失败的条目安静地跳过 —— 用户可能把别的东西也拖进这个文件夹，
+// 为它报错弹窗比直接无视更吵。
+func ScanInvites(root string) []Candidate {
+	entries, err := os.ReadDir(ConfigDir(root))
+	if err != nil {
+		return nil
+	}
+	var out []Candidate
+	for _, e := range entries {
+		if e.IsDir() || e.Name() == InviteFileName || !strings.EqualFold(filepath.Ext(e.Name()), ".antapp") {
+			continue
+		}
+		inv, err := LoadInvite(filepath.Join(ConfigDir(root), e.Name()))
+		if err != nil {
+			continue
+		}
+		out = append(out, Candidate{File: e.Name(), Inv: inv})
+	}
+	return out
+}
+
+// DuplicateNames 返回候选里出现两次及以上的客户端名。两个文件的节点名相同时
+// 没法凭名字区分谁是谁（服务端重签、手工复制都会造成），必须提醒用户自己挑。
+func DuplicateNames(cands []Candidate) []string {
+	count := map[string]int{}
+	for _, c := range cands {
+		count[c.Inv.Name]++
+	}
+	var dups []string
+	for name, n := range count {
+		if n > 1 {
+			dups = append(dups, name)
+		}
+	}
+	sort.Strings(dups)
+	return dups
 }

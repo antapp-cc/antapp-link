@@ -68,6 +68,12 @@ type UI struct {
 	done          chan struct{}
 	pending       *update.Manifest
 
+	// config 文件夹自动识别：未配置状态下低频扫描，发现候选就采用/弹选择框。
+	// adoptBusy 防止选择框弹着的时候又进来一次；取消后静默一会儿再扫。
+	scanTicks   int
+	adoptBusy   bool
+	suppressTil time.Time
+
 	// busyOp 非空表示一次连接/断开在跑。只允许 UI 线程读写：
 	// 点按钮立刻置上并渲染「连接中/断开中」，操作结束在 Synchronize 里清掉。
 	// 值为 "connect" / "disconnect" / "reconnect"。
@@ -349,9 +355,120 @@ func (u *UI) refreshLoop() {
 			return
 		case <-ticker.C:
 			// walk 要求所有控件操作回到主线程
-			u.mw.Synchronize(u.refresh)
+			u.mw.Synchronize(func() {
+				u.refresh()
+				// 未配置时低频扫 config 文件夹：用户把 pinode.antapp 拖进去，
+				// 不用重启客户端几秒内就能被识别
+				u.scanTicks++
+				if u.scanTicks%3 == 0 {
+					u.adoptFromConfigDir()
+				}
+			})
 		}
 	}
+}
+
+// adoptFromConfigDir 在未配置状态下识别 config\*.antapp（pinode.antapp 这类）：
+// 恰好一个直接采用；多个先提示同名冲突，再弹列表让用户挑。
+func (u *UI) adoptFromConfigDir() {
+	if u.adoptBusy || u.app.Configured() || time.Now().Before(u.suppressTil) {
+		return
+	}
+	cands := ScanInvites(u.app.RootDir())
+	if len(cands) == 0 {
+		return
+	}
+	u.adoptBusy = true
+	defer func() { u.adoptBusy = false }()
+
+	if len(cands) == 1 {
+		c := cands[0]
+		if u.adoptCandidate(c) {
+			u.app.Log().Info(fmt.Sprintf("已自动识别 config 文件夹里的配置 %s（节点 %s，服务端 %s）",
+				c.File, c.Inv.Name, c.Inv.Server))
+		}
+		return
+	}
+
+	if dups := DuplicateNames(cands); len(dups) > 0 {
+		walk.MsgBox(u.mw, "检测到同名配置",
+			fmt.Sprintf("config 文件夹里有 %d 个同名的配置（%s）。\n\n它们无法凭名字区分，请在下面的列表里选择要使用的；多余的建议删掉。",
+				len(dups), strings.Join(dups, "、")),
+			walk.MsgBoxIconWarning)
+	}
+	c, ok := u.pickCandidate(cands)
+	if !ok {
+		u.suppressTil = time.Now().Add(30 * time.Second)
+		return
+	}
+	if u.adoptCandidate(c) {
+		u.app.Log().Info(fmt.Sprintf("已选用配置 %s（节点 %s，服务端 %s）", c.File, c.Inv.Name, c.Inv.Server))
+	}
+}
+
+// adoptCandidate 把候选写入生效配置并切换。返回是否成功。
+func (u *UI) adoptCandidate(c Candidate) bool {
+	if err := SaveInvite(u.app.RootDir(), c.Inv); err != nil {
+		u.alert("采用配置文件失败", err.Error())
+		return false
+	}
+	if err := u.app.UpdateInvite(c.Inv); err != nil {
+		u.alert("切换配置失败", err.Error())
+		return false
+	}
+	u.refresh()
+	return true
+}
+
+// pickCandidate 弹出选择列表。返回用户选中的候选；取消时 ok=false。
+func (u *UI) pickCandidate(cands []Candidate) (Candidate, bool) {
+	items := make([]string, len(cands))
+	for i, c := range cands {
+		items[i] = fmt.Sprintf("%s　—　%s　（%s）", c.Inv.Name, c.Inv.Server, c.File)
+	}
+
+	var dlg *walk.Dialog
+	var lb *walk.ListBox
+	chosen := false
+	if err := (Dialog{
+		AssignTo: &dlg,
+		Title:    "检测到多个配置文件",
+		MinSize:  Size{Width: 500, Height: 300},
+		Layout:   VBox{Margins: Margins{Left: 16, Top: 16, Right: 16, Bottom: 16}, Spacing: 10},
+		Children: []Widget{
+			Label{Text: "config 文件夹里有多个连接码，请选择要使用的："},
+			ListBox{AssignTo: &lb, Model: items},
+			Composite{
+				Layout: HBox{MarginsZero: true, Spacing: 8},
+				Children: []Widget{
+					HSpacer{},
+					PushButton{
+						Text:    "使用选中的",
+						MinSize: Size{Width: 110},
+						OnClicked: func() {
+							if lb.CurrentIndex() >= 0 {
+								chosen = true
+								dlg.Accept()
+							}
+						},
+					},
+					PushButton{Text: "取消", MinSize: Size{Width: 80}, OnClicked: func() { dlg.Cancel() }},
+				},
+			},
+		},
+	}).Create(u.mw); err != nil {
+		u.alert("无法显示选择窗口", err.Error())
+		return Candidate{}, false
+	}
+	dlg.Run()
+	if !chosen {
+		return Candidate{}, false
+	}
+	idx := lb.CurrentIndex()
+	if idx < 0 || idx >= len(cands) {
+		return Candidate{}, false
+	}
+	return cands[idx], true
 }
 
 func (u *UI) refresh() {
