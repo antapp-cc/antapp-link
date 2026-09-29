@@ -1,6 +1,7 @@
 package client
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,79 +25,65 @@ func makeInvite(t *testing.T, name string) pki.Invite {
 	return inv
 }
 
-func writeInvite(t *testing.T, root, name string, inv pki.Invite) {
+func writeInviteFile(t *testing.T, root, name string, inv pki.Invite) {
 	t.Helper()
-	code, err := inv.Encode()
+	// 与服务端 invite 的产物一致：JSON 格式
+	code, err := json.Marshal(inv)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(ConfigDir(root), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(ConfigDir(root), name), []byte(code+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(ConfigDir(root), name), code, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestScanInvites(t *testing.T) {
+func TestListInviteFiles(t *testing.T) {
 	root := t.TempDir()
-	writeInvite(t, root, "pinode (2).antapp", makeInvite(t, "pi-node-01"))
-	writeInvite(t, root, "other.antapp", makeInvite(t, "pi-node-02"))
-	// 非 .antapp 的文件不算候选
+	writeInviteFile(t, root, "pinode (3).antapp", makeInvite(t, "pi-node-01"))
+	writeInviteFile(t, root, "pinode (2).antapp", makeInvite(t, "pi-node-01"))
+	writeInviteFile(t, root, "other.antapp", makeInvite(t, "pi-node-02"))
 	if err := os.WriteFile(filepath.Join(ConfigDir(root), "readme.txt"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	got := ScanInvites(root)
-	if len(got) != 2 {
-		t.Fatalf("应发现 2 个候选（排除生效配置），实际 %d", len(got))
-	}
-	// 两个候选的节点名相同 → 同名检测
-	dups := DuplicateFileNames(got)
-	if len(dups) != 0 {
-		t.Fatalf("不同文件名的候选不应报同名: %v", dups)
+	got := ListInviteFiles(root)
+	if len(got) != 3 {
+		t.Fatalf("应列出 3 个 .antapp 文件，实际 %v", got)
 	}
 }
 
-func TestScanInvitesDuplicateNames(t *testing.T) {
-	root := t.TempDir()
-	writeInvite(t, root, "pinode (3).antapp", makeInvite(t, "pi-node-01"))
-	writeInvite(t, root, "pinode (2).antapp", makeInvite(t, "pi-node-01"))
-
-	got := ScanInvites(root)
-	if len(got) != 2 {
-		t.Fatalf("应发现 2 个候选，实际 %d", len(got))
+func TestListInviteFilesEmpty(t *testing.T) {
+	if got := ListInviteFiles(t.TempDir()); len(got) != 0 {
+		t.Fatalf("空目录应返回 0 个，实际 %v", got)
 	}
-	// 两个文件的节点名都是 pi-node-01，但按文件名判重：pinode (2)/(3) 都是
-	// pinode.antapp 的 Windows 复制副本，去掉序号后同名 → 应检出
-	dups := DuplicateFileNames(got)
+}
+
+func TestDuplicateFileNames(t *testing.T) {
+	// pinode (2)/(3) 去掉 Windows 复制序号后同名 → 检出一组
+	names := []string{"pinode (2).antapp", "pinode (3).antapp"}
+	dups := DuplicateFileNames(names)
 	if len(dups) != 1 || dups[0].Name != "pinode.antapp" || len(dups[0].Files) != 2 {
-		t.Fatalf("应检出同名文件组 pinode.antapp×2，实际 %+v", dups)
+		t.Fatalf("应检出同名组 pinode.antapp×2，实际 %+v", dups)
 	}
 
-	// Windows 复制产生的真·同名：pinode.antapp + pinode (2).antapp
-	writeInvite(t, root, "pinode.antapp", makeInvite(t, "pi-node-01"))
-	dups = DuplicateFileNames(ScanInvites(root))
-	if len(dups) != 1 || dups[0].Name != "pinode.antapp" || len(dups[0].Files) != 3 {
-		t.Fatalf("应检出同名文件组 pinode.antapp×3，实际 %+v", dups)
+	// 不同文件名不报同名
+	if dups := DuplicateFileNames([]string{"a.antapp", "b.antapp"}); len(dups) != 0 {
+		t.Fatalf("不同文件名不应报同名: %+v", dups)
 	}
 }
 
-func TestScanInvitesEmpty(t *testing.T) {
-	if got := ScanInvites(t.TempDir()); len(got) != 0 {
-		t.Fatalf("空目录应返回 0 个候选，实际 %d", len(got))
-	}
-}
-
-func TestScanInvitesSingleAdoptable(t *testing.T) {
+func TestLoadInviteFile(t *testing.T) {
 	root := t.TempDir()
-	writeInvite(t, root, "pinode (2).antapp", makeInvite(t, "pi-node-02"))
+	writeInviteFile(t, root, "pinode.antapp", makeInvite(t, "pi-node-02"))
 
-	got := ScanInvites(root)
-	if len(got) != 1 || got[0].File != "pinode (2).antapp" || got[0].Inv.Name != "pi-node-02" {
-		t.Fatalf("单候选识别错误: %+v", got)
+	inv, err := LoadInviteFile(root, "pinode.antapp")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if dups := DuplicateFileNames(got); len(dups) != 0 {
-		t.Fatalf("单候选不应有同名: %v", dups)
+	if inv.Name != "pi-node-02" {
+		t.Fatalf("加载到的节点名错误: %s", inv.Name)
 	}
 }

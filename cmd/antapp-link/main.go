@@ -4,7 +4,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -78,32 +77,17 @@ func run() int {
 	defer closeLog()
 
 	if inviteArg != "" {
-		inv, err := client.LoadInvite(inviteArg)
-		if err != nil {
-			logger.Error("连接码无法解析", "err", err)
-			client.ShowMessage("AntApp Link", "连接码无法解析：\n"+err.Error())
+		if _, err := client.ImportInviteFile(dataDir, inviteArg); err != nil {
+			logger.Error("导入连接码失败", "err", err)
+			client.ShowMessage("AntApp Link", "导入连接码失败："+err.Error())
 			return 1
 		}
-		if err := client.SaveInvite(dataDir, inv); err != nil {
-			logger.Error("保存连接码失败", "err", err)
-			client.ShowMessage("AntApp Link", "保存连接码失败："+err.Error())
-			return 1
-		}
-		logger.Info("已导入连接码", "server", inv.Server, "name", inv.Name)
+		logger.Info("已导入连接码文件", "file", filepath.Base(inviteArg))
 	}
 
-	// 没有连接码不是错误：界面照样起来，引导用户在界面上导入。
-	// 装完之后直接弹个框退出，用户等于看不到这个软件。
-	client.MigrateInviteFileName(dataDir)
-	inv, err := client.LoadSavedInvite(dataDir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			logger.Warn("config 里还没有生效的连接码（pinode.antapp），等待导入或自动识别")
-		} else {
-			logger.Warn("生效的连接码读取失败", "err", err)
-		}
-		inv = pki.Invite{}
-	}
+	// 连接码不在这里加载：App 以「未配置」状态启动，由界面扫描 config\*.antapp
+	// 决定用哪个 —— 一个直接用，多个让用户挑，客户端不记录上次连的是哪个。
+	inv := pki.Invite{}
 
 	var opts []client.Option
 	if *noNetCfg {
@@ -123,6 +107,21 @@ func run() int {
 	}
 
 	if *once {
+		// 命令行一次性模式：config 里必须恰好有一个连接码文件（联调用，不做选择界面）
+		cands := client.ListInviteFiles(dataDir)
+		if len(cands) != 1 {
+			fmt.Fprintf(os.Stderr, "config 里需要恰好一个 .antapp 连接码文件，实际 %d 个\n", len(cands))
+			return 1
+		}
+		inv, err := client.LoadInviteFile(dataDir, cands[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "读取连接码失败: %v\n", err)
+			return 1
+		}
+		if err := app.UpdateInvite(inv, cands[0]); err != nil {
+			fmt.Fprintf(os.Stderr, "连接失败: %v\n", err)
+			return 1
+		}
 		if err := app.Connect(); err != nil {
 			fmt.Fprintf(os.Stderr, "连接失败: %v\n", err)
 			return 1
@@ -133,16 +132,7 @@ func run() int {
 		return 0
 	}
 
-	if app.Configured() {
-		// config 里摆着多个不同的配置时别自作主张：先让用户在界面上挑，
-		// 挑完由界面发起连接 —— 否则可能连到别人正在用的那台。
-		if client.HasAlternateInvites(dataDir, inv) {
-			logger.Warn("检测到多个不同的配置文件，等待用户选择后再连接")
-		} else if err := app.Connect(); err != nil {
-			// 连不上也要把界面显示出来，用户可以改连接码或看日志
-			logger.Warn("自动连接失败，界面仍可用", "err", err)
-		}
-	}
+	// 连不连、连哪个，由界面扫描 config\*.antapp 决定：一个直接连，多个弹窗让用户挑。
 	if err := client.RunUI(app, logs, dataDir); err != nil {
 		logger.Error("界面启动失败", "err", err)
 		client.ShowMessage("AntApp Link", "界面启动失败："+err.Error())
@@ -151,19 +141,16 @@ func run() int {
 	return 0
 }
 
-// importInviteQuietly 把连接码写进 config\，不做界面反馈。
+// importInviteQuietly 把连接码文件原样复制进 config\，不做界面反馈。
 //
 // 用在「客户端已经在跑，用户又双击了一个 .antapp 文件」这条路径上：
-// 本进程只负责把文件落到正确位置，正在跑的那个实例会自己发现并重载。
+// 本进程只负责把文件落到正确位置，正在跑的那个实例会自己发现并弹出让用户确认。
 func importInviteQuietly(rootDir, arg string) {
-	inv, err := client.LoadInvite(arg)
-	if err != nil {
-		client.ShowMessage("AntApp Link", "连接码无法解析：\n"+err.Error())
+	if _, err := client.ImportInviteFile(rootDir, arg); err != nil {
+		client.ShowMessage("AntApp Link", "导入连接码失败："+err.Error())
 		return
 	}
-	if err := client.SaveInvite(rootDir, inv); err != nil {
-		client.ShowMessage("AntApp Link", "保存连接码失败："+err.Error())
-	}
+	client.ShowMessage("AntApp Link", "已导入连接码文件，正在运行的客户端会弹出选择窗口")
 }
 
 // defaultRootDir 是客户端的工作根目录：程序自己所在的目录（安装后就是

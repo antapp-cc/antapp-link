@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/antapp-cc/antapp-link/internal/pki"
@@ -63,33 +64,27 @@ func ImportInviteBytes(root, name string, raw []byte) (string, error) {
 	return name, nil
 }
 
-// Candidate 是 config\ 里发现的一个候选连接码文件。
-type Candidate struct {
-	File string
-	Inv  pki.Invite
-}
-
-// ScanInvites 扫描 config\ 下除生效配置外的全部 .antapp 文件。
-//
-// 解析失败的条目安静地跳过 —— 用户可能把别的东西也拖进这个文件夹，
-// 为它报错弹窗比直接无视更吵。
-func ScanInvites(root string) []Candidate {
+// ListInviteFiles 列出 config\ 里的全部 .antapp 文件名（按名字排序）。
+// 只看文件名，不读内容 —— 文件名就是配置的身份，连接时才读选中的那个。
+func ListInviteFiles(root string) []string {
 	entries, err := os.ReadDir(ConfigDir(root))
 	if err != nil {
 		return nil
 	}
-	var out []Candidate
+	var out []string
 	for _, e := range entries {
 		if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".antapp") {
 			continue
 		}
-		inv, err := LoadInvite(filepath.Join(ConfigDir(root), e.Name()))
-		if err != nil {
-			continue
-		}
-		out = append(out, Candidate{File: e.Name(), Inv: inv})
+		out = append(out, e.Name())
 	}
+	sort.Strings(out)
 	return out
+}
+
+// LoadInviteFile 按 config\ 里的文件名加载连接码。
+func LoadInviteFile(root, name string) (pki.Invite, error) {
+	return LoadInvite(filepath.Join(ConfigDir(root), name))
 }
 
 // NameDup 是一组同名的连接码文件。
@@ -103,20 +98,20 @@ type NameDup struct {
 // 云服 invite 出的固定叫 pinode.antapp，用户复制几份进来就成了
 // pinode (2).antapp、pinode (3).antapp —— 去掉 Windows 的复制序号后名字相同，
 // 光看名字分不清谁是谁，必须提醒用户自己挑。
-func DuplicateFileNames(cands []Candidate) []NameDup {
+func DuplicateFileNames(names []string) []NameDup {
 	groups := map[string][]string{}
 	var order []string
-	for _, c := range cands {
-		n := normalizeCopyName(c.File)
-		if groups[n] == nil {
-			order = append(order, n)
+	for _, n := range names {
+		k := normalizeCopyName(n)
+		if groups[k] == nil {
+			order = append(order, k)
 		}
-		groups[n] = append(groups[n], c.File)
+		groups[k] = append(groups[k], n)
 	}
 	var out []NameDup
-	for _, n := range order {
-		if len(groups[n]) > 1 {
-			out = append(out, NameDup{Name: n, Files: groups[n]})
+	for _, k := range order {
+		if len(groups[k]) > 1 {
+			out = append(out, NameDup{Name: k, Files: groups[k]})
 		}
 	}
 	return out
@@ -150,18 +145,8 @@ func normalizeCopyName(name string) string {
 	return base + ext
 }
 
-// HasAlternateInvites 报告 config\ 里是否存在与 inv 不同的候选连接码。
-// 有就说明用户面前摆着多个选择，客户端不该自作主张用哪一个。
-func HasAlternateInvites(root string, inv pki.Invite) bool {
-	cands := ScanInvites(root)
-	code, err := inv.Encode()
-	if err != nil {
-		return len(cands) > 0
-	}
-	for _, c := range cands {
-		if ccode, err := c.Inv.Encode(); err == nil && ccode != code {
-			return true
-		}
-	}
-	return false
+// HasMultipleInvites 报告 config\ 里是否有两个及以上的连接码文件。
+// 有就必须让用户挑，客户端不该自作主张用哪一个。
+func HasMultipleInvites(root string) bool {
+	return len(ListInviteFiles(root)) >= 2
 }

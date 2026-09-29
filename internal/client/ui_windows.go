@@ -19,7 +19,6 @@ import (
 	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
 
-	"github.com/antapp-cc/antapp-link/internal/pki"
 	"github.com/antapp-cc/antapp-link/internal/setup"
 	"github.com/antapp-cc/antapp-link/internal/update"
 )
@@ -232,11 +231,12 @@ func (u *UI) build() error {
 // 用户在客户端已经运行时双击一个 .antapp 文件，那个新进程只会把文件复制进 config\
 // 然后退出（单实例闸门挡着）。真正的切换得由这条链完成 —— 否则双击看起来毫无反应。
 func (u *UI) watchInvite() {
-	snapshot := func() map[string]bool {
-		now := map[string]bool{}
-		for _, c := range ScanInvites(u.app.RootDir()) {
-			if code, err := c.Inv.Encode(); err == nil {
-				now[c.File+" "+code] = true
+	snapshot := func() map[string]time.Time {
+		now := map[string]time.Time{}
+		for _, name := range ListInviteFiles(u.app.RootDir()) {
+			path := filepath.Join(ConfigDir(u.app.RootDir()), name)
+			if st, err := os.Stat(path); err == nil {
+				now[name] = st.ModTime()
 			}
 		}
 		return now
@@ -251,15 +251,13 @@ func (u *UI) watchInvite() {
 		}
 
 		now := snapshot()
-		changed := false
-		for key := range now {
-			if !last[key] {
-				changed = true
-			}
-		}
-		for key := range last {
-			if !now[key] {
-				changed = true // 删了文件也算变化，值得让用户知道
+		changed := len(now) != len(last)
+		if !changed {
+			for name, mod := range now {
+				if last[name] != mod {
+					changed = true
+					break
+				}
 			}
 		}
 		if !changed {
@@ -315,13 +313,13 @@ func (u *UI) buildTray() error {
 	// 切换配置文件：config 里有多个不同的配置才可点（状态在菜单弹出前刷新）
 	mSwitchCfg := walk.NewAction()
 	_ = mSwitchCfg.SetText("切换配置文件")
-	mSwitchCfg.SetEnabled(HasAlternateInvites(u.app.RootDir(), u.app.CurrentInvite()))
+	mSwitchCfg.SetEnabled(HasMultipleInvites(u.app.RootDir()))
 	mSwitchCfg.Triggered().Attach(u.onSwitchConfig)
 	ni.ContextMenu().Actions().Add(mSwitchCfg)
 	u.mSwitchCfg = mSwitchCfg
 	ni.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
 		if button == walk.RightButton {
-			u.mSwitchCfg.SetEnabled(HasAlternateInvites(u.app.RootDir(), u.app.CurrentInvite()))
+			u.mSwitchCfg.SetEnabled(HasMultipleInvites(u.app.RootDir()))
 		}
 	})
 
@@ -387,10 +385,15 @@ func (u *UI) refreshLoop() {
 	}
 }
 
-// adoptCandidate 采用候选并按它重连。用户的文件保持原名原内容不动 ——
-// 客户端只读它，不复制不改名。返回是否成功。
-func (u *UI) adoptCandidate(c Candidate) bool {
-	if err := u.app.UpdateInvite(c.Inv, c.File); err != nil {
+// adoptCandidate 按文件名采用配置并重连。用户的文件保持原名原内容不动 ——
+// 客户端只在连接时读它，不复制不改名。返回是否成功。
+func (u *UI) adoptByName(name string) bool {
+	inv, err := LoadInviteFile(u.app.RootDir(), name)
+	if err != nil {
+		u.alert("读取连接码文件失败", err.Error())
+		return false
+	}
+	if err := u.app.UpdateInvite(inv, name); err != nil {
 		u.alert("切换配置失败", err.Error())
 		return false
 	}
@@ -402,22 +405,12 @@ func (u *UI) adoptCandidate(c Candidate) bool {
 	return true
 }
 
-// pickFromAll 弹出配置选择列表：文件名为主（云服签发的节点名全都是
-// pi-node-01，区分不了），服务器辅助。active 非零时列表首位放当前生效的
-// 配置并标注「当前使用」，返回值会说明用户是否改选了别的。
-func (u *UI) pickFromAll(active pki.Invite, cands []Candidate) (Candidate, bool, bool) {
-	activeCode, _ := active.Encode()
-	all := cands
-	if active.Server != "" {
-		all = append([]Candidate{{File: u.app.CurrentSource(), Inv: active}}, cands...)
-	}
-
-	items := make([]string, len(all))
-	for i, c := range all {
-		items[i] = c.File + "　—　" + c.Inv.Server
-		if code, err := c.Inv.Encode(); err == nil && code == activeCode {
-			items[i] += "　（当前使用）"
-		}
+// pickConfig 弹出配置选择列表：只显示文件名（用户要求只看文件名）。
+// currentSource 非空时列表首位放当前正在用的文件并标注；返回选中的文件名。
+func (u *UI) pickConfig(currentSource string, names []string) (string, bool) {
+	all := names
+	if currentSource != "" {
+		all = append([]string{currentSource}, names...)
 	}
 
 	var dlg *walk.Dialog
@@ -433,13 +426,13 @@ func (u *UI) pickFromAll(active pki.Invite, cands []Candidate) (Candidate, bool,
 	if err := (Dialog{
 		AssignTo: &dlg,
 		Title:    "选择要使用的配置",
-		MinSize:  Size{Width: 500, Height: 300},
+		MinSize:  Size{Width: 460, Height: 300},
 		Layout:   VBox{Margins: Margins{Left: 16, Top: 16, Right: 16, Bottom: 16}, Spacing: 10},
 		Children: []Widget{
 			Label{Text: "config 文件夹里有多个连接码，单击选中一行，再点下面的按钮；双击行直接使用："},
 			ListBox{
 				AssignTo: &lb,
-				Model:    items,
+				Model:    all,
 				OnCurrentIndexChanged: func() {
 					btnOK.SetEnabled(lb.CurrentIndex() >= 0)
 				},
@@ -462,20 +455,17 @@ func (u *UI) pickFromAll(active pki.Invite, cands []Candidate) (Candidate, bool,
 		},
 	}).Create(u.mw); err != nil {
 		u.alert("无法显示选择窗口", err.Error())
-		return Candidate{}, false, false
+		return "", false
 	}
 	dlg.Run()
 	if !chosen {
-		return Candidate{}, false, false
+		return "", false
 	}
 	idx := lb.CurrentIndex()
 	if idx < 0 || idx >= len(all) {
-		return Candidate{}, false, false
+		return "", false
 	}
-	c := all[idx]
-	code, err := c.Inv.Encode()
-	changed := err == nil && code != activeCode
-	return c, changed, true
+	return all[idx], true
 }
 
 func (u *UI) refresh() {
@@ -827,52 +817,49 @@ func (u *UI) applyUpdate(newExe string) {
 // 卸载入口刻意不放在这个托盘菜单里：它紧挨着「退出」，而卸载是不可逆的，
 // 误点代价太大。改由安装目录里的「卸载 AntApp Link」快捷方式承担。
 
-// resolveFromConfigDir 点「连接」时的统一入口：扫描 config\*.antapp 决定连哪个。
-// 恰好一个直接连；多个先提示同名冲突，再弹列表让用户挑；零个引导导入。
+// resolveFromConfigDir 点「连接」/启动时的统一入口：只看文件名——
+// config 里一个文件直接连，多个弹列表让用户挑，零个引导导入。
 func (u *UI) resolveFromConfigDir() {
-	cands := ScanInvites(u.app.RootDir())
-	if len(cands) == 0 {
+	files := ListInviteFiles(u.app.RootDir())
+	if len(files) == 0 {
 		u.onImport()
 		return
 	}
-	var c Candidate
-	if len(cands) == 1 {
-		c = cands[0]
+	var name string
+	if len(files) == 1 {
+		name = files[0]
 	} else {
-		if dups := DuplicateFileNames(cands); len(dups) > 0 {
+		if dups := DuplicateFileNames(files); len(dups) > 0 {
 			walk.MsgBox(u.mw, "检测到同名配置",
 				fmt.Sprintf("config 文件夹里有多个同名的文件：%s。\n\n名字一样分不清谁是谁，请在下面的列表里选择要使用的；多余的建议删掉。",
 					strings.Join(dups[0].Files, "、")),
 				walk.MsgBoxIconWarning)
 		}
-		picked, _, ok := u.pickFromAll(pki.Invite{}, cands)
+		picked, ok := u.pickConfig("", files)
 		if !ok {
 			return
 		}
-		c = picked
+		name = picked
 	}
-	if u.adoptCandidate(c) {
-		u.app.Log().Info(fmt.Sprintf("已选用配置 %s（服务端 %s）", c.File, c.Inv.Server))
+	if u.adoptByName(name) {
+		u.app.Log().Info(fmt.Sprintf("已选用配置 %s", name))
 	}
 }
 
 // onSwitchConfig 手动切换配置文件：弹全量列表（含当前生效项，标注「当前使用」）。
 // 菜单项只在 config 里存在不同配置时可点；adoptBusy 与自动识别互斥，防两个框并发。
 func (u *UI) onSwitchConfig() {
-	if u.adoptBusy || !HasAlternateInvites(u.app.RootDir(), u.app.CurrentInvite()) {
+	if u.adoptBusy || !HasMultipleInvites(u.app.RootDir()) {
 		return
 	}
 	u.adoptBusy = true
 	defer func() { u.adoptBusy = false }()
-	c, changed, ok := u.pickFromAll(u.app.CurrentInvite(), ScanInvites(u.app.RootDir()))
-	if !ok || !changed {
-		if ok {
-			u.app.Log().Info("选中的配置与当前一致，无需切换", "file", c.File, "server", c.Inv.Server)
-		}
+	name, ok := u.pickConfig(u.app.CurrentSource(), ListInviteFiles(u.app.RootDir()))
+	if !ok || name == u.app.CurrentSource() {
 		return
 	}
-	if u.adoptCandidate(c) {
-		u.app.Log().Info(fmt.Sprintf("已切换到配置 %s（服务端 %s）", c.File, c.Inv.Server))
+	if u.adoptByName(name) {
+		u.app.Log().Info(fmt.Sprintf("已切换到配置 %s", name))
 	}
 }
 
