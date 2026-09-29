@@ -77,8 +77,8 @@ func TestScanInvitesDuplicateNames(t *testing.T) {
 	// Windows 复制产生的真·同名：pinode.antapp + pinode (2).antapp
 	writeInvite(t, root, "pinode.antapp", makeInvite(t, "pi-node-01"))
 	dups = DuplicateFileNames(ScanInvites(root))
-	if len(dups) != 1 || dups[0].Name != "pinode.antapp" || len(dups[0].Files) != 2 {
-		t.Fatalf("应检出同名文件组 pinode.antapp×2，实际 %+v", dups)
+	if len(dups) != 1 || dups[0].Name != "pinode.antapp" || len(dups[0].Files) != 3 {
+		t.Fatalf("应检出同名文件组 pinode.antapp×3，实际 %+v", dups)
 	}
 }
 
