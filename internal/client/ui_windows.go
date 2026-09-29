@@ -70,10 +70,16 @@ type UI struct {
 	pending       *update.Manifest
 
 	// config 文件夹自动识别：未配置状态下低频扫描，发现候选就采用/弹选择框；
-	// 已配置时候选内容有变化就弹全量选择列表。adoptBusy 防止弹窗时重入。
+	// 已配置时候选内容有变化（新文件或换了内容）才弹全量选择列表。
+	// adoptBusy 防止弹窗时重入；seenContent 记住见过的内容——提示过一次，
+	// 用户取消或忽略后就不再重复弹，直到内容真的变了。
 	scanTicks   int
 	adoptBusy   bool
 	suppressTil time.Time
+	seenContent map[string]bool
+
+	// lastLoggedErr 去重：同一条连接错误只在日志里记一次，不每秒刷屏。
+	lastLoggedErr string
 
 	// busyOp 非空表示一次连接/断开在跑。只允许 UI 线程读写：
 	// 点按钮立刻置上并渲染「连接中/断开中」，操作结束在 Synchronize 里清掉。
@@ -216,7 +222,8 @@ func (u *UI) build() error {
 	// 自作主张连上一个，可能正是别人正在用的那台。
 	if HasAlternateInvites(u.app.RootDir(), u.app.CurrentInvite()) {
 		u.app.Log().Info("检测到多个不同的配置文件，等待选择后再连接")
-		c, changed, ok := u.pickFromAll(u.app.CurrentInvite())
+		c, changed, ok := u.pickFromAll(u.app.CurrentInvite(), ScanInvites(u.app.RootDir()))
+		u.markSeen(ScanInvites(u.app.RootDir()))
 		if ok && changed {
 			u.adoptCandidate(c)
 		}
@@ -386,8 +393,8 @@ func (u *UI) refreshLoop() {
 
 // adoptFromConfigDir 扫描 config\*.antapp：
 //   - 未配置：恰好一个直接采用；多个先提示同名冲突，再弹列表让用户挑；
-//   - 已配置：候选内容与当前生效的连接码不同（同名换了内容也算）时，弹窗询问是否切换；
-//     同名同内容保持安静。
+//   - 已配置：只有出现「没见过」的内容（新文件或换了内容）才弹全量选择列表；
+//     用户取消或忽略后，同样的内容不再重复弹。
 func (u *UI) adoptFromConfigDir() {
 	if u.adoptBusy || time.Now().Before(u.suppressTil) {
 		return
@@ -397,27 +404,46 @@ func (u *UI) adoptFromConfigDir() {
 		return
 	}
 
+	// 只挑出没见过的内容。见过的（用户取消过/忽略过/已在用）不再打扰。
+	fresh := make([]Candidate, 0, len(cands))
+	for _, c := range cands {
+		code, err := c.Inv.Encode()
+		if err != nil {
+			continue
+		}
+		if !u.seenContent[code] {
+			fresh = append(fresh, c)
+		}
+	}
+	if len(fresh) == 0 {
+		return
+	}
 	if u.app.Configured() {
+		// 已配置：新内容和当前生效的一致就不用打扰（文件被复制/覆盖成同一份）。
 		active := u.app.CurrentInvite()
-		if !HasAlternateInvites(u.app.RootDir(), active) {
+		if activeCode, err := active.Encode(); err == nil {
+			filtered := fresh[:0]
+			for _, c := range fresh {
+				if code, err := c.Inv.Encode(); err == nil && code != activeCode {
+					filtered = append(filtered, c)
+				}
+			}
+			fresh = filtered
+		}
+		if len(fresh) == 0 {
+			u.markSeen(cands)
 			return
 		}
-		u.adoptBusy = true
-		c, changed, ok := u.pickFromAll(active)
-		u.adoptBusy = false
-		if ok && changed {
-			if u.adoptCandidate(c) {
-				u.app.Log().Info(fmt.Sprintf("已切换到配置 %s（服务端 %s）", c.File, c.Inv.Server))
-			}
-		}
-		return
 	}
 
 	u.adoptBusy = true
-	defer func() { u.adoptBusy = false }()
+	defer func() {
+		u.adoptBusy = false
+		u.markSeen(cands)
+	}()
 
-	if len(cands) == 1 {
-		c := cands[0]
+	if !u.app.Configured() && len(fresh) == 1 {
+		c := fresh[0]
 		if u.adoptCandidate(c) {
 			u.app.Log().Info(fmt.Sprintf("已自动识别 config 文件夹里的配置 %s（节点 %s，服务端 %s）",
 				c.File, c.Inv.Name, c.Inv.Server))
@@ -425,19 +451,32 @@ func (u *UI) adoptFromConfigDir() {
 		return
 	}
 
-	if dups := DuplicateNames(cands); len(dups) > 0 {
+	if dups := DuplicateNames(fresh); len(dups) > 0 {
 		walk.MsgBox(u.mw, "检测到同名配置",
 			fmt.Sprintf("config 文件夹里有 %d 个同名的配置（%s）。\n\n它们无法凭名字区分，请在下面的列表里选择要使用的；多余的建议删掉。",
 				len(dups), strings.Join(dups, "、")),
 			walk.MsgBoxIconWarning)
 	}
-	c, _, ok := u.pickFromAll(pki.Invite{})
+	c, _, ok := u.pickFromAll(pki.Invite{}, fresh)
 	if !ok {
+		// 用户取消：这些内容记为已见，30 秒内也不再扫
 		u.suppressTil = time.Now().Add(30 * time.Second)
 		return
 	}
 	if u.adoptCandidate(c) {
 		u.app.Log().Info(fmt.Sprintf("已选用配置 %s（节点 %s，服务端 %s）", c.File, c.Inv.Name, c.Inv.Server))
+	}
+}
+
+// markSeen 把候选内容记为「已见过」，之后同样的内容不再触发选择。
+func (u *UI) markSeen(cands []Candidate) {
+	if u.seenContent == nil {
+		u.seenContent = map[string]bool{}
+	}
+	for _, c := range cands {
+		if code, err := c.Inv.Encode(); err == nil {
+			u.seenContent[code] = true
+		}
 	}
 }
 
@@ -455,13 +494,15 @@ func (u *UI) adoptCandidate(c Candidate) bool {
 	return true
 }
 
-// pickFromAll 弹出全部配置的选择列表：文件名为主（云服签发的节点名全都是
-// pi-node-01，区分不了），服务器辅助，当前生效的标出来并默认选中。
-// 返回选中的候选、「是否与当前生效的不同」、用户是否确定。
-func (u *UI) pickFromAll(active pki.Invite) (Candidate, bool, bool) {
+// pickFromAll 弹出配置选择列表：文件名为主（云服签发的节点名全都是
+// pi-node-01，区分不了），服务器辅助。active 非零时列表首位放当前生效的
+// 配置并标注「当前使用」，返回值会说明用户是否改选了别的。
+func (u *UI) pickFromAll(active pki.Invite, cands []Candidate) (Candidate, bool, bool) {
 	activeCode, _ := active.Encode()
-	all := []Candidate{{File: InviteFileName, Inv: active}}
-	all = append(all, ScanInvites(u.app.RootDir())...)
+	all := cands
+	if active.Server != "" {
+		all = append([]Candidate{{File: InviteFileName, Inv: active}}, cands...)
+	}
 
 	items := make([]string, len(all))
 	for i, c := range all {
@@ -557,12 +598,15 @@ func (u *UI) refresh() {
 	}
 	u.lblState.SetText(state)
 
-	// 上次的错误比「服务端 x」更有用，就摆在状态行下面
+	// 上次的错误比「服务端 x」更有用，就写进日志区（每条错误只记一次，不刷屏），
+	// 状态行保持干净的「服务端 x」。
+	if configured && !st.Online && st.LastError != "" && st.LastError != u.lastLoggedErr {
+		u.lastLoggedErr = st.LastError
+		u.app.Log().Warn("连接失败", "err", st.LastError)
+	}
 	switch {
 	case busyOp != "":
 		u.lblIP.SetText("正在交换网络配置，请稍候…")
-	case configured && !st.Online && st.LastError != "":
-		u.lblIP.SetText("上次错误: " + truncateRunes(st.LastError, 46))
 	case st.Online:
 		u.lblIP.SetText(fmt.Sprintf("分配 IP: %s", st.TunnelIP))
 	case configured:
