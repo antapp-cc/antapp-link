@@ -2,6 +2,14 @@
 
 ## 一次性安装
 
+**方式一（推荐）：云服上一条命令，脚本自动从 GitHub Release 下载二进制**
+
+```bash
+wget -qO install.sh "https://raw.githubusercontent.com/antapp-cc/antapp-link/main/deploy/install.sh" && bash install.sh
+```
+
+**方式二：离线部署**（云服访问 GitHub 不便时）
+
 ```bash
 # 1. 本机交叉编译并上传（两个文件放同一目录）
 pwsh -File build.ps1
@@ -12,7 +20,9 @@ pwsh -File build.ps1
 bash install.sh                    # 默认转发端口段 31400-31409
 ```
 
-脚本会：装二进制到 `/usr/local/bin/antapp-linkd` → 生成 CA 与服务端证书 → 写 systemd unit 并 enable → 配置 netfilter → 启动隧道。
+脚本会：装二进制到 `/usr/local/bin/antapp-linkd` → 生成 CA 与服务端证书 → 写 systemd unit 并 enable → 安装并配置 dnsmasq（隧道 DNS 中继）→ 配置 netfilter → 启动隧道。
+
+**每台 VPS 的 PKI 密钥在首次安装时现场随机生成**，互不相同、互不通用——一台泄露不影响其他台。
 
 **幂等**。重复跑只刷新二进制和配置，**不会重建 CA**（重建会让已发出的所有连接码一起失效）。CA 材料不完整时它会明确报错并拒绝继续，而不是悄悄重建。
 
@@ -24,7 +34,7 @@ bash install.sh                    # 默认转发端口段 31400-31409
 
 会输出：
 
-- `/root/antapp-node-pi-node-01.antapp`（完整连接码文件，双击即可导入客户端）
+- `/root/pinode.antapp`（完整连接码文件，双击即可导入客户端；放进节点机 config\ 时建议按服务器改名，如 `pinode-82.antapp`）
 - 一行 `antapp://...`（发给节点机导入，内含私钥，**等同密码**）
 
 节点机那边：把 `.antapp` 文件拷过去双击，或者复制整行后在托盘菜单里选「导入连接码」，也可以命令行 `antapp-link.exe -c "antapp://..."`。
@@ -34,7 +44,7 @@ bash install.sh                    # 默认转发端口段 31400-31409
 ## 日常运维
 
 ```bash
-antapp-linkd status -c /etc/antapp-link/server.json    # 隧道状态、已接入节点、DNAT 规则
+antapp-linkd status -c /etc/antapp-link/server.json    # 隧道状态、已接入节点、端口转发
 journalctl -u antapp-linkd -f                          # 隧道日志
 systemctl status antapp-linkd antapp-link-up
 antapp-linkd up -c /etc/antapp-link/server.json        # 重配 netfilter（幂等）
@@ -83,11 +93,13 @@ bash install.sh --forward 31400-31409
 
 排障：`dig @10.10.0.1 <域名> A`（应有答案）；`dig @10.10.0.1 <域名> AAAA`（应为空）；`systemctl status dnsmasq`。dnsmasq 用 `bind-dynamic` 绑定，开机时 antapp0 还没建起来也不会启动失败。
 
+> 坑：Debian/Ubuntu 上 `apt-get install dnsmasq` 会**立即自启**——那时 antapp.conf 还没写入，服务就带着空配置跑起来了。`install.sh` 已处理（写入配置后强制 `restart`），手动安装时也要注意这个顺序。
+
 ## 排障
 
 | 现象 | 先看这里 |
 |---|---|
 | 节点连不上 | `antapp-linkd status` 看「已接入节点」；`journalctl -u antapp-linkd` 找 TLS 握手失败（多半是客户端证书不是本 CA 签的） |
-| 端口从外面连不上 | `antapp-linkd status` 里的 DNAT 规则；再确认节点确实在线 —— 客户端没连上时 DNAT 目标不可达，外部表现为超时 |
+| 端口从外面连不上 | `ss -tlnp | grep antapp-linkd` 确认转发器在监听 31400-31409；再确认节点确实在线 —— 客户端没连上时隧道转发不可达，外部表现为超时 |
 | 节点显示已连接但上不了网 | 客户端日志里的「出网自检」结论。自检失败时客户端会自动断开并还原网络，日志里会有原因（多半是云服出口的 DNS 查不通） |
 | 改了端口段没生效 | `antapp-linkd down` 再 `up`，或直接重跑 `install.sh --forward <段>` |

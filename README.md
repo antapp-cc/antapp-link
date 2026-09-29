@@ -25,10 +25,10 @@ Pi 节点机 (Windows)                          云服 (Linux)
 - **国内分流**：809 条国内网段直连，其余走隧道——服务端故障也不影响国内上网
 - **出口迁移**：换 Wi-Fi / 插拔网线 / 睡眠唤醒自动跟随，绕行路由、DNS、分流无缝迁移，隧道秒级自愈
 - **DNS 防污染**：解析走隧道中继（服务端 dnsmasq `filter-AAAA`，v4-only 隧道不发 AAAA），`minepi.com` 一类被污染域名经隧道出口解析
-- **动态 MTU**：跟随出口链路自动调整（下限 576），PPPoE / 4G 不断流
+- **多配置文件管理**（OpenVPN 式）：`config\*.antapp` 每个文件一台服务器，托盘菜单直接列出、点谁连谁；一个文件自动连，多个让用户挑；文件名即身份，不改名不复制
 - **安全自愈**：连接前先探测服务端（不通则不动网络）；出网自检失败自动断开还原；崩溃 / 强杀后启动自愈
-- **在线更新**：检查 → 下载 → sha256 校验 → 先还原网络再替换自身，全程无需人工干预
-- 托盘 + 主窗口（状态 / 日志 / 延迟 / 流量）、连接码双击导入与热切换、开机自启（计划任务）、单实例
+- **在线更新**：启动 8 秒后 + 每 1 小时自动检查；发现新版本**自动下载、校验、应用重启**，全程无交互（界面同时保留手动更新按钮）；启动时自动清理上次更新的 .old 备份
+- 托盘 + 主窗口（状态 / 日志 / 延迟 / 流量 / 当前配置文件）、连接码双击导入与托盘热切换、开机自启（计划任务，无 UAC 弹窗）、单实例
 
 **服务端（Linux）**
 
@@ -42,11 +42,13 @@ Pi 节点机 (Windows)                          云服 (Linux)
 ### 服务端（云服，root）
 
 ```bash
-pwsh -File build.ps1        # 本机交叉编译
-# 上传 dist/antapp-linkd 和 deploy/install.sh 到云服同一目录，然后：
-bash install.sh
-/usr/local/bin/antapp-linkd invite pi-node-01 -o /root   # 产出连接码文件 + 单行码
+pwsh -File build.ps1        # 本机交叉编译，发布到 GitHub Release
+# 云服（root）一条命令自动部署——自动下载二进制、装依赖、配 DNS 中继：
+wget -qO install.sh "https://raw.githubusercontent.com/antapp-cc/antapp-link/main/deploy/install.sh" && bash install.sh
+/usr/local/bin/antapp-linkd invite pi-node-01 -o /root   # 产出连接码文件（pinode.antapp）+ 单行码
 ```
+
+> 每台 VPS 的 PKI 密钥在首次安装时现场随机生成，互不相同、互不通用——一台泄露不影响其他台。多台服务器的连接码放进同一台节点机时建议按服务器改名（如 `pinode-145.antapp`），方便在菜单里区分。
 
 ### 客户端（节点机，管理员）
 
