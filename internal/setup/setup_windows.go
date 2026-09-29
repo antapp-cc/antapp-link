@@ -186,10 +186,11 @@ func Install(opts Options, log func(string)) error {
 	log("已释放 " + dst)
 
 	if len(opts.Notices) > 0 {
-		np := filepath.Join(opts.InstallDir, "THIRD-PARTY-NOTICES.md")
+		np := filepath.Join(opts.InstallDir, "README.md")
 		if err := os.WriteFile(np, opts.Notices, 0o644); err != nil {
 			log("第三方许可写入失败: " + err.Error())
 		}
+		_ = os.Remove(filepath.Join(opts.InstallDir, "THIRD-PARTY-NOTICES.md")) // 清掉旧名字的遗留
 	}
 
 	if err := installUninstaller(log); err != nil {

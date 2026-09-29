@@ -5,7 +5,7 @@
 # 产出在 dist/release-<版本>/：
 #   antapp-link.exe        客户端更新包
 #   latest.json            更新清单（客户端按它判断版本、校验 sha256）
-#   THIRD-PARTY-NOTICES.md
+#   README.md
 #   上传指引.txt
 #
 # 然后到 GitHub 建一个 tag 为 v<版本> 的 Release，把前三个文件传上去。
@@ -38,7 +38,7 @@ if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 New-Item -ItemType Directory -Force $out | Out-Null
 
 Copy-Item $exe (Join-Path $out 'antapp-link.exe') -Force
-Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') $out -Force
+Copy-Item (Join-Path $root 'README.md') $out -Force
 
 # 更新清单。字段名要和 internal/update 里的结构体对齐。
 $tag = "v$Version"
@@ -72,7 +72,7 @@ $guide = @"
   4. 把下面三个文件作为附件传上去（文件名不要改）：
        antapp-link.exe
        latest.json
-       THIRD-PARTY-NOTICES.md
+       README.md
   5. 发布。客户端下次检查更新时会读到 latest.json，比对版本后自行下载。
 
 校验值

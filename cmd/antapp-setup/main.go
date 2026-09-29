@@ -27,7 +27,7 @@ var iconData []byte
 //go:embed assets/antapp-link.exe
 var clientExe []byte
 
-//go:embed assets/THIRD-PARTY-NOTICES.md
+//go:embed assets/README.md
 var notices []byte
 
 func main() {

@@ -52,14 +52,14 @@ Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-link.exe' -Pkg './cmd/
 $setupAssets = Join-Path $root 'cmd\antapp-setup\assets'
 New-Item -ItemType Directory -Force $setupAssets | Out-Null
 Copy-Item (Join-Path $distDir 'antapp-link.exe') (Join-Path $setupAssets 'antapp-link.exe') -Force
-Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') (Join-Path $setupAssets 'THIRD-PARTY-NOTICES.md') -Force
+Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') (Join-Path $setupAssets 'README.md') -Force
 
 # 安装程序：内嵌了客户端，分发只带这一个文件
 Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-setup.exe' -Pkg './cmd/antapp-setup' `
     -Ldflags "-s -w -H windowsgui -X github.com/antapp-cc/antapp-link/internal/setup.Version=$Version"
 
 # 合规要求：Wintun 的预编译二进制许可要求随包附上原文
-Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') $distDir -Force
+Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') (Join-Path $distDir 'README.md') -Force
 
 # 代码签名：蚁巢证书（装在本机证书库），安装器和客户端都签，时间戳保证证书过期后签名仍有效
 $thumbprint = '58075F4CBD7592BB7A79B6B3F210A2AE551213D8'
