@@ -228,12 +228,14 @@ func (u *UI) build() error {
 		c, changed, ok := u.pickFromAll(u.app.CurrentInvite(), ScanInvites(u.app.RootDir()))
 		u.markSeen(ScanInvites(u.app.RootDir()))
 		if ok && changed {
-			u.adoptCandidate(c)
+			u.adoptCandidate(c) // 内部已按新连接码重连
+		} else {
+			// 取消或选回当前的：用现有配置正常连接
+			go func() {
+				_ = u.app.Connect()
+				u.mw.Synchronize(u.refresh)
+			}()
 		}
-		go func() {
-			_ = u.app.Connect()
-			u.mw.Synchronize(u.refresh)
-		}()
 	}
 
 	go u.refreshLoop()
@@ -496,7 +498,9 @@ func (u *UI) markSeen(cands []Candidate) {
 	}
 }
 
-// adoptCandidate 把候选写入生效配置并切换。返回是否成功。
+// adoptCandidate 把候选写入生效配置并切换，随后立即按新连接码重连。
+// （UpdateInvite 只断开不连——重连由这里统一发起，手动切换和自动识别行为一致。）
+// 返回是否成功。
 func (u *UI) adoptCandidate(c Candidate) bool {
 	if err := SaveInvite(u.app.RootDir(), c.Inv); err != nil {
 		u.alert("采用配置文件失败", err.Error())
@@ -507,6 +511,10 @@ func (u *UI) adoptCandidate(c Candidate) bool {
 		return false
 	}
 	u.refresh()
+	go func() {
+		_ = u.app.Connect()
+		u.mw.Synchronize(u.refresh)
+	}()
 	return true
 }
 
