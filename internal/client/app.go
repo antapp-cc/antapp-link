@@ -19,6 +19,7 @@ import (
 // 所以这里不含任何界面代码，逻辑可以单独测。
 type App struct {
 	inv       pki.Invite
+	invSource string
 	rootDir   string
 	statePath string
 	log       *slog.Logger
@@ -546,16 +547,25 @@ func (a *App) Invite() pki.Invite {
 	return a.inv
 }
 
-// UpdateInvite 换一个连接码。必须先断开：旧连接码对应的隧道地址和路由要还原干净，
-// 否则新旧两套配置会叠在一起。
-func (a *App) UpdateInvite(inv pki.Invite) error {
+// UpdateInvite 换一个连接码。source 是给人看的来源描述（文件名或「手动导入」），
+// 会跟着「检测到新的连接码」日志一起记录。必须先断开：旧连接码对应的隧道地址和
+// 路由要还原干净，否则新旧两套配置会叠在一起。
+func (a *App) UpdateInvite(inv pki.Invite, source string) error {
 	if err := a.Disconnect(); err != nil {
 		return err
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.inv = inv
+	a.invSource = source
 	return nil
+}
+
+// CurrentInvite 返回当前生效的连接码（未导入时为零值）。给界面比对候选用。
+func (a *App) CurrentInvite() pki.Invite {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.inv
 }
 
 // ---------- 在线更新 ----------

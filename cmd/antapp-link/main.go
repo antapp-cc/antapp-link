@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -93,9 +94,14 @@ func run() int {
 
 	// 没有连接码不是错误：界面照样起来，引导用户在界面上导入。
 	// 装完之后直接弹个框退出，用户等于看不到这个软件。
+	client.MigrateInviteFileName(dataDir)
 	inv, err := client.LoadSavedInvite(dataDir)
 	if err != nil {
-		logger.Warn("还没有连接码，等用户在界面上导入", "err", err)
+		if errors.Is(err, os.ErrNotExist) {
+			logger.Warn("config 里还没有生效的连接码（pinode.antapp），等待导入或自动识别")
+		} else {
+			logger.Warn("生效的连接码读取失败", "err", err)
+		}
 		inv = pki.Invite{}
 	}
 

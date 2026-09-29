@@ -44,7 +44,24 @@ func LoadInvite(pathOrCode string) (pki.Invite, error) {
 //
 // 用 .antapp 而不是通用的 .conf：这个后缀已经关联到客户端，用户想手动换连接码时
 // 直接双击这个文件就行 —— 跟从别处拿到的连接码文件是同一种东西，没必要两套命名。
-const InviteFileName = "node.antapp"
+// 名字与云服 invite 出的文件保持一致（pinode.antapp），用户复制过来不用改任何东西。
+const InviteFileName = "pinode.antapp"
+
+// legacyInviteFileName 是 0.2.0 之前的生效配置名，启动时迁移到新名字。
+const legacyInviteFileName = "node.antapp"
+
+// MigrateInviteFileName 把旧布局的 node.antapp 迁移成 pinode.antapp（只发生一次）。
+// 新名字已存在时不迁移 —— 那说明用户已经在新布局上工作，旧文件留作候选即可。
+func MigrateInviteFileName(root string) {
+	old := filepath.Join(ConfigDir(root), legacyInviteFileName)
+	if _, err := os.Stat(old); err != nil {
+		return
+	}
+	if _, err := os.Stat(InviteFilePath(root)); err == nil {
+		return
+	}
+	_ = os.Rename(old, InviteFilePath(root))
+}
 
 // InviteFilePath 是客户端保存连接码的位置。
 func InviteFilePath(root string) string { return filepath.Join(ConfigDir(root), InviteFileName) }

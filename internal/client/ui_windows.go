@@ -68,11 +68,12 @@ type UI struct {
 	done          chan struct{}
 	pending       *update.Manifest
 
-	// config 文件夹自动识别：未配置状态下低频扫描，发现候选就采用/弹选择框。
-	// adoptBusy 防止选择框弹着的时候又进来一次；取消后静默一会儿再扫。
+	// config 文件夹自动识别：未配置状态下低频扫描，发现候选就采用/弹选择框；
+	// 已配置时盯候选内容变化，不同才询问切换。adoptBusy 防止弹窗时重入。
 	scanTicks   int
 	adoptBusy   bool
 	suppressTil time.Time
+	offeredInv  map[string]bool
 
 	// busyOp 非空表示一次连接/断开在跑。只允许 UI 线程读写：
 	// 点按钮立刻置上并渲染「连接中/断开中」，操作结束在 Synchronize 里清掉。
@@ -244,11 +245,12 @@ func (u *UI) watchInvite() {
 			u.app.Log().Warn("连接码变了但读不出来", "err", err)
 			continue
 		}
-		if err := u.app.UpdateInvite(inv); err != nil {
+		if err := u.app.UpdateInvite(inv, InviteFileName); err != nil {
 			u.app.Log().Warn("换用新连接码失败", "err", err)
 			continue
 		}
-		u.app.Log().Info("检测到新的连接码，重新连接", "server", inv.Server, "name", inv.Name)
+		u.app.Log().Info("检测到新的连接码，重新连接",
+			"file", InviteFileName, "server", inv.Server, "name", inv.Name)
 
 		go func() {
 			_ = u.app.Connect()
@@ -368,16 +370,52 @@ func (u *UI) refreshLoop() {
 	}
 }
 
-// adoptFromConfigDir 在未配置状态下识别 config\*.antapp（pinode.antapp 这类）：
-// 恰好一个直接采用；多个先提示同名冲突，再弹列表让用户挑。
+// adoptFromConfigDir 扫描 config\*.antapp：
+//   - 未配置：恰好一个直接采用；多个先提示同名冲突，再弹列表让用户挑；
+//   - 已配置：候选内容与当前生效的连接码不同（同名换了内容也算）时，弹窗询问是否切换；
+//     同名同内容保持安静。
 func (u *UI) adoptFromConfigDir() {
-	if u.adoptBusy || u.app.Configured() || time.Now().Before(u.suppressTil) {
+	if u.adoptBusy || time.Now().Before(u.suppressTil) {
 		return
 	}
 	cands := ScanInvites(u.app.RootDir())
 	if len(cands) == 0 {
 		return
 	}
+
+	if u.app.Configured() {
+		active := u.app.CurrentInvite()
+		activeCode, _ := active.Encode()
+		for _, c := range cands {
+			code, err := c.Inv.Encode()
+			if err != nil || code == activeCode {
+				continue
+			}
+			key := c.File + " " + code
+			if u.offeredInv[key] {
+				continue
+			}
+			u.adoptBusy = true
+			answer := walk.MsgBox(u.mw, "检测到配置文件已变更",
+				fmt.Sprintf("config 文件夹里的 %s 与当前使用的连接码不同。\n\n节点：%s\n服务端：%s\n\n是否切换到这个连接码？",
+					c.File, c.Inv.Name, c.Inv.Server),
+				walk.MsgBoxYesNo|walk.MsgBoxIconQuestion)
+			u.adoptBusy = false
+			if u.offeredInv == nil {
+				u.offeredInv = map[string]bool{}
+			}
+			u.offeredInv[key] = true
+			if answer == walk.DlgCmdYes {
+				if u.adoptCandidate(c) {
+					u.app.Log().Info(fmt.Sprintf("已切换到更新的配置 %s（节点 %s，服务端 %s）",
+						c.File, c.Inv.Name, c.Inv.Server))
+				}
+			}
+			break
+		}
+		return
+	}
+
 	u.adoptBusy = true
 	defer func() { u.adoptBusy = false }()
 
@@ -412,7 +450,7 @@ func (u *UI) adoptCandidate(c Candidate) bool {
 		u.alert("采用配置文件失败", err.Error())
 		return false
 	}
-	if err := u.app.UpdateInvite(c.Inv); err != nil {
+	if err := u.app.UpdateInvite(c.Inv, c.File); err != nil {
 		u.alert("切换配置失败", err.Error())
 		return false
 	}
@@ -866,7 +904,11 @@ func (u *UI) onImport() {
 			u.alert("保存连接码失败", err.Error())
 			return
 		}
-		if err := u.app.UpdateInvite(inv); err != nil {
+		source := "剪贴板粘贴"
+		if fromFile {
+			source = filepath.Base(raw)
+		}
+		if err := u.app.UpdateInvite(inv, source); err != nil {
 			u.alert("切换连接码失败", err.Error())
 			return
 		}
