@@ -423,6 +423,8 @@ func (u *UI) pickConfig(currentSource string, names []string) (string, bool) {
 			dlg.Accept()
 		}
 	}
+	// 默认选中第一行：高亮行 = 将使用的配置，所见即所选
+	afterCreate := func() { lb.SetCurrentIndex(0) }
 	if err := (Dialog{
 		AssignTo: &dlg,
 		Title:    "选择要使用的配置",
@@ -457,6 +459,7 @@ func (u *UI) pickConfig(currentSource string, names []string) (string, bool) {
 		u.alert("无法显示选择窗口", err.Error())
 		return "", false
 	}
+	afterCreate()
 	dlg.Run()
 	if !chosen {
 		return "", false
@@ -465,6 +468,7 @@ func (u *UI) pickConfig(currentSource string, names []string) (string, bool) {
 	if idx < 0 || idx >= len(all) {
 		return "", false
 	}
+	u.app.Log().Info(fmt.Sprintf("配置选择结果：列表共 %d 项，用户选定第 %d 项 = %s", len(all), idx+1, all[idx]))
 	return all[idx], true
 }
 
@@ -839,7 +843,14 @@ func (u *UI) resolveFromConfigDir() {
 		if !ok {
 			return
 		}
+		// 提交前把将要使用的文件名亮出来让用户确认——选择列表里的高亮行
+		// 不一定就是用户心里想的那行，这一步兜底
 		name = picked
+		if walk.MsgBox(u.mw, "确认使用这个配置",
+			fmt.Sprintf("将使用配置文件：%s\n\n确认并连接？", name),
+			walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
+			return
+		}
 	}
 	if u.adoptByName(name) {
 		u.app.Log().Info(fmt.Sprintf("已选用配置 %s", name))
