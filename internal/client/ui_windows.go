@@ -941,6 +941,9 @@ func (u *UI) onSwitchConfig() {
 	c, changed, ok := u.pickFromAll(u.app.CurrentInvite(), ScanInvites(u.app.RootDir()))
 	u.markSeen(ScanInvites(u.app.RootDir()))
 	if !ok || !changed {
+		if ok {
+			u.app.Log().Info("选中的配置与当前一致，无需切换", "file", c.File, "server", c.Inv.Server)
+		}
 		return
 	}
 	if u.adoptCandidate(c) {
