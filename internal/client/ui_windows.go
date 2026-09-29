@@ -218,9 +218,15 @@ func (u *UI) build() error {
 	// 没有新版本时这个按钮不该占着位置
 	u.btnUpdate.SetVisible(false)
 
-	// 启动即按 config 里的文件决定连接：一个直接用，多个弹窗让用户挑，
-	// 零个保持未配置等导入。客户端不记录上次连的是哪个文件。
-	u.resolveFromConfigDir()
+	// OpenVPN 式：config 里一个文件就自动连；多个不自动连，
+	// 从托盘菜单里点哪个连哪个（客户端不记录上次连的是哪个文件）。
+	if files := ListInviteFiles(u.app.RootDir()); len(files) == 1 {
+		if u.adoptByName(files[0]) {
+			u.app.Log().Info(fmt.Sprintf("已自动连接配置 %s", files[0]))
+		}
+	} else if len(files) > 1 {
+		u.app.Log().Info(fmt.Sprintf("config 里有 %d 个连接码文件：连接哪个请从托盘菜单选择", len(files)))
+	}
 
 	go u.refreshLoop()
 	go u.autoCheckUpdate()
@@ -617,7 +623,13 @@ func (u *UI) onPrimary() {
 		return
 	}
 	if !u.app.Configured() {
-		u.resolveFromConfigDir()
+		if files := ListInviteFiles(u.app.RootDir()); len(files) == 1 {
+			if u.adoptByName(files[0]) {
+				u.app.Log().Info(fmt.Sprintf("已选用配置 %s", files[0]))
+			}
+			return
+		}
+		u.onImport()
 		return
 	}
 	op := "connect"
@@ -818,7 +830,6 @@ func (u *UI) applyUpdate(newExe string) {
 // 卸载入口刻意不放在这个托盘菜单里：它紧挨着「退出」，而卸载是不可逆的，
 // 误点代价太大。改由安装目录里的「卸载 AntApp Link」快捷方式承担。
 
-// resolveFromConfigDir 点「连接」/启动时的统一入口：只看文件名——
 // config 里一个文件直接连，多个弹列表让用户挑，零个引导导入。
 func (u *UI) resolveFromConfigDir() {
 	files := ListInviteFiles(u.app.RootDir())
@@ -884,12 +895,17 @@ func (u *UI) rebuildConfigMenu() {
 		} else {
 			_ = a.SetText("连接 " + name)
 			a.Triggered().Attach(func() {
-				if u.busyOp != "" {
+				if u.adoptBusy {
 					return
 				}
-				if u.adoptByName(name) {
-					u.app.Log().Info(fmt.Sprintf("已切换到配置 %s", name))
-				}
+				u.adoptBusy = true
+				go func() {
+					if u.adoptByName(name) {
+						u.app.Log().Info(fmt.Sprintf("已切换到配置 %s", name))
+					}
+					u.adoptBusy = false
+					u.mw.Synchronize(u.refresh)
+				}()
 			})
 		}
 		if err := actions.Insert(insertAt, a); err != nil {
