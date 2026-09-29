@@ -51,6 +51,9 @@ type UI struct {
 	mw *walk.MainWindow
 	ni *walk.NotifyIcon
 
+	// 托盘菜单里的「切换配置文件」：可点状态跟着 config 里的候选变化刷新
+	mSwitchCfg *walk.Action
+
 	lblState    *walk.Label
 	lblIP       *walk.Label
 	lblTraffic  *walk.Label
@@ -320,6 +323,19 @@ func (u *UI) buildTray() error {
 	_ = mImport.SetText("导入连接码")
 	mImport.Triggered().Attach(u.onImport)
 	ni.ContextMenu().Actions().Add(mImport)
+
+	// 切换配置文件：config 里有多个不同的配置才可点（状态在菜单弹出前刷新）
+	mSwitchCfg := walk.NewAction()
+	_ = mSwitchCfg.SetText("切换配置文件")
+	mSwitchCfg.SetEnabled(HasAlternateInvites(u.app.RootDir(), u.app.CurrentInvite()))
+	mSwitchCfg.Triggered().Attach(u.onSwitchConfig)
+	ni.ContextMenu().Actions().Add(mSwitchCfg)
+	u.mSwitchCfg = mSwitchCfg
+	ni.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
+		if button == walk.RightButton {
+			u.mSwitchCfg.SetEnabled(HasAlternateInvites(u.app.RootDir(), u.app.CurrentInvite()))
+		}
+	})
 
 	mOpenDir := walk.NewAction()
 	_ = mOpenDir.SetText("打开配置目录")
@@ -907,6 +923,22 @@ func (u *UI) applyUpdate(newExe string) {
 
 // 卸载入口刻意不放在这个托盘菜单里：它紧挨着「退出」，而卸载是不可逆的，
 // 误点代价太大。改由安装目录里的「卸载 AntApp Link」快捷方式承担。
+
+// onSwitchConfig 手动切换配置文件：弹全量列表（含当前生效项，标注「当前使用」）。
+// 菜单项只在 config 里存在不同配置时可点，这里再防御一次避免竞态。
+func (u *UI) onSwitchConfig() {
+	if u.adoptBusy || !HasAlternateInvites(u.app.RootDir(), u.app.CurrentInvite()) {
+		return
+	}
+	c, changed, ok := u.pickFromAll(u.app.CurrentInvite(), ScanInvites(u.app.RootDir()))
+	u.markSeen(ScanInvites(u.app.RootDir()))
+	if !ok || !changed {
+		return
+	}
+	if u.adoptCandidate(c) {
+		u.app.Log().Info(fmt.Sprintf("已切换到配置 %s（服务端 %s）", c.File, c.Inv.Server))
+	}
+}
 
 // onImport 导入连接码：先问来源，再走对应的读取方式。
 //
