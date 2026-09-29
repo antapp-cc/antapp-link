@@ -19,6 +19,7 @@ import (
 	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
 
+	"github.com/antapp-cc/antapp-link/internal/pki"
 	"github.com/antapp-cc/antapp-link/internal/setup"
 	"github.com/antapp-cc/antapp-link/internal/update"
 )
@@ -69,11 +70,10 @@ type UI struct {
 	pending       *update.Manifest
 
 	// config 文件夹自动识别：未配置状态下低频扫描，发现候选就采用/弹选择框；
-	// 已配置时盯候选内容变化，不同才询问切换。adoptBusy 防止弹窗时重入。
+	// 已配置时候选内容有变化就弹全量选择列表。adoptBusy 防止弹窗时重入。
 	scanTicks   int
 	adoptBusy   bool
 	suppressTil time.Time
-	offeredInv  map[string]bool
 
 	// busyOp 非空表示一次连接/断开在跑。只允许 UI 线程读写：
 	// 点按钮立刻置上并渲染「连接中/断开中」，操作结束在 Synchronize 里清掉。
@@ -211,6 +211,20 @@ func (u *UI) build() error {
 
 	// 没有新版本时这个按钮不该占着位置
 	u.btnUpdate.SetVisible(false)
+
+	// config 里摆着多个不同的配置时，先让用户挑，再谈连接 —— 不然客户端
+	// 自作主张连上一个，可能正是别人正在用的那台。
+	if HasAlternateInvites(u.app.RootDir(), u.app.CurrentInvite()) {
+		u.app.Log().Info("检测到多个不同的配置文件，等待选择后再连接")
+		c, changed, ok := u.pickFromAll(u.app.CurrentInvite())
+		if ok && changed {
+			u.adoptCandidate(c)
+		}
+		go func() {
+			_ = u.app.Connect()
+			u.mw.Synchronize(u.refresh)
+		}()
+	}
 
 	go u.refreshLoop()
 	go u.autoCheckUpdate()
@@ -385,33 +399,16 @@ func (u *UI) adoptFromConfigDir() {
 
 	if u.app.Configured() {
 		active := u.app.CurrentInvite()
-		activeCode, _ := active.Encode()
-		for _, c := range cands {
-			code, err := c.Inv.Encode()
-			if err != nil || code == activeCode {
-				continue
+		if !HasAlternateInvites(u.app.RootDir(), active) {
+			return
+		}
+		u.adoptBusy = true
+		c, changed, ok := u.pickFromAll(active)
+		u.adoptBusy = false
+		if ok && changed {
+			if u.adoptCandidate(c) {
+				u.app.Log().Info(fmt.Sprintf("已切换到配置 %s（服务端 %s）", c.File, c.Inv.Server))
 			}
-			key := c.File + " " + code
-			if u.offeredInv[key] {
-				continue
-			}
-			u.adoptBusy = true
-			answer := walk.MsgBox(u.mw, "检测到配置文件已变更",
-				fmt.Sprintf("config 文件夹里的 %s 与当前使用的连接码不同。\n\n节点：%s\n服务端：%s\n\n是否切换到这个连接码？",
-					c.File, c.Inv.Name, c.Inv.Server),
-				walk.MsgBoxYesNo|walk.MsgBoxIconQuestion)
-			u.adoptBusy = false
-			if u.offeredInv == nil {
-				u.offeredInv = map[string]bool{}
-			}
-			u.offeredInv[key] = true
-			if answer == walk.DlgCmdYes {
-				if u.adoptCandidate(c) {
-					u.app.Log().Info(fmt.Sprintf("已切换到更新的配置 %s（节点 %s，服务端 %s）",
-						c.File, c.Inv.Name, c.Inv.Server))
-				}
-			}
-			break
 		}
 		return
 	}
@@ -434,7 +431,7 @@ func (u *UI) adoptFromConfigDir() {
 				len(dups), strings.Join(dups, "、")),
 			walk.MsgBoxIconWarning)
 	}
-	c, ok := u.pickCandidate(cands)
+	c, _, ok := u.pickFromAll(pki.Invite{})
 	if !ok {
 		u.suppressTil = time.Now().Add(30 * time.Second)
 		return
@@ -458,11 +455,20 @@ func (u *UI) adoptCandidate(c Candidate) bool {
 	return true
 }
 
-// pickCandidate 弹出选择列表。返回用户选中的候选；取消时 ok=false。
-func (u *UI) pickCandidate(cands []Candidate) (Candidate, bool) {
-	items := make([]string, len(cands))
-	for i, c := range cands {
-		items[i] = fmt.Sprintf("%s　—　%s　（%s）", c.Inv.Name, c.Inv.Server, c.File)
+// pickFromAll 弹出全部配置的选择列表：文件名为主（云服签发的节点名全都是
+// pi-node-01，区分不了），服务器辅助，当前生效的标出来并默认选中。
+// 返回选中的候选、「是否与当前生效的不同」、用户是否确定。
+func (u *UI) pickFromAll(active pki.Invite) (Candidate, bool, bool) {
+	activeCode, _ := active.Encode()
+	all := []Candidate{{File: InviteFileName, Inv: active}}
+	all = append(all, ScanInvites(u.app.RootDir())...)
+
+	items := make([]string, len(all))
+	for i, c := range all {
+		items[i] = c.File + "　—　" + c.Inv.Server
+		if code, err := c.Inv.Encode(); err == nil && code == activeCode {
+			items[i] += "　（当前使用）"
+		}
 	}
 
 	var dlg *walk.Dialog
@@ -470,7 +476,7 @@ func (u *UI) pickCandidate(cands []Candidate) (Candidate, bool) {
 	chosen := false
 	if err := (Dialog{
 		AssignTo: &dlg,
-		Title:    "检测到多个配置文件",
+		Title:    "选择要使用的配置",
 		MinSize:  Size{Width: 500, Height: 300},
 		Layout:   VBox{Margins: Margins{Left: 16, Top: 16, Right: 16, Bottom: 16}, Spacing: 10},
 		Children: []Widget{
@@ -496,17 +502,20 @@ func (u *UI) pickCandidate(cands []Candidate) (Candidate, bool) {
 		},
 	}).Create(u.mw); err != nil {
 		u.alert("无法显示选择窗口", err.Error())
-		return Candidate{}, false
+		return Candidate{}, false, false
 	}
 	dlg.Run()
 	if !chosen {
-		return Candidate{}, false
+		return Candidate{}, false, false
 	}
 	idx := lb.CurrentIndex()
-	if idx < 0 || idx >= len(cands) {
-		return Candidate{}, false
+	if idx < 0 || idx >= len(all) {
+		return Candidate{}, false, false
 	}
-	return cands[idx], true
+	c := all[idx]
+	code, err := c.Inv.Encode()
+	changed := err == nil && code != activeCode
+	return c, changed, true
 }
 
 func (u *UI) refresh() {

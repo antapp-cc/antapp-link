@@ -128,3 +128,19 @@ func DuplicateNames(cands []Candidate) []string {
 	sort.Strings(dups)
 	return dups
 }
+
+// HasAlternateInvites 报告 config\ 里是否存在与 inv 不同的候选连接码。
+// 有就说明用户面前摆着多个选择，客户端不该自作主张用哪一个。
+func HasAlternateInvites(root string, inv pki.Invite) bool {
+	cands := ScanInvites(root)
+	code, err := inv.Encode()
+	if err != nil {
+		return len(cands) > 0
+	}
+	for _, c := range cands {
+		if ccode, err := c.Inv.Encode(); err == nil && ccode != code {
+			return true
+		}
+	}
+	return false
+}

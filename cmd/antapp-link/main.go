@@ -134,7 +134,11 @@ func run() int {
 	}
 
 	if app.Configured() {
-		if err := app.Connect(); err != nil {
+		// config 里摆着多个不同的配置时别自作主张：先让用户在界面上挑，
+		// 挑完由界面发起连接 —— 否则可能连到别人正在用的那台。
+		if client.HasAlternateInvites(dataDir, inv) {
+			logger.Warn("检测到多个不同的配置文件，等待用户选择后再连接")
+		} else if err := app.Connect(); err != nil {
 			// 连不上也要把界面显示出来，用户可以改连接码或看日志
 			logger.Warn("自动连接失败，界面仍可用", "err", err)
 		}
