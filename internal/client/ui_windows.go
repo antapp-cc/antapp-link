@@ -72,14 +72,8 @@ type UI struct {
 	done          chan struct{}
 	pending       *update.Manifest
 
-	// config 文件夹自动识别：未配置状态下低频扫描，发现候选就采用/弹选择框；
-	// 已配置时候选内容有变化（新文件或换了内容）才弹全量选择列表。
-	// adoptBusy 防止弹窗时重入；seenContent 记住见过的内容——提示过一次，
-	// 用户取消或忽略后就不再重复弹，直到内容真的变了。
-	scanTicks   int
-	adoptBusy   bool
-	suppressTil time.Time
-	seenContent map[string]bool
+	// adoptBusy 防止切换配置的弹窗重入。
+	adoptBusy bool
 
 	// lastLoggedErr 去重：同一条连接错误只在日志里记一次，不每秒刷屏。
 	lastLoggedErr string
@@ -273,23 +267,7 @@ func (u *UI) watchInvite() {
 		}
 		last = now
 
-		u.mw.Synchronize(func() {
-			if u.adoptBusy || u.app.Configured() && u.suppressTil.After(time.Now()) {
-				return
-			}
-			cands := ScanInvites(u.app.RootDir())
-			if len(cands) == 0 {
-				return
-			}
-			// 运行中发生变化：弹全量列表让用户确认用哪个（当前项已标注）
-			c, changed, ok := u.pickFromAll(u.app.CurrentInvite(), cands)
-			if !ok || !changed {
-				return
-			}
-			if u.adoptCandidate(c) {
-				u.app.Log().Info(fmt.Sprintf("已切换到配置 %s（服务端 %s）", c.File, c.Inv.Server))
-			}
-		})
+		u.app.Log().Info("config 文件夹的连接码有变化；如需切换，请使用托盘菜单的「切换配置文件」")
 	}
 }
 
@@ -404,104 +382,7 @@ func (u *UI) refreshLoop() {
 			return
 		case <-ticker.C:
 			// walk 要求所有控件操作回到主线程
-			u.mw.Synchronize(func() {
-				u.refresh()
-				// 未配置时低频扫 config 文件夹：用户把 pinode.antapp 拖进去，
-				// 不用重启客户端几秒内就能被识别
-				u.scanTicks++
-				if u.scanTicks%3 == 0 {
-					u.adoptFromConfigDir()
-				}
-			})
-		}
-	}
-}
-
-// adoptFromConfigDir 扫描 config\*.antapp：
-//   - 未配置：恰好一个直接采用；多个先提示同名冲突，再弹列表让用户挑；
-//   - 已配置：只有出现「没见过」的内容（新文件或换了内容）才弹全量选择列表；
-//     用户取消或忽略后，同样的内容不再重复弹。
-func (u *UI) adoptFromConfigDir() {
-	if u.adoptBusy || time.Now().Before(u.suppressTil) {
-		return
-	}
-	cands := ScanInvites(u.app.RootDir())
-	if len(cands) == 0 {
-		return
-	}
-
-	// 只挑出没见过的内容。见过的（用户取消过/忽略过/已在用）不再打扰。
-	fresh := make([]Candidate, 0, len(cands))
-	for _, c := range cands {
-		code, err := c.Inv.Encode()
-		if err != nil {
-			continue
-		}
-		if !u.seenContent[code] {
-			fresh = append(fresh, c)
-		}
-	}
-	if len(fresh) == 0 {
-		return
-	}
-	if u.app.Configured() {
-		// 已配置：新内容和当前生效的一致就不用打扰（文件被复制/覆盖成同一份）。
-		active := u.app.CurrentInvite()
-		if activeCode, err := active.Encode(); err == nil {
-			filtered := fresh[:0]
-			for _, c := range fresh {
-				if code, err := c.Inv.Encode(); err == nil && code != activeCode {
-					filtered = append(filtered, c)
-				}
-			}
-			fresh = filtered
-		}
-		if len(fresh) == 0 {
-			u.markSeen(cands)
-			return
-		}
-	}
-
-	u.adoptBusy = true
-	defer func() {
-		u.adoptBusy = false
-		u.markSeen(cands)
-	}()
-
-	if !u.app.Configured() && len(fresh) == 1 {
-		c := fresh[0]
-		if u.adoptCandidate(c) {
-			u.app.Log().Info(fmt.Sprintf("已自动识别 config 文件夹里的配置 %s（节点 %s，服务端 %s）",
-				c.File, c.Inv.Name, c.Inv.Server))
-		}
-		return
-	}
-
-	if dups := DuplicateFileNames(fresh); len(dups) > 0 {
-		walk.MsgBox(u.mw, "检测到同名配置",
-			fmt.Sprintf("config 文件夹里有多个同名的文件：%s。\n\n名字一样分不清谁是谁，请在下面的列表里选择要使用的；多余的建议删掉。",
-				strings.Join(dups[0].Files, "、")),
-			walk.MsgBoxIconWarning)
-	}
-	c, _, ok := u.pickFromAll(pki.Invite{}, fresh)
-	if !ok {
-		// 用户取消：这些内容记为已见，30 秒内也不再扫
-		u.suppressTil = time.Now().Add(30 * time.Second)
-		return
-	}
-	if u.adoptCandidate(c) {
-		u.app.Log().Info(fmt.Sprintf("已选用配置 %s（节点 %s，服务端 %s）", c.File, c.Inv.Name, c.Inv.Server))
-	}
-}
-
-// markSeen 把候选内容记为「已见过」，之后同样的内容不再触发选择。
-func (u *UI) markSeen(cands []Candidate) {
-	if u.seenContent == nil {
-		u.seenContent = map[string]bool{}
-	}
-	for _, c := range cands {
-		if code, err := c.Inv.Encode(); err == nil {
-			u.seenContent[code] = true
+			u.mw.Synchronize(u.refresh)
 		}
 	}
 }
@@ -984,7 +865,6 @@ func (u *UI) onSwitchConfig() {
 	u.adoptBusy = true
 	defer func() { u.adoptBusy = false }()
 	c, changed, ok := u.pickFromAll(u.app.CurrentInvite(), ScanInvites(u.app.RootDir()))
-	u.markSeen(ScanInvites(u.app.RootDir()))
 	if !ok || !changed {
 		if ok {
 			u.app.Log().Info("选中的配置与当前一致，无需切换", "file", c.File, "server", c.Inv.Server)
