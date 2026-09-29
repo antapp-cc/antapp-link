@@ -558,6 +558,8 @@ func (a *App) UpdateInvite(inv pki.Invite, source string) error {
 	defer a.mu.Unlock()
 	a.inv = inv
 	a.invSource = source
+	// 日志随配置文件切会话：pinode.antapp → logs\pinode.log，新会话清空重来
+	SwitchLogSession(source)
 	return nil
 }
 

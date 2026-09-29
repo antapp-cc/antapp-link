@@ -777,12 +777,23 @@ func (u *UI) hintTray() {
 
 // autoCheckUpdate 在界面出来之后静默查一次，不打扰用户。
 func (u *UI) autoCheckUpdate() {
+	// 启动 8 秒查一次；之后每 1 小时重复——长期不退出的客户端也能及时拿到新版本
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
 	select {
 	case <-u.done:
 		return
 	case <-time.After(8 * time.Second):
 	}
 	u.checkUpdate(false)
+	for {
+		select {
+		case <-u.done:
+			return
+		case <-ticker.C:
+			u.checkUpdate(false)
+		}
+	}
 }
 
 func (u *UI) onCheckUpdate() { go u.checkUpdate(true) }

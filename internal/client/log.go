@@ -74,6 +74,26 @@ func (l *rotatingLog) rotate() error {
 	return l.open()
 }
 
+// SwitchFile 把日志切到新文件并清空：每次连接会话的日志从零开始，
+// 打开文件看到的就是本次连接的最新内容（旧会话不保留）。
+func (l *rotatingLog) SwitchFile(path string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file != nil {
+		_ = l.file.Close()
+		l.file = nil
+	}
+	l.path = path
+	// 新会话覆盖写
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	l.file = f
+	l.size = 0
+	return nil
+}
+
 func (l *rotatingLog) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -136,6 +156,13 @@ func (b *LogBuffer) Since(seq uint64) ([]string, uint64) {
 		out = append(out, b.lines[idx:]...)
 	}
 	return out, b.seq
+}
+
+// Clear 清空界面缓冲：新连接会话的界面日志同样从零开始。
+func (b *LogBuffer) Clear() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.lines = nil
 }
 
 // Tail 返回最后 n 行。n<=0 表示全部。
@@ -207,13 +234,41 @@ func levelTag(l slog.Level) string {
 	}
 }
 
+// sessionLogger = 文件日志 + 界面缓冲：每次连接会话切换文件并清空。
+type sessionLogger struct {
+	rot *rotatingLog
+	buf *LogBuffer
+}
+
+// activeSession 客户端单实例，包内单例安全。NewFileLogger 时赋值。
+var activeSession *sessionLogger
+
+var rootDirForLogs string
+
+// SwitchLogSession 把日志切到与配置文件同名的会话文件（pinode.antapp → pinode.log），
+// 文件与界面缓冲同时清空——新连接会话的日志从零开始，看到的永远是最新的。
+// 失败安静忽略：日志切换失败不该挡住连接。
+func SwitchLogSession(source string) {
+	if activeSession == nil {
+		return
+	}
+	name := strings.TrimSuffix(source, ".antapp")
+	if name == "" {
+		name = "client"
+	}
+	_ = activeSession.rot.SwitchFile(filepath.Join(LogsDir(rootDirForLogs), name+".log"))
+	activeSession.buf.Clear()
+}
+
 // NewFileLogger 建一个同时写文件与界面缓冲的 logger。
 func NewFileLogger(root string) (*slog.Logger, *LogBuffer, func(), error) {
+	rootDirForLogs = root
 	rot, err := OpenLog(filepath.Join(LogsDir(root), "client.log"), 2<<20)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	buf := NewLogBuffer(500)
+	activeSession = &sessionLogger{rot: rot, buf: buf}
 	fileHandler := slog.NewTextHandler(rot, &slog.HandlerOptions{Level: slog.LevelInfo})
 	return slog.New(&teeHandler{file: fileHandler, buf: buf}), buf,
 		func() { _ = rot.Close() }, nil
