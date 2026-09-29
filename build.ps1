@@ -8,7 +8,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Version = '0.2.2',
+    [string]$Version = '0.2.3',
     [string]$Dist = 'dist'
 )
 
