@@ -408,9 +408,16 @@ func (u *UI) adoptByName(name string) bool {
 // pickConfig 弹出配置选择列表：只显示文件名（用户要求只看文件名）。
 // currentSource 非空时列表首位放当前正在用的文件并标注；返回选中的文件名。
 func (u *UI) pickConfig(currentSource string, names []string) (string, bool) {
-	all := names
+	// 当前正在用的文件排首位；其余文件跟在后面。同一个文件只出现一次——
+	// 不然两行同名夹着别的文件，用户点错行提交的就不是心里想的那份。
+	var all []string
 	if currentSource != "" {
-		all = append([]string{currentSource}, names...)
+		all = append(all, currentSource)
+	}
+	for _, n := range names {
+		if n != currentSource {
+			all = append(all, n)
+		}
 	}
 
 	var dlg *walk.Dialog
