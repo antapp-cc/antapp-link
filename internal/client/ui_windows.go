@@ -813,6 +813,10 @@ func (u *UI) checkUpdate(manual bool) {
 			u.refresh()
 			if manual {
 				u.askUpdate()
+			} else {
+				// 自动更新：检测到新版本直接静默下载并应用，无需手动点击。
+				// 失败只记日志，按钮保留供手动重试。
+				go u.autoApplyUpdate(m)
 			}
 		case err != nil:
 			if manual {
@@ -870,6 +874,34 @@ func (u *UI) askUpdate() {
 			u.applyUpdate(newExe)
 		})
 	}()
+}
+
+// autoApplyUpdate 静默自动更新：下载 → 校验 → 应用重启，全程无交互。
+// 失败只记日志，界面按钮保留供手动重试。
+func (u *UI) autoApplyUpdate(m *update.Manifest) {
+	u.app.Log().Info(fmt.Sprintf("检测到新版本 %s，开始自动更新", m.Version))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+
+	newExe, err := u.app.DownloadUpdate(ctx, m)
+	if err != nil {
+		u.app.Log().Warn(fmt.Sprintf("自动更新下载失败: %v（可手动点「更新到 %s」重试）", err, m.Version))
+		return
+	}
+	u.app.Log().Info("更新包校验通过，正在应用并重启……")
+
+	done := make(chan struct{})
+	u.mw.Synchronize(func() {
+		defer close(done)
+		if err := u.app.ApplyUpdate(newExe); err != nil {
+			u.app.Log().Warn(fmt.Sprintf("自动更新应用失败: %v（可手动点「更新到 %s」重试）", err, m.Version))
+			u.btnUpdate.SetEnabled(true)
+			return
+		}
+		u.quitting = true
+		os.Exit(0)
+	})
+	<-done
 }
 
 // applyUpdate 已经回到主线程：替换文件、拉起新版，然后立刻退出自己 ——
