@@ -21,6 +21,15 @@ import (
 //go:embed assets/antapp.ico
 var iconData []byte
 
+// 单文件安装器：客户端 exe 和第三方许可直接内嵌，分发只带这一个文件。
+// assets/ 下的内容由 build.ps1 在构建时生成并拷入。
+//
+//go:embed assets/antapp-link.exe
+var clientExe []byte
+
+//go:embed assets/THIRD-PARTY-NOTICES.md
+var notices []byte
+
 func main() {
 	uninstall := flag.Bool("uninstall", false, "卸载")
 	quiet := flag.Bool("quiet", false, "静默模式，不显示界面")
@@ -64,6 +73,8 @@ func runQuiet(uninstall bool, dirFlag string) int {
 	}
 
 	opts := setup.DefaultOptions()
+	opts.ClientExe = clientExe
+	opts.Notices = notices
 	if dirFlag != "" {
 		opts.InstallDir = dirFlag
 	}
@@ -96,6 +107,8 @@ func loadIcon() (*walk.Icon, error) {
 
 func runInstallUI(icon *walk.Icon, dirFlag string) int {
 	opts := setup.DefaultOptions()
+	opts.ClientExe = clientExe
+	opts.Notices = notices
 	if dirFlag != "" {
 		opts.InstallDir = dirFlag
 	}

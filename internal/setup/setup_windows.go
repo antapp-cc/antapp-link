@@ -69,6 +69,10 @@ type Options struct {
 	SourceDir  string
 	DataDir    string
 
+	// ClientExe/Notices 非空时直接内嵌安装（单文件安装器），不再找 SourceDir。
+	ClientExe []byte
+	Notices   []byte
+
 	StartMenu bool
 	Desktop   bool
 	Launch    bool
@@ -146,9 +150,15 @@ func Installed() (Options, bool) {
 }
 
 func Install(opts Options, log func(string)) error {
-	src := filepath.Join(opts.SourceDir, AppExeName)
-	if _, err := os.Stat(src); err != nil {
-		return fmt.Errorf("安装包里找不到 %s（它需要和安装程序放在同一个目录）: %w", AppExeName, err)
+	// 客户端 exe 来源：单文件安装器走内嵌；内嵌为空（测试/旧布局）再找同目录文件
+	client := opts.ClientExe
+	if client == nil {
+		src := filepath.Join(opts.SourceDir, AppExeName)
+		b, err := os.ReadFile(src)
+		if err != nil {
+			return fmt.Errorf("安装包里找不到 %s（它需要和安装程序放在同一个目录）: %w", AppExeName, err)
+		}
+		client = b
 	}
 
 	// 先停掉正在跑的客户端，否则程序文件被占用、覆盖会失败
@@ -165,11 +175,22 @@ func Install(opts Options, log func(string)) error {
 	// 的旧文件挪走再写入（与 update.Apply 同一套路）。否则遇到杀软短时握着
 	// 句柄，覆盖会静默失败，装完还是旧版本。
 	_ = os.Rename(dst, dst+".old")
-	if err := copyFile(src, dst); err != nil {
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, client, 0o755); err != nil {
+		return fmt.Errorf("拷贝程序: %w", err)
+	}
+	if err := os.Rename(tmp, dst); err != nil {
 		return fmt.Errorf("拷贝程序: %w", err)
 	}
 	_ = os.Remove(dst + ".old")
 	log("已释放 " + dst)
+
+	if len(opts.Notices) > 0 {
+		np := filepath.Join(opts.InstallDir, "THIRD-PARTY-NOTICES.md")
+		if err := os.WriteFile(np, opts.Notices, 0o644); err != nil {
+			log("第三方许可写入失败: " + err.Error())
+		}
+	}
 
 	if err := installUninstaller(log); err != nil {
 		return err

@@ -10,3 +10,7 @@ third_party/wintun-0.14.1.zip
 /notifications.json
 # 交叉编译产物（GOOS=linux go build 无 -o 时落在根目录）
 /antapp-linkd
+
+# 单文件安装器的内嵌素材（构建时由 build.ps1 生成拷入）
+cmd/antapp-setup/assets/antapp-link.exe
+cmd/antapp-setup/assets/THIRD-PARTY-NOTICES.md

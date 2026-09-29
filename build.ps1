@@ -48,7 +48,13 @@ Build-Target -Goos 'linux' -Goarch 'amd64' -Out 'antapp-linkd' -Pkg './cmd/antap
 Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-link.exe' -Pkg './cmd/antapp-link' `
     -Ldflags "-s -w -H windowsgui -X github.com/antapp-cc/antapp-link/internal/client.Version=$Version"
 
-# 安装程序：和客户端 exe 必须放在同一个目录里分发
+# 单文件安装器：客户端 exe 和第三方许可先拷进 assets，由 go:embed 内嵌进安装器
+$setupAssets = Join-Path $root 'cmd\antapp-setup\assets'
+New-Item -ItemType Directory -Force $setupAssets | Out-Null
+Copy-Item (Join-Path $distDir 'antapp-link.exe') (Join-Path $setupAssets 'antapp-link.exe') -Force
+Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') (Join-Path $setupAssets 'THIRD-PARTY-NOTICES.md') -Force
+
+# 安装程序：内嵌了客户端，分发只带这一个文件
 Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-setup.exe' -Pkg './cmd/antapp-setup' `
     -Ldflags "-s -w -H windowsgui -X github.com/antapp-cc/antapp-link/internal/setup.Version=$Version"
 
@@ -83,15 +89,9 @@ if ($signtool) {
     Write-Warning '没找到 signtool，本次构建不签名'
 }
 
-# 打成安装包：setup.exe 会去同目录找 antapp-link.exe
-$pkgDir = Join-Path $distDir 'AntAppLink-Setup'
-if (Test-Path $pkgDir) { Remove-Item $pkgDir -Recurse -Force }
-New-Item -ItemType Directory -Force $pkgDir | Out-Null
-foreach ($f in @('antapp-setup.exe', 'antapp-link.exe', 'THIRD-PARTY-NOTICES.md')) {
-    Copy-Item (Join-Path $distDir $f) $pkgDir -Force
-}
-$zip = Join-Path $distDir "AntAppLink-Setup-$Version.zip"
-Compress-Archive -Path (Join-Path $pkgDir '*') -DestinationPath $zip -Force
+# 给客户的分发物：签名后的单文件安装器，带上版本号命名
+$setupDist = Join-Path $distDir "AntAppLink-安装-$Version.exe"
+Copy-Item (Join-Path $distDir 'antapp-setup.exe') $setupDist -Force
 
 Write-Host ''
 Write-Host '== 产物 ==' -ForegroundColor Green
@@ -99,10 +99,5 @@ Get-ChildItem $distDir -File | Sort-Object Name | ForEach-Object {
     '  {0,-32} {1,12:N0} 字节' -f $_.Name, $_.Length
 }
 Write-Host ''
-Write-Host '== 安装包 ==' -ForegroundColor Green
-Get-ChildItem $pkgDir -File | Sort-Object Name | ForEach-Object {
-    '  AntAppLink-Setup/{0,-22} {1,12:N0} 字节' -f $_.Name, $_.Length
-}
-Write-Host ''
-Write-Host '分发：把 AntAppLink-Setup 整个目录（或那个 zip）给用户，运行 antapp-setup.exe。' -ForegroundColor DarkGray
+Write-Host '分发：把 AntAppLink-安装-版本号.exe 一个文件给用户即可，双击安装。' -ForegroundColor DarkGray
 Write-Host '节点机不需要装任何驱动或额外程序，客户端 exe 自带 wintun.dll。' -ForegroundColor DarkGray
