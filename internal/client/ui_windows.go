@@ -54,9 +54,6 @@ type UI struct {
 	mImport    *walk.Action
 	cfgActions []*walk.Action
 
-	// 托盘菜单里的「切换配置文件」：可点状态跟着 config 里的候选变化刷新
-	mSwitchCfg *walk.Action
-
 	lblState    *walk.Label
 	lblCfg      *walk.Label
 	lblIP       *walk.Label
