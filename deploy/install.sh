@@ -54,10 +54,6 @@ done
 [[ "$(id -u)" -eq 0 ]] || die "请用 root 运行"
 
 reset_apt_sources() {
-  # 统一改写为 Debian 官方源（deb.debian.org，HTTPS）：
-  # 镜像商预装的源五花八门（.145 实测阿里云镜像在香港机上 45 秒下不完一个包索引，
-  # 官方源秒下），全部换成官方源最省事也最快。
-  # 幂等：已是官方源就不动；原文件备份成 .antapp-bak（已有备份不重复备份）。
   local src=/etc/apt/sources.list
   local codename
   codename=$(grep -m1 -oP '(?<=^deb ).*? (?=main)' /etc/apt/sources.list 2>/dev/null | awk '{print $2}')
@@ -76,7 +72,6 @@ deb https://deb.debian.org/debian/ $codename-updates main contrib non-free non-f
 deb https://deb.debian.org/debian-security/ $codename-security main contrib non-free non-free-firmware
 deb https://deb.debian.org/debian/ $codename-backports main contrib non-free non-free-firmware
 SRCEOF
-  # 发行版目录下的第三方源文件一并停用（镜像商常在这里塞东西）
   if ls /etc/apt/sources.list.d/*.list >/dev/null 2>&1; then
     for f in /etc/apt/sources.list.d/*.list; do
       mv "$f" "$f.antapp-bak"
@@ -154,7 +149,6 @@ command -v iptables >/dev/null || die "iptables 仍不可用"
 modprobe tun 2>/dev/null || true
 [[ -c /dev/net/tun ]] || die "/dev/net/tun 不可用 —— 这台机器不支持 TUN 设备（老式 OpenVZ 容器常见），换一台"
 
-# BBR 加速：内核模块要先加载，否则 sysctl 静默失败（实测 Debian 12 默认不加载 tcp_bbr）
 modprobe tcp_bbr 2>/dev/null || true
 mkdir -p /etc/modules-load.d
 grep -q '^tcp_bbr$' /etc/modules-load.d/bbr.conf 2>/dev/null || echo tcp_bbr > /etc/modules-load.d/bbr.conf
