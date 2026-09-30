@@ -179,14 +179,14 @@ init_args=(-c "$CONF")
 "$BIN" down -c "$CONF" >/dev/null 2>&1 || true
 "$BIN" init "${init_args[@]}"
 
-for i in 1 2 3; do
-  [[ -f /etc/sysctl.d/99-antapp-link.conf ]] && sysctl -p /etc/sysctl.d/99-antapp-link.conf >/dev/null 2>&1 || true
-  [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]] && break
-  sleep 1
-done
-if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != "bbr" ]]; then
-  log "警告: BBR 未生效（当前 $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)）——内核可能不支持，隧道功能不受影响，只是弱网下吞吐略低"
+log "启用 BBR 加速"
+sysctl -w net.core.default_qdisc=fq >/dev/null
+if ! sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+  modprobe tcp_bbr
+  sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null
 fi
+[[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ]] || die "BBR 启用失败——内核不支持且模块加载不了"
+log "BBR 已生效（$(sysctl -n net.ipv4.tcp_congestion_control) + $(sysctl -n net.core.default_qdisc)）"
 
 log "安装 systemd 服务"
 "$BIN" install -c "$CONF"
