@@ -22,7 +22,7 @@ Pi 节点机 (Windows)                          云服 (Linux)
 **客户端（Windows，托盘应用）**
 
 - **秒级连接**：网络接管全程进程内系统调用（WireGuard winipcfg），不拉起任何外部命令
-- **国内分流**：809 条国内网段直连，其余走隧道——服务端故障也不影响国内上网
+- **国内分流**：国内网段直连，其余走隧道——服务端故障也不影响国内上网。网段表两级：内置兜底表 809 条（/16），`data\cn_routes.txt` 云端表存在且合法时优先（社区每日更新，当前 6207 条）
 - **出口迁移**：换 Wi-Fi / 插拔网线 / 睡眠唤醒自动跟随，绕行路由、DNS、分流无缝迁移，隧道秒级自愈
 - **DNS 防污染**：解析走隧道中继（服务端 dnsmasq `filter-AAAA`，v4-only 隧道不发 AAAA），`minepi.com` 一类被污染域名经隧道出口解析
 - **多配置文件管理**（OpenVPN 式）：`config\*.antapp` 每个文件一台服务器，托盘菜单直接列出、点谁连谁；一个文件自动连，多个让用户挑；文件名即身份，不改名不复制
@@ -90,7 +90,7 @@ internal/client/         Wintun 网卡、原生网络接管、出口迁移 watch
 internal/setup/          安装与卸载（释放文件、快捷方式、注册表）
 internal/update/         在线更新：检查、下载校验、替换自身
 deploy/                  云服安装脚本、DNS 中继说明与排障
-tools/                   netwatch 路由探针、资源生成、发版打包、更新链路自测
+tools/                   netwatch 路由探针、mkres 资源生成、release 发版打包、updatetest 更新链路自测、grayico/fixicon 图标工具、sshkey
 docs/superpowers/        设计文档与实现计划
 third_party/             Wintun 出处与哈希（dll 已提取进 internal/client/assets）
 ```
