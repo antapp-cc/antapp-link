@@ -257,6 +257,9 @@ func SwitchLogSession(source string) {
 		name = "client"
 	}
 	_ = activeSession.rot.SwitchFile(filepath.Join(LogsDir(rootDirForLogs), name+".log"))
+	// client.log 只装启动瞬间的过渡日志（自愈/更新检查等，发生在选定配置之前），
+	// 会话已切走，它没有保留价值——删掉，别在 logs 目录里留残渣
+	_ = os.Remove(filepath.Join(LogsDir(rootDirForLogs), "client.log"))
 	activeSession.buf.Clear()
 }
 
