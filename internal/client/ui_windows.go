@@ -802,7 +802,7 @@ func (u *UI) checkUpdate(manual bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	m, err := u.app.CheckUpdate(ctx)
+	m, err := u.app.CheckUpdate(ctx, !manual)
 
 	u.mw.Synchronize(func() {
 		switch {

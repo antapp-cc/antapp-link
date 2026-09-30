@@ -49,7 +49,7 @@ func run() int {
 	app := client.NewApp(pki.Invite{}, *dir, logger)
 
 	ctx := context.Background()
-	m, err := app.CheckUpdate(ctx)
+	m, err := app.CheckUpdate(ctx, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "检查更新失败: %v\n", err)
 		return 1

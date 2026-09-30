@@ -582,7 +582,7 @@ func (a *App) CurrentSource() string {
 // CheckUpdate 询问更新源。返回 nil 表示已经是最新。
 //
 // 部分源失败不算错（有备源就是干这个的）；只有全部源都失败才报错。
-func (a *App) CheckUpdate(ctx context.Context) (*update.Manifest, error) {
+func (a *App) CheckUpdate(ctx context.Context, quiet bool) (*update.Manifest, error) {
 	m, errs := a.checker.Check(ctx)
 	if m == nil {
 		if len(errs) > 0 && len(errs) == len(a.checker.Sources) {
@@ -591,7 +591,11 @@ func (a *App) CheckUpdate(ctx context.Context) (*update.Manifest, error) {
 			}
 			return nil, fmt.Errorf("所有更新源都不可用：%v", errs[0])
 		}
-		a.log.Info("已是最新版本", "version", Version)
+		if !quiet {
+			// 周期性自动检测成功且无新版本是常态，不写日志——否则几小时就把
+			// 有用的连接/错误日志顶出缓冲区。手动检查仍有弹窗反馈。
+			a.log.Info("已是最新版本", "version", Version)
+		}
 		return nil, nil
 	}
 
