@@ -179,8 +179,6 @@ init_args=(-c "$CONF")
 "$BIN" down -c "$CONF" >/dev/null 2>&1 || true
 "$BIN" init "${init_args[@]}"
 
-# modprobe 后内核刷新可用算法有延迟（全新 VPS 实测首次 sysctl 会抢在生效前），
-# 应用+校验带重试
 for i in 1 2 3; do
   [[ -f /etc/sysctl.d/99-antapp-link.conf ]] && sysctl -p /etc/sysctl.d/99-antapp-link.conf >/dev/null 2>&1 || true
   [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]] && break
