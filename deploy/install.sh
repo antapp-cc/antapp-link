@@ -57,27 +57,41 @@ reset_apt_sources() {
   local src=/etc/apt/sources.list
   local codename
   codename=$(grep -m1 -oP '(?<=^deb ).*? (?=main)' /etc/apt/sources.list 2>/dev/null | awk '{print $2}')
-  [[ -z "$codename" ]] && codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-bookworm}")
+  [[ -z "$codename" ]] && codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
 
-  if grep -q '^deb .*deb.debian.org' "$src" 2>/dev/null; then
-    log "软件源已是 Debian 官方源，跳过换源"
-    return 0
-  fi
-
-  [[ -f $src && ! -f $src.antapp-bak ]] && cp "$src" "$src.antapp-bak"
-
-  cat > "$src" <<SRCEOF
+  if [[ "${ID:-}" == "ubuntu" ]]; then
+    if grep -q '^deb .*archive.ubuntu.com' "$src" 2>/dev/null; then
+      log "软件源已是 Ubuntu 官方源，跳过换源"
+      return 0
+    fi
+    [[ -z "$codename" ]] && codename="noble"
+    [[ -f $src && ! -f $src.antapp-bak ]] && cp "$src" "$src.antapp-bak"
+    cat > "$src" <<SRCEOF
+deb https://archive.ubuntu.com/ubuntu/ $codename main restricted universe multiverse
+deb https://archive.ubuntu.com/ubuntu/ $codename-updates main restricted universe multiverse
+deb https://archive.ubuntu.com/ubuntu/ $codename-backports main restricted universe multiverse
+deb https://security.ubuntu.com/ubuntu/ $codename-security main restricted universe multiverse
+SRCEOF
+  else
+    if grep -q '^deb .*deb.debian.org' "$src" 2>/dev/null; then
+      log "软件源已是 Debian 官方源，跳过换源"
+      return 0
+    fi
+    [[ -z "$codename" ]] && codename="bookworm"
+    [[ -f $src && ! -f $src.antapp-bak ]] && cp "$src" "$src.antapp-bak"
+    cat > "$src" <<SRCEOF
 deb https://deb.debian.org/debian/ $codename main contrib non-free non-free-firmware
 deb https://deb.debian.org/debian/ $codename-updates main contrib non-free non-free-firmware
 deb https://deb.debian.org/debian-security/ $codename-security main contrib non-free non-free-firmware
 deb https://deb.debian.org/debian/ $codename-backports main contrib non-free non-free-firmware
 SRCEOF
+  fi
   if ls /etc/apt/sources.list.d/*.list >/dev/null 2>&1; then
     for f in /etc/apt/sources.list.d/*.list; do
       mv "$f" "$f.antapp-bak"
     done
   fi
-  log "软件源已切换为 Debian 官方源"
+  log "软件源已切换为官方源（$codename）"
 }
 
 ver_ge() {
