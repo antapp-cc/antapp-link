@@ -53,6 +53,10 @@ done
 
 [[ "$(id -u)" -eq 0 ]] || die "请用 root 运行"
 
+modprobe tcp_bbr 2>/dev/null || true
+mkdir -p /etc/modules-load.d
+grep -q '^tcp_bbr$' /etc/modules-load.d/bbr.conf 2>/dev/null || echo tcp_bbr > /etc/modules-load.d/bbr.conf
+
 reset_apt_sources() {
   local src=/etc/apt/sources.list
   local codename
@@ -161,10 +165,6 @@ command -v iptables >/dev/null || die "iptables 仍不可用"
 
 modprobe tun 2>/dev/null || true
 [[ -c /dev/net/tun ]] || die "/dev/net/tun 不可用 —— 这台机器不支持 TUN 设备（老式 OpenVZ 容器常见），换一台"
-
-modprobe tcp_bbr 2>/dev/null || true
-mkdir -p /etc/modules-load.d
-grep -q '^tcp_bbr$' /etc/modules-load.d/bbr.conf 2>/dev/null || echo tcp_bbr > /etc/modules-load.d/bbr.conf
 
 log "安装二进制到 $BIN"
 install -m 0755 "$SRC_DIR/antapp-linkd" "$BIN.new"
