@@ -820,7 +820,11 @@ func (u *UI) checkUpdate(manual bool) {
 			}
 		case err != nil:
 			if manual {
-				walk.MsgBox(u.mw, "检查更新失败", err.Error(), walk.MsgBoxIconWarning)
+				hint := ""
+				if !st.Running {
+					hint = "\n\n当前未连接隧道——更新服务器在国外，直连可能不稳定，连接后再试通常就能成功。"
+				}
+				walk.MsgBox(u.mw, "检查更新失败", err.Error()+hint, walk.MsgBoxIconWarning)
 			}
 		default:
 			if manual {
