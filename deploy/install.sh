@@ -53,6 +53,38 @@ done
 
 [[ "$(id -u)" -eq 0 ]] || die "请用 root 运行"
 
+reset_apt_sources() {
+  # 统一改写为 Debian 官方源（deb.debian.org，HTTPS）：
+  # 镜像商预装的源五花八门（.145 实测阿里云镜像在香港机上 45 秒下不完一个包索引，
+  # 官方源秒下），全部换成官方源最省事也最快。
+  # 幂等：已是官方源就不动；原文件备份成 .antapp-bak（已有备份不重复备份）。
+  local src=/etc/apt/sources.list
+  local codename
+  codename=$(grep -m1 -oP '(?<=^deb ).*? (?=main)' /etc/apt/sources.list 2>/dev/null | awk '{print $2}')
+  [[ -z "$codename" ]] && codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-bookworm}")
+
+  if grep -q '^deb .*deb.debian.org' "$src" 2>/dev/null; then
+    log "软件源已是 Debian 官方源，跳过换源"
+    return 0
+  fi
+
+  [[ -f $src && ! -f $src.antapp-bak ]] && cp "$src" "$src.antapp-bak"
+
+  cat > "$src" <<SRCEOF
+deb https://deb.debian.org/debian/ $codename main contrib non-free non-free-firmware
+deb https://deb.debian.org/debian/ $codename-updates main contrib non-free non-free-firmware
+deb https://deb.debian.org/debian-security/ $codename-security main contrib non-free non-free-firmware
+deb https://deb.debian.org/debian/ $codename-backports main contrib non-free non-free-firmware
+SRCEOF
+  # 发行版目录下的第三方源文件一并停用（镜像商常在这里塞东西）
+  if ls /etc/apt/sources.list.d/*.list >/dev/null 2>&1; then
+    for f in /etc/apt/sources.list.d/*.list; do
+      mv "$f" "$f.antapp-bak"
+    done
+  fi
+  log "软件源已切换为 Debian 官方源（原配置备份为 *.antapp-bak）"
+}
+
 ver_ge() {
   local lo
   lo=$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)
@@ -72,6 +104,10 @@ case "${ID:-}" in
     ;;
 esac
 log "系统检查通过：${PRETTY_NAME:-$ID $VERSION_ID}"
+
+if command -v apt-get >/dev/null; then
+  reset_apt_sources
+fi
 
 if [[ -f $CONF ]]; then
   log "检测到已安装 AntApp Link——本次按升级处理：只更新程序与配置，CA、已签发证书和 /root/pinode.antapp 全部原样保留，老连接码继续有效"
