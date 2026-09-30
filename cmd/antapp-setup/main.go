@@ -75,6 +75,9 @@ func runQuiet(uninstall bool, dirFlag string) int {
 	opts := setup.DefaultOptions()
 	opts.ClientExe = clientExe
 	opts.Notices = notices
+	// 静默安装是给一键部署这类无人值守流程用的：装完不拉起客户端，
+	// 免得部署中途弹出引导窗口，连接码也是部署流程后面才导进来的
+	opts.Launch = false
 	if dirFlag != "" {
 		opts.InstallDir = dirFlag
 	}
