@@ -179,9 +179,13 @@ init_args=(-c "$CONF")
 "$BIN" down -c "$CONF" >/dev/null 2>&1 || true
 "$BIN" init "${init_args[@]}"
 
-if [[ -f /etc/sysctl.d/99-antapp-link.conf ]]; then
-  sysctl -p /etc/sysctl.d/99-antapp-link.conf >/dev/null 2>&1 || true
-fi
+# modprobe 后内核刷新可用算法有延迟（全新 VPS 实测首次 sysctl 会抢在生效前），
+# 应用+校验带重试
+for i in 1 2 3; do
+  [[ -f /etc/sysctl.d/99-antapp-link.conf ]] && sysctl -p /etc/sysctl.d/99-antapp-link.conf >/dev/null 2>&1 || true
+  [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]] && break
+  sleep 1
+done
 if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != "bbr" ]]; then
   log "警告: BBR 未生效（当前 $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)）——内核可能不支持，隧道功能不受影响，只是弱网下吞吐略低"
 fi
