@@ -118,6 +118,11 @@ command -v iptables >/dev/null || die "iptables 仍不可用"
 modprobe tun 2>/dev/null || true
 [[ -c /dev/net/tun ]] || die "/dev/net/tun 不可用 —— 这台机器不支持 TUN 设备（老式 OpenVZ 容器常见），换一台"
 
+# BBR 加速：内核模块要先加载，否则 sysctl 静默失败（实测 Debian 12 默认不加载 tcp_bbr）
+modprobe tcp_bbr 2>/dev/null || true
+mkdir -p /etc/modules-load.d
+grep -q '^tcp_bbr$' /etc/modules-load.d/bbr.conf 2>/dev/null || echo tcp_bbr > /etc/modules-load.d/bbr.conf
+
 log "安装二进制到 $BIN"
 install -m 0755 "$SRC_DIR/antapp-linkd" "$BIN.new"
 mv -f "$BIN.new" "$BIN"
@@ -130,6 +135,13 @@ init_args=(-c "$CONF")
 
 "$BIN" down -c "$CONF" >/dev/null 2>&1 || true
 "$BIN" init "${init_args[@]}"
+
+if [[ -f /etc/sysctl.d/99-antapp-link.conf ]]; then
+  sysctl -p /etc/sysctl.d/99-antapp-link.conf >/dev/null 2>&1 || true
+fi
+if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != "bbr" ]]; then
+  log "警告: BBR 未生效（当前 $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)）——内核可能不支持，隧道功能不受影响，只是弱网下吞吐略低"
+fi
 
 log "安装 systemd 服务"
 "$BIN" install -c "$CONF"
