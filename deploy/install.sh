@@ -57,14 +57,14 @@ reset_apt_sources() {
   local src=/etc/apt/sources.list
   local codename
   codename=$(grep -m1 -oP '(?<=^deb ).*? (?=main)' /etc/apt/sources.list 2>/dev/null | awk '{print $2}')
-  [[ -z "$codename" ]] && codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+  [[ "$codename" =~ ^[a-z]+$ ]] || codename=${VERSION_CODENAME:-}
+  [[ "$codename" =~ ^[a-z]+$ ]] || die "认不出系统代号（codename），换源中止——请检查 /etc/apt/sources.list 或手动换源后重试"
 
   if [[ "${ID:-}" == "ubuntu" ]]; then
     if grep -q '^deb .*archive.ubuntu.com' "$src" 2>/dev/null; then
       log "软件源已是 Ubuntu 官方源，跳过换源"
       return 0
     fi
-    [[ -z "$codename" ]] && codename="noble"
     [[ -f $src && ! -f $src.antapp-bak ]] && cp "$src" "$src.antapp-bak"
     cat > "$src" <<SRCEOF
 deb https://archive.ubuntu.com/ubuntu/ $codename main restricted universe multiverse
@@ -77,7 +77,6 @@ SRCEOF
       log "软件源已是 Debian 官方源，跳过换源"
       return 0
     fi
-    [[ -z "$codename" ]] && codename="bookworm"
     [[ -f $src && ! -f $src.antapp-bak ]] && cp "$src" "$src.antapp-bak"
     cat > "$src" <<SRCEOF
 deb https://deb.debian.org/debian/ $codename main contrib non-free non-free-firmware
@@ -86,11 +85,11 @@ deb https://deb.debian.org/debian-security/ $codename-security main contrib non-
 deb https://deb.debian.org/debian/ $codename-backports main contrib non-free non-free-firmware
 SRCEOF
   fi
-  if ls /etc/apt/sources.list.d/*.list >/dev/null 2>&1; then
-    for f in /etc/apt/sources.list.d/*.list; do
-      mv "$f" "$f.antapp-bak"
-    done
-  fi
+  local f
+  for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [[ -f "$f" ]] || continue
+    mv "$f" "$f.antapp-bak"
+  done
   log "软件源已切换为官方源（$codename）"
 }
 
