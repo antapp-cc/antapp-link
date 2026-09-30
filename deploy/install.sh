@@ -77,7 +77,7 @@ SRCEOF
       mv "$f" "$f.antapp-bak"
     done
   fi
-  log "软件源已切换为 Debian 官方源（原配置备份为 *.antapp-bak）"
+  log "软件源已切换为 Debian 官方源"
 }
 
 ver_ge() {
