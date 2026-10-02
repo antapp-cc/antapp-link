@@ -97,3 +97,21 @@ func TestUint32Helpers(t *testing.T) {
 		t.Error("长度不对时应该返回 false")
 	}
 }
+
+// 类型名会出现在日志与握手错误里，新增帧类型必须登记，否则排障只看到 TYPE(0x08)。
+func TestTypeStringCoversAllKnownTypes(t *testing.T) {
+	for typ, want := range map[Type]string{
+		TypeHello:     "HELLO",
+		TypeHelloAck:  "HELLO_ACK",
+		TypeIP:        "IP",
+		TypePing:      "PING",
+		TypePong:      "PONG",
+		TypeBye:       "BYE",
+		TypeUDPPort:   "UDP_PORT",
+		TypeMemberAck: "MEMBER_ACK",
+	} {
+		if got := typ.String(); got != want {
+			t.Errorf("Type(%#02x).String() = %q，期望 %q", uint8(typ), got, want)
+		}
+	}
+}

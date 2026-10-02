@@ -54,6 +54,48 @@ func TestLoadConfigRejectsMissingFile(t *testing.T) {
 	}
 }
 
+// 文档里的写法是 tunnel.max_members，必须原生生效——写在顶层会静默失效，这类坑
+// 不值得再踩一次。
+func TestLoadConfigAcceptsTunnelMaxMembers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.json")
+	if err := os.WriteFile(path, []byte(`{"tunnel":{"max_members":3}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Tunnel.MaxMembers != 3 {
+		t.Errorf("tunnel.max_members = %d，期望 3", cfg.Tunnel.MaxMembers)
+	}
+}
+
+// 早期版本把 max_members 写在顶层，读到要并进 tunnel 层，不能静默丢掉。
+func TestLoadConfigMigratesTopLevelMaxMembers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.json")
+	if err := os.WriteFile(path, []byte(`{"max_members":2}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Tunnel.MaxMembers != 2 {
+		t.Errorf("顶层旧写法的 max_members 没被迁移，实际 %d", cfg.Tunnel.MaxMembers)
+	}
+}
+
+func TestValidateRejectsBadMaxMembers(t *testing.T) {
+	for _, n := range []int{0, 5} {
+		cfg := Default()
+		cfg.Tunnel.MaxMembers = n
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "max_members") {
+			t.Errorf("max_members=%d 应该报错，实际 %v", n, err)
+		}
+	}
+}
+
 func TestValidateRejectsBadConfig(t *testing.T) {
 	base := Default()
 	cases := []struct {
