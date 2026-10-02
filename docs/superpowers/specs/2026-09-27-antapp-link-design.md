@@ -1,7 +1,7 @@
 # AntApp Pi 节点虚拟专线（antapp-link）设计
 
 日期：2026-09-27
-状态：待评审
+状态：历史评审稿——实现已在三处走远：端口转发改为服务端应答式转发器（无 DNAT、只转 TCP）、DNS 改为 dnsmasq 中继 + 客户端 NRPT、客户端配置改为 `config\*.antapp`。以 README.md 为准
 
 ## 1. 背景
 

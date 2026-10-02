@@ -21,7 +21,7 @@ import (
 // 智能分流的国内网段表：数据与程序分离。
 //
 //   exe 内嵌一份兜底表（cn_routes.txt，随版本发布）；
-//   data\cn_routes.txt 是云端表（社区每日更新），存在且合法时优先使用。
+//   data\cnr.cache 是云端表（社区每日更新，混淆缓存），存在且合法时优先使用。
 //   客户端每 24 小时从公共源拉取刷新；拉取/校验失败一律静默保持现状，
 //   绝不影响连接。启动时只读本地文件（毫秒级），不发起任何网络请求。
 
@@ -43,7 +43,7 @@ const (
 
 var (
 	routeTableMu     sync.RWMutex
-	routeTablePath   string   // data\cn_routes.txt，NewApp 时注入
+	routeTablePath   string   // data\cnr.cache，NewApp 时注入
 	activeRouteTable []string // 当前生效的网段表
 )
 

@@ -1,6 +1,6 @@
 # AntApp Link
 
-Pi 节点虚拟专线：**服务端（Linux 单二进制）+ 客户端（Windows 单 exe）全自研**。TLS 1.3 双向认证隧道 + Wintun 虚拟网卡 + 内核端口转发。
+Pi 节点虚拟专线：**服务端（Linux 单二进制）+ 客户端（Windows 单 exe）全自研**。TLS 1.3 双向认证隧道 + Wintun 虚拟网卡 + 服务端应答式端口转发。
 
 ## 架构
 
@@ -21,11 +21,11 @@ Pi 节点机 (Windows)                          云服 (Linux)
 
 **客户端（Windows，托盘应用）**
 
-- **秒级连接**：网络接管全程进程内系统调用（WireGuard winipcfg），不拉起任何外部命令
-- **国内分流**：国内网段直连，其余走隧道——服务端故障也不影响国内上网。网段表两级：内置兜底表 809 条（/16），`data\cn_routes.txt` 云端表存在且合法时优先（社区每日更新，当前 6207 条）
+- **秒级连接**：网络接管全程进程内系统调用（WireGuard winipcfg），不依赖 netsh / route 等外部命令
+- **国内分流**：国内网段直连，其余走隧道——服务端故障也不影响国内上网。网段表两级：内置兜底表 809 条（/16），云端表存在且合法时优先（社区维护，每 24 小时刷新，落盘 `data\cnr.cache`）
 - **出口迁移**：换 Wi-Fi / 插拔网线 / 睡眠唤醒自动跟随，绕行路由、DNS、分流无缝迁移，隧道秒级自愈
 - **DNS 防污染**：解析走隧道中继（服务端 dnsmasq `filter-AAAA`，v4-only 隧道不发 AAAA），`minepi.com` 一类被污染域名经隧道出口解析
-- **多配置文件管理**（OpenVPN 式）：`config\*.antapp` 每个文件一台服务器，托盘菜单直接列出、点谁连谁；一个文件自动连，多个让用户挑；文件名即身份，不改名不复制
+- **多配置文件管理**（OpenVPN 式）：`config\*.antapp` 每个文件一台服务器，托盘菜单直接列出、点谁连谁；一个文件自动连，多个从托盘菜单里挑（启动时不弹选择框）；文件名即身份，不改名不复制
 - **安全自愈**：连接前先探测服务端（不通则不动网络）；出网自检失败自动断开还原；崩溃 / 强杀后启动自愈
 - **在线更新**：启动 8 秒后 + 每 1 小时自动检查；发现新版本**自动下载、校验、应用重启**，全程无交互（界面同时保留手动更新按钮）；启动时自动清理上次更新的 .old 备份
 - 托盘 + 主窗口（状态 / 日志 / 延迟 / 流量 / 当前配置文件）、连接码双击导入与托盘热切换、开机自启（计划任务，无 UAC 弹窗）、单实例
@@ -52,7 +52,7 @@ wget -qO install.sh "https://raw.githubusercontent.com/antapp-cc/antapp-link/mai
 
 ### 客户端（节点机，管理员）
 
-运行 `AntAppLink-Setup` 目录里的 `antapp-setup.exe` 安装（自动建快捷方式、注册 `.antapp` 关联、可勾选开机自启），然后**双击连接码文件**或在托盘菜单「导入连接码」粘贴单行码，连接即用。
+运行单文件安装器 `AntAppLink-安装-<版本>.exe`（自动建快捷方式、注册 `.antapp` 关联；开机自启在客户端托盘菜单里勾选），然后**双击连接码文件**或在托盘菜单「导入连接码」粘贴单行码，连接即用。
 
 详细的服务端运维、迁移与排障见 [deploy/README.md](deploy/README.md)。
 
@@ -83,6 +83,7 @@ antapp-link.exe -version          显示版本
 ```
 cmd/antapp-linkd/        服务端入口（Linux，单二进制）
 cmd/antapp-link/         客户端入口（Windows，单 exe + 托盘）
+cmd/antapp-setup/        单文件安装器（内嵌客户端与第三方许可）
 internal/proto/          帧编解码（两端共用）
 internal/pki/            自签 CA 与连接码
 internal/server/         TUN、隧道循环、netfilter、CLI、systemd 安装
@@ -90,7 +91,7 @@ internal/client/         Wintun 网卡、原生网络接管、出口迁移 watch
 internal/setup/          安装与卸载（释放文件、快捷方式、注册表）
 internal/update/         在线更新：检查、下载校验、替换自身
 deploy/                  云服安装脚本、DNS 中继说明与排障
-tools/                   netwatch 路由探针、mkres 资源生成、release 发版打包、updatetest 更新链路自测、grayico/fixicon 图标工具、sshkey
+tools/                   netwatch 路由探针、mkres 资源生成、release 发版打包、updatetest 更新链路自测、grayico/fixicon 图标工具、sshkey、fakeapp 假新版程序
 docs/superpowers/        设计文档与实现计划
 third_party/             Wintun 出处与哈希（dll 已提取进 internal/client/assets）
 ```
