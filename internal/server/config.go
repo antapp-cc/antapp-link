@@ -60,7 +60,7 @@ func Default() Config {
 			ServerIP:   "10.10.0.1",
 			ClientIP:   "10.10.0.2",
 			MTU:        1400,
-			MaxMembers: 1,
+			MaxMembers: 4,
 		},
 		// 客户端的 DNS 指向隧道网关：服务端在网关上跑 dnsmasq（filter-AAAA）。
 		// 隧道只接管 IPv4，绝不能把 AAAA 发给客户端 —— 浏览器拿到 v6 地址会
