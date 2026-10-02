@@ -203,7 +203,7 @@ func cmdInvite(stdout, stderr io.Writer, args []string) int {
 	cfgPath := fs.String("c", DefaultConfigPath, "配置文件路径")
 	outDir := fs.String("o", ".", "连接码输出目录")
 	serverAddr := fs.String("server", "", "服务端地址 host:port（默认自动探测公网 IP）")
-	membersFlag := fs.Int("members", 0, "并行连接数（0/1=单连接，最大 4；受 max_members 限制）")
+	membersFlag := fs.Int("members", 0, "并行连接数（默认=服务端 max_members；显式传 1 表示单连接，上限 4）")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
 	}
@@ -234,9 +234,11 @@ func cmdInvite(stdout, stderr io.Writer, args []string) int {
 		addr = net.JoinHostPort(ip, port)
 	}
 
+	// 不指定 --members 时跟随服务端上限：默认就是 4 条，而不是灰度期的单连接。
+	// 显式传 1 仍然表示「要单连接」。
 	members := *membersFlag
-	if members < 0 {
-		members = 0
+	if members <= 0 {
+		members = cfg.Tunnel.MaxMembers
 	}
 	if members > cfg.Tunnel.MaxMembers {
 		members = cfg.Tunnel.MaxMembers
