@@ -801,12 +801,8 @@ func (u *UI) autoCheckUpdate() {
 	// 必定超时，白跑一次还会在日志里留一条「更新源不可用」；刚连上那几秒
 	// 路由与 DNS 接管也未必落定，所以额外再等一段。
 	// 等不到就先跳过这一轮，交给下面每小时的循环重试。
-	u.app.Log().Info("自动更新：等待隧道就绪")
 	if u.waitTunnelReady(5 * time.Minute) {
-		u.app.Log().Info("自动更新：隧道就绪且已稳定 30 秒，开始检查")
 		u.checkUpdate(false)
-	} else {
-		u.app.Log().Info("自动更新：隧道未就绪或界面已关闭，跳过本轮，之后每小时重试")
 	}
 
 	ticker := time.NewTicker(time.Hour)
