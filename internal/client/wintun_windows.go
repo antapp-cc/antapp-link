@@ -90,6 +90,31 @@ func (d *WintunDevice) Read(p []byte) (int, error) {
 	}
 }
 
+// TryRead 非阻塞收割一个已就绪的包：Wintun 的 ReceivePacket 本就是"无包立即
+// 返回 ERROR_NO_MORE_ITEMS"的轮询语义，正好当非阻塞读用（写合并的收割端）。
+func (d *WintunDevice) TryRead(p []byte) (int, error) {
+	select {
+	case <-d.closed:
+		return 0, ErrDeviceClosed
+	default:
+	}
+	d.recvMu.Lock()
+	defer d.recvMu.Unlock()
+	packet, err := d.session.ReceivePacket()
+	if err == nil {
+		n := copy(p, packet)
+		d.session.ReleaseReceivePacket(packet)
+		return n, nil
+	}
+	if errors.Is(err, windows.ERROR_NO_MORE_ITEMS) {
+		return 0, nil // 无包，不等待
+	}
+	if errors.Is(err, windows.ERROR_HANDLE_EOF) {
+		return 0, fmt.Errorf("%w: %w", ErrAdapterDead, err)
+	}
+	return 0, fmt.Errorf("读网卡: %w", err)
+}
+
 // Write 把包交给内核。发送队列满时重试一小会儿，再不行就丢弃 ——
 // IP 层本就是尽力而为，丢一个包远好过让整条隧道重连。
 func (d *WintunDevice) Write(p []byte) (int, error) {

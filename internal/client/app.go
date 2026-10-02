@@ -39,6 +39,8 @@ type App struct {
 
 	checker *update.Checker
 	pending *update.Manifest
+
+	orderTrace *OrderTracer
 }
 
 type Option func(*App)
@@ -49,6 +51,21 @@ type Option func(*App)
 // 可以在完全不碰现有网络的前提下验完。
 func WithNoNetCfg() Option {
 	return func(a *App) { a.noNetCfg = true }
+}
+
+// WithOrderTrace 把每个进出隧道的包（方向、槽位、五元组、seq）记到文件，
+// 用来断言「同一内层流是否始终走同一个槽」——抓包工具的时间戳做不到这件事。
+// 不传这个 Option 时 tracer 为 nil，数据面只多一次 nil 判断。
+func WithOrderTrace(path string) Option {
+	return func(a *App) {
+		tr, err := NewOrderTracer(path)
+		if err != nil {
+			a.log.Warn("顺序追踪未能启用", "path", path, "err", err)
+			return
+		}
+		a.orderTrace = tr
+		a.log.Info("顺序追踪已启用", "file", path)
+	}
 }
 
 func NewApp(inv pki.Invite, rootDir string, logger *slog.Logger, opts ...Option) *App {
@@ -219,6 +236,7 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snapshot) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	tunnel := NewTunnel(inv, dev, a.log)
+	tunnel.Trace = a.orderTrace
 	// 适配器被外力干掉时，重拨 TCP 救不了，要走一次完整的断开+连接
 	// （重开设备、重新接管网络）。它是异步的：先 Disconnect 掉本循环，
 	// 再走一遍 connectSlow 的全流程。
@@ -244,7 +262,7 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 
 	go func() {
 		if err := tunnel.Run(ctx); err != nil {
-			a.log.Warn("隧道循环退出", "err", err)
+			a.log.Warn("隧道循环退出", connLogAttrs(err, nil)...)
 		}
 	}()
 	a.log.Info("已连接", "server", inv.Server, "tunnel_ip", cfg.TunnelIP)
@@ -348,7 +366,7 @@ func (a *App) watchHealth(ctx context.Context) {
 		return
 	}
 
-	a.log.Error("出网自检失败，自动断开并还原网络", "err", err)
+	a.log.Error("出网自检失败，自动断开并还原网络", connLogAttrs(err, nil)...)
 	a.mu.Lock()
 	a.lastError = "出网自检失败：" + err.Error()
 	a.mu.Unlock()

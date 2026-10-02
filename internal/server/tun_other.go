@@ -13,5 +13,6 @@ func OpenTUN(string) (*TUN, error)              { return nil, ErrNoTUN }
 func (t *TUN) Name() string                     { return "" }
 func (t *TUN) Configure(string, int, int) error { return ErrNoTUN }
 func (t *TUN) Read([]byte) (int, error)         { return 0, ErrNoTUN }
+func (t *TUN) TryRead([]byte) (int, error)      { return 0, ErrNoTUN }
 func (t *TUN) Write([]byte) (int, error)        { return 0, ErrNoTUN }
 func (t *TUN) Close() error                     { return nil }

@@ -32,6 +32,7 @@ type TunnelParams struct {
 	MTU      int
 	DNS      []string
 	Mode     TunnelMode // 空表示 TCP
+	Members  int        // 并行连接数（0/1=单连接，最大 4）
 }
 
 // TunnelMode 是隧道的数据通道走法。
@@ -66,6 +67,7 @@ type Invite struct {
 	MTU      int        `json:"mtu"`
 	DNS      []string   `json:"dns"`
 	Mode     TunnelMode `json:"mode,omitempty"`
+	Members  int        `json:"members,omitempty"`
 	CAPEM    string     `json:"ca_pem"`
 	CertPEM  string     `json:"cert_pem"`
 	KeyPEM   string     `json:"key_pem"`
@@ -106,6 +108,7 @@ func Issue(dir, name, server string, tp TunnelParams) (Invite, error) {
 		MTU:      tp.MTU,
 		DNS:      tp.DNS,
 		Mode:     tp.Mode,
+		Members:  tp.Members,
 		CAPEM:    string(caPEM),
 		CertPEM:  string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})),
 		KeyPEM:   string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})),
@@ -232,5 +235,8 @@ func ClientTLSConfig(inv Invite) (*tls.Config, error) {
 		ServerName:   ServerName,
 		MinVersion:   tls.VersionTLS13,
 		NextProtos:   []string{ALPN},
+		// 多连接并发：成员连接复用 TLS 会话（老熟人免重验），省服务端计算量。
+		// 不开 EarlyData：Go 无客户端 0-RTT 支持且有重放风险。
+		ClientSessionCache: tls.NewLRUClientSessionCache(8),
 	}, nil
 }

@@ -8,6 +8,7 @@ type WintunDevice struct{}
 func OpenDevice() (*WintunDevice, error) { return nil, ErrNoWintun }
 
 func (d *WintunDevice) Read([]byte) (int, error)    { return 0, ErrNoWintun }
+func (d *WintunDevice) TryRead([]byte) (int, error) { return 0, ErrNoTryRead }
 func (d *WintunDevice) Write(p []byte) (int, error) { return 0, ErrNoWintun }
 func (d *WintunDevice) Name() string                { return "" }
 func (d *WintunDevice) Close() error                { return nil }

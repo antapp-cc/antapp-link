@@ -11,7 +11,7 @@ const (
 	AutostartTask = "AntAppLink"
 )
 
-var Version = "0.1.0"
+var Version = "0.2.5"
 
 var ErrNotWindows = errors.New("setup: 安装程序只在 Windows 上可用")
 

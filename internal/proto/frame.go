@@ -42,6 +42,8 @@ func (t Type) String() string {
 		return "BYE"
 	case TypeUDPPort:
 		return "UDP_PORT"
+	case TypeMemberAck:
+		return "MEMBER_ACK"
 	default:
 		return fmt.Sprintf("TYPE(0x%02X)", uint8(t))
 	}

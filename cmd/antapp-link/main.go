@@ -20,11 +20,13 @@ func main() {
 
 func run() int {
 	var (
-		codeArg  = flag.String("c", "", "连接码：单行 antapp:// 或 .antapp 文件路径（双击连接码文件时由系统传入）")
-		dataArg  = flag.String("data", defaultRootDir(), "工作根目录（config/、logs/、data/ 都建在它下面）")
-		once     = flag.Bool("once", false, "前台连接，不显示界面（Ctrl+C 退出）")
-		noNetCfg = flag.Bool("no-netcfg", false, "只建隧道、只配虚拟网卡，不改路由与 DNS（联调端口转发用）")
-		showVer  = flag.Bool("version", false, "显示版本")
+		codeArg    = flag.String("c", "", "连接码：单行 antapp:// 或 .antapp 文件路径（双击连接码文件时由系统传入）")
+		dataArg    = flag.String("data", defaultRootDir(), "工作根目录（config/、logs/、data/ 都建在它下面）")
+		once       = flag.Bool("once", false, "前台连接，不显示界面（Ctrl+C 退出）")
+		noNetCfg   = flag.Bool("no-netcfg", false, "只建隧道、只配虚拟网卡，不改路由与 DNS（联调端口转发用）")
+		orderTrace = flag.String("order-trace", "",
+			"联调用：把每个进出隧道的包（方向/槽位/五元组/seq）记到该文件，用来断言同一内层流不跨外层连接")
+		showVer = flag.Bool("version", false, "显示版本")
 	)
 	flag.Parse()
 
@@ -95,6 +97,9 @@ func run() int {
 		// 这是说明不是警告：-no-netcfg 只在命令行显式指定时才有，
 		// 正常双击启动走不到这里。
 		logger.Info("联调模式：只建隧道、只配网卡，不改路由与 DNS")
+	}
+	if *orderTrace != "" {
+		opts = append(opts, client.WithOrderTrace(*orderTrace))
 	}
 	// 清掉上次在线更新留下的旧程序备份（更新时正在运行删不掉，新进程里删才删得动）
 	update.CleanupOld()

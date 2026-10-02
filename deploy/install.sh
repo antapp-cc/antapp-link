@@ -188,6 +188,45 @@ fi
 [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ]] || die "BBR 启用失败——内核不支持且模块加载不了"
 log "BBR 已生效（$(sysctl -n net.ipv4.tcp_congestion_control) + $(sysctl -n net.core.default_qdisc)）"
 
+log "调优内核缓冲（多连接数据面）"
+apply_sysctl() {
+  sysctl -w "$1" >/dev/null 2>&1
+}
+apply_or_die() {
+  apply_sysctl "$1"
+  want="${1#*=}"
+  got="$(sysctl -n "${1%%=*}")"
+  [[ "$got" == "$want" ]] || die "内核参数 $1 应用失败（当前 $got，期望 $want）"
+}
+# 多值参数（tcp_rmem/tcp_wmem）内核回读是制表符分隔，比较前先归一空白
+apply_list_or_die() {
+  apply_sysctl "$1"
+  key="${1%%=*}"
+  want="$(printf '%s' "${1#*=}" | tr -s ' \t' ' ')"
+  got="$(sysctl -n "$key" | tr -s ' \t' ' ')"
+  [[ "$got" == "$want" ]] || die "内核参数 $key 应用失败（当前 $got，期望 $want）"
+}
+
+# 先备份原值：tcp_rmem/tcp_wmem 是整串覆盖，会冲掉机器上已有的自定义值
+mkdir -p "$CONF_DIR"
+SYSCTL_BACKUP="$CONF_DIR/sysctl-backup.txt"
+: > "$SYSCTL_BACKUP"
+for k in net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
+         net.core.rmem_max net.core.wmem_max net.ipv4.tcp_mtu_probing net.ipv4.tcp_fastopen; do
+  printf '%s = %s\n' "$k" "$(sysctl -n "$k" 2>/dev/null || echo '(读取失败)')" >> "$SYSCTL_BACKUP"
+done
+log "原值已备份到 $SYSCTL_BACKUP"
+
+apply_or_die "net.ipv4.tcp_slow_start_after_idle=0"
+apply_or_die "net.core.rmem_max=16777216"
+apply_or_die "net.core.wmem_max=16777216"
+apply_or_die "net.ipv4.tcp_mtu_probing=1"
+apply_list_or_die "net.ipv4.tcp_rmem=4096 87380 16777216"
+apply_list_or_die "net.ipv4.tcp_wmem=4096 65536 16777216"
+# 占位项：Go 标准库不发起 TFO，配了也不生效，所以只应用、不验收
+apply_sysctl "net.ipv4.tcp_fastopen=3"
+log "内核缓冲调优完成（rmem/wmem 上限 16MB，空闲不重新起步；持久化见 /etc/sysctl.d/99-antapp-link.conf）"
+
 log "安装 systemd 服务"
 "$BIN" install -c "$CONF"
 

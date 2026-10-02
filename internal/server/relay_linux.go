@@ -70,7 +70,7 @@ func handleRelayConn(conn net.Conn, target string, log *slog.Logger) {
 	defer conn.Close()
 	upstream, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
-		log.Debug("转发连接拨号节点机失败", "target", target, "err", err)
+		log.Debug("转发连接拨号节点机失败", connLogAttrs(err, conn, "target", target)...)
 		return
 	}
 	defer upstream.Close()

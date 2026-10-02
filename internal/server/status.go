@@ -18,6 +18,19 @@ type Status struct {
 	Client      string `json:"client,omitempty"`
 	ConnectedAt string `json:"connected_at,omitempty"`
 	UpdatedAt   string `json:"updated_at"`
+	Members     int    `json:"members,omitempty"`
+	LiveMembers int    `json:"live_members,omitempty"`
+	// 每槽收发字节 + 熔断计数：灰度多连接时看流量分摊，以及 JOIN 是否正被拒
+	Slots        []SlotStatus `json:"slots,omitempty"`
+	JoinFailures int          `json:"join_failures,omitempty"`
+}
+
+// SlotStatus 是一条连接的收发字节，按链路上的字节算（含帧头）。
+// 空槽（成员连接断开待补）也会出现，字节数保持 0。
+type SlotStatus struct {
+	Slot    int    `json:"slot"`
+	RxBytes uint64 `json:"rx_bytes"`
+	TxBytes uint64 `json:"tx_bytes"`
 }
 
 // WriteStatus 先写临时文件再改名，避免 status 读到半个 JSON。
