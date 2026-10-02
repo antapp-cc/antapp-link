@@ -117,8 +117,12 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 
 // pumpTun 把网卡上的包送往当前客户端。没有客户端时直接丢弃：云服自身的流量不会
 // 走这张网卡（默认路由还在原网卡上），所以丢包是安全且正确的。
+//
+// 写合并：首包选定槽位后，非阻塞收割同槽的现成包（TryRead 不等待），拼单缓冲
+// 一次写出——外层 TLS 记录减半。不同槽的包先 flush 再单独起批。
 func (s *Server) pumpTun(ctx context.Context) {
 	buf := make([]byte, readBufferSize)
+	batch := make([]byte, 0, proto.MaxBatchBytes)
 	for {
 		n, err := s.tun.Read(buf)
 		if err != nil {
@@ -135,9 +139,35 @@ func (s *Server) pumpTun(ctx context.Context) {
 		if sess == nil {
 			continue
 		}
-		if err := sess.writePkt(buf[:n]); err != nil {
+		k := proto.Slot(buf[:n], sess.membersN())
+
+		batch = proto.AppendHeader(batch[:0], proto.TypeIP, n)
+		batch = append(batch, buf[:n]...)
+
+		for len(batch) < proto.MaxBatchBytes-proto.HeaderSize-readBufferSize {
+			m, rerr := s.tun.TryRead(buf)
+			if rerr != nil || m <= 0 {
+				break
+			}
+			kk := proto.Slot(buf[:m], sess.membersN())
+			if kk != k {
+				if err := sess.flushBatch(k, batch); err != nil {
+					s.log.Debug("转发给客户端失败", "client", sess.name, "err", err)
+				}
+				batch = batch[:0]
+				k = kk
+				batch = proto.AppendHeader(batch, proto.TypeIP, m)
+				batch = append(batch, buf[:m]...)
+				continue
+			}
+			batch = proto.AppendHeader(batch, proto.TypeIP, m)
+			batch = append(batch, buf[:m]...)
+		}
+
+		if err := sess.flushBatch(k, batch); err != nil {
 			s.log.Debug("转发给客户端失败", "client", sess.name, "err", err)
 		}
+		batch = batch[:0]
 	}
 }
 
@@ -499,6 +529,14 @@ func (s *session) write(t proto.Type, payload []byte) error {
 // writePkt 把一个内层 IP 包按流哈希送到对应槽位；槽位死亡落控制连接。
 func (s *session) writePkt(pkt []byte) error {
 	return s.slot(proto.Slot(pkt, s.membersN())).write(proto.TypeIP, pkt)
+}
+
+// flushBatch 把合并缓冲一次写入槽位 k 的连接。
+func (s *session) flushBatch(k int, batch []byte) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	return s.slot(k).write(proto.TypeIP, batch)
 }
 
 // membersN 返回生效的连接总数（读锁内拷贝，避免与握手竞态）。

@@ -34,10 +34,16 @@ const (
 // 所以客户端不需要用户态协议栈，也不需要端口转发器。
 type Device interface {
 	Read(p []byte) (int, error)
+	// TryRead 非阻塞收割一个已就绪的包：无包立即返回 (0, nil)，不等待。
+	// 供写合并使用；实现方不支持时返回 (0, ErrNoTryRead)。
+	TryRead(p []byte) (int, error)
 	Write(p []byte) (int, error)
 	Name() string
 	Close() error
 }
+
+// ErrNoTryRead 表示设备不支持非阻塞读（写合并自动退化为单包模式）。
+var ErrNoTryRead = errors.New("client: 设备不支持 TryRead")
 
 // Ack 是服务端 HELLO_ACK 的内容。
 type Ack struct {
@@ -503,8 +509,13 @@ func (s *clientSession) pumpFromTunnel(ctx context.Context) error {
 }
 
 // pumpFromDevice：网卡上出现的包（也就是内核要发往外网的包）送进隧道。
+//
+// 写合并：首包选定槽位后，非阻塞地继续收割内核缓冲里现成的、同槽的包，
+// 拼成单缓冲一次写出——外层 TLS 记录数量减半（帧头+载荷合并成一趟）。
+// 收不到就停，绝不等待：打字、ping 这类单包场景行为不变。
 func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 	buf := make([]byte, readBufferSize)
+	batch := make([]byte, 0, proto.MaxBatchBytes)
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -516,11 +527,55 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 		if n <= 0 {
 			continue
 		}
-		if err := s.writeSlot(buf[:n]); err != nil {
-			return fmt.Errorf("写隧道: %w", err)
+		pktLen := n
+		k := proto.Slot(buf[:n], s.members)
+
+		batch = proto.AppendHeader(batch[:0], proto.TypeIP, pktLen)
+		batch = append(batch, buf[:pktLen]...)
+
+		// 收割现成的同槽包：不等待、批量不超上限；设备不支持就单包模式
+		for len(batch) < proto.MaxBatchBytes-proto.HeaderSize-readBufferSize {
+			m, rerr := s.dev.TryRead(buf)
+			if rerr != nil || m <= 0 {
+				break
+			}
+			if proto.Slot(buf[:m], s.members) != k {
+				// 不同槽的包放回没有手段（Device 是单读接口），直接单发处理完再收
+				if err := flushBatch(s, k, batch); err != nil {
+					return err
+				}
+				batch = batch[:0]
+				batch = proto.AppendHeader(batch, proto.TypeIP, m)
+				batch = append(batch, buf[:m]...)
+				s.stats.TxBytes.Add(uint64(m))
+				continue
+			}
+			batch = proto.AppendHeader(batch, proto.TypeIP, m)
+			batch = append(batch, buf[:m]...)
+			s.stats.TxBytes.Add(uint64(m))
 		}
-		s.stats.TxBytes.Add(uint64(n))
+
+		if err := flushBatch(s, k, batch); err != nil {
+			return err
+		}
+		batch = batch[:0]
 	}
+}
+
+// flushBatch 把合并缓冲一次写出（写入失败返回错误终止会话）。
+func flushBatch(s *clientSession, k int, batch []byte) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	conn := s.slot(k)
+	if k == 0 {
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+	}
+	if _, err := conn.Write(batch); err != nil {
+		return fmt.Errorf("写隧道: %w", err)
+	}
+	return nil
 }
 
 func (s *clientSession) heartbeat(ctx context.Context) error {
