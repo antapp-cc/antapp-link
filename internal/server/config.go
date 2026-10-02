@@ -24,6 +24,10 @@ type Config struct {
 	// （控制仍走 TCP，数据包走 UDP + AES-GCM）。
 	// 它会被写进签发的连接码，客户端据此选择。
 	Mode string `json:"mode,omitempty"`
+
+	// MaxMembers 是单个逻辑会话允许的最大并行连接数（1-4，默认 1=关闭多连接）。
+	// 客户端请求的 members 会被压到这个上限以下。
+	MaxMembers int `json:"max_members,omitempty"`
 }
 
 type TunnelConfig struct {
@@ -59,6 +63,7 @@ func Default() Config {
 		DNS:          []string{"10.10.0.1"},
 		ForwardPorts: PortRange{Start: 31400, End: 31409},
 		PKIDir:       "/etc/antapp-link/pki",
+		MaxMembers:   1,
 	}
 }
 
@@ -185,6 +190,9 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.PKIDir) == "" {
 		return errors.New("pki_dir 不能为空")
+	}
+	if c.MaxMembers < 1 || c.MaxMembers > 4 {
+		return fmt.Errorf("max_members %d 越界（1-4）", c.MaxMembers)
 	}
 	return nil
 }

@@ -18,6 +18,8 @@ type Status struct {
 	Client      string `json:"client,omitempty"`
 	ConnectedAt string `json:"connected_at,omitempty"`
 	UpdatedAt   string `json:"updated_at"`
+	Members     int    `json:"members,omitempty"`
+	LiveMembers int    `json:"live_members,omitempty"`
 }
 
 // WriteStatus 先写临时文件再改名，避免 status 读到半个 JSON。

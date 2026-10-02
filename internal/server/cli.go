@@ -203,6 +203,7 @@ func cmdInvite(stdout, stderr io.Writer, args []string) int {
 	cfgPath := fs.String("c", DefaultConfigPath, "配置文件路径")
 	outDir := fs.String("o", ".", "连接码输出目录")
 	serverAddr := fs.String("server", "", "服务端地址 host:port（默认自动探测公网 IP）")
+	membersFlag := fs.Int("members", 0, "并行连接数（0/1=单连接，最大 4；受 max_members 限制）")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
 	}
@@ -233,6 +234,14 @@ func cmdInvite(stdout, stderr io.Writer, args []string) int {
 		addr = net.JoinHostPort(ip, port)
 	}
 
+	members := *membersFlag
+	if members < 0 {
+		members = 0
+	}
+	if members > cfg.MaxMembers {
+		members = cfg.MaxMembers
+	}
+
 	inv, err := pki.Issue(cfg.PKIDir, name, addr, pki.TunnelParams{
 		TunnelIP: cfg.Tunnel.ClientIP,
 		Gateway:  cfg.Tunnel.ServerIP,
@@ -240,6 +249,7 @@ func cmdInvite(stdout, stderr io.Writer, args []string) int {
 		MTU:      cfg.Tunnel.MTU,
 		DNS:      cfg.DNS,
 		Mode:     pki.TunnelMode(cfg.Mode),
+		Members:  members,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "签发失败: %v\n", err)
@@ -370,6 +380,9 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 		fmt.Fprintf(stdout, "\n隧道进程    : 运行中（状态更新于 %s）\n", st.UpdatedAt)
 		if st.Client != "" {
 			fmt.Fprintf(stdout, "已接入节点  : %s（自 %s）\n", st.Client, st.ConnectedAt)
+			if st.Members > 1 {
+				fmt.Fprintf(stdout, "并行连接    : %d/%d 条存活\n", st.LiveMembers, st.Members)
+			}
 		} else {
 			fmt.Fprintln(stdout, "已接入节点  : 无")
 		}

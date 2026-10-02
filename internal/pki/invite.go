@@ -32,6 +32,7 @@ type TunnelParams struct {
 	MTU      int
 	DNS      []string
 	Mode     TunnelMode // 空表示 TCP
+	Members  int        // 并行连接数（0/1=单连接，最大 4）
 }
 
 // TunnelMode 是隧道的数据通道走法。
@@ -66,6 +67,7 @@ type Invite struct {
 	MTU      int        `json:"mtu"`
 	DNS      []string   `json:"dns"`
 	Mode     TunnelMode `json:"mode,omitempty"`
+	Members  int        `json:"members,omitempty"`
 	CAPEM    string     `json:"ca_pem"`
 	CertPEM  string     `json:"cert_pem"`
 	KeyPEM   string     `json:"key_pem"`
