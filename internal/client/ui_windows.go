@@ -797,23 +797,51 @@ func (u *UI) hintTray() {
 
 // autoCheckUpdate 在界面出来之后静默查一次，不打扰用户。
 func (u *UI) autoCheckUpdate() {
-	// 启动 8 秒查一次；之后每 1 小时重复——长期不退出的客户端也能及时拿到新版本
+	// 先等隧道连上、再稳 30 秒才查：没连上时海外流量没有隧道路由，访问 GitHub
+	// 必定超时，白跑一次还会在日志里留一条「更新源不可用」；刚连上那几秒
+	// 路由与 DNS 接管也未必落定，所以额外再等一段。
+	// 等不到就先跳过这一轮，交给下面每小时的循环重试。
+	u.app.Log().Info("自动更新：等待隧道就绪")
+	if u.waitTunnelReady(5 * time.Minute) {
+		u.app.Log().Info("自动更新：隧道就绪且已稳定 30 秒，开始检查")
+		u.checkUpdate(false)
+	} else {
+		u.app.Log().Info("自动更新：隧道未就绪或界面已关闭，跳过本轮，之后每小时重试")
+	}
+
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
-	select {
-	case <-u.done:
-		return
-	case <-time.After(8 * time.Second):
-	}
-	u.checkUpdate(false)
 	for {
 		select {
 		case <-u.done:
 			return
 		case <-ticker.C:
-			u.checkUpdate(false)
+			if u.app.Status().Online {
+				u.checkUpdate(false)
+			}
 		}
 	}
+}
+
+// waitTunnelReady 等隧道就绪后再稳 30 秒；超时或界面已关闭返回 false。
+func (u *UI) waitTunnelReady(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for !u.app.Status().Online {
+		if time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-u.done:
+			return false
+		case <-time.After(time.Second):
+		}
+	}
+	select {
+	case <-u.done:
+		return false
+	case <-time.After(30 * time.Second):
+	}
+	return true
 }
 
 func (u *UI) onCheckUpdate() { go u.checkUpdate(true) }
