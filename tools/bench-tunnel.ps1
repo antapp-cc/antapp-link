@@ -1,7 +1,7 @@
 # 隧道吞吐对照：单流 vs 4 并发流，各跑多轮取中位数。
 #
-#   pwsh -File deploy/bench-tunnel.ps1
-#   pwsh -File deploy/bench-tunnel.ps1 -Bytes 20000000 -Rounds 5
+#   pwsh -File tools/bench-tunnel.ps1
+#   pwsh -File tools/bench-tunnel.ps1 -Bytes 20000000 -Rounds 5
 #
 # 每条 curl 都是独立的 TCP 流，按流哈希落到各自的外层连接上：
 # members=4 时 4 条流有机会走 4 条连接，members=1 时只能挤一条。

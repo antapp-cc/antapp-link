@@ -1,8 +1,8 @@
 # 空闲突发对照：交替切换 net.ipv4.tcp_slow_start_after_idle 并复用同一条 TCP 连接，
 # 比较"空闲一段时间后突发"的首 2 秒吞吐。
 #
-#   pwsh -File deploy/bench-idle-compare.ps1                 # 空闲 60s，各 3 轮
-#   pwsh -File deploy/bench-idle-compare.ps1 -Idle 300 -Rounds 2
+#   pwsh -File tools/bench-idle-compare.ps1                 # 空闲 60s，各 3 轮
+#   pwsh -File tools/bench-idle-compare.ps1 -Idle 300 -Rounds 2
 #
 # 切换内核参数走直连 SSH（不经隧道），所以不会打破隧道那边的空闲窗口。
 
