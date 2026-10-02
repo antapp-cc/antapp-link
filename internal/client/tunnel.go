@@ -140,7 +140,9 @@ func sessionEndInfo(err error) (slog.Level, string) {
 	case strings.Contains(msg, "reset"):
 		return slog.LevelWarn, "连接被重置"
 	default:
-		return slog.LevelWarn, ""
+		// 其余交给统一映射：Windows 的 syscall 长文案（如 wsarecv 的超时整句）
+		// 只有它认得出，认出来就不必在这行再摆一串英文原文
+		return slog.LevelWarn, connBrokenReason(err)
 	}
 }
 
