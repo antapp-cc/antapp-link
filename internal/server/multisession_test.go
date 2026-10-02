@@ -25,19 +25,25 @@ func TestSessionSlotRouting(t *testing.T) {
 	if got := sess.slot(5); got != sess.slots[0] {
 		t.Fatal("越界必须落控制连接")
 	}
-	// 占槽/重复占槽
+	// 占槽/重复占槽（slotFree 预检 + commitSlot 提交两段式）
 	c := &fakeConn{}
-	if !sess.join(1, c) {
-		t.Fatal("空槽 join 应成功")
+	if !sess.slotFree(1) {
+		t.Fatal("空槽预检应通过")
 	}
-	if sess.join(1, c) {
-		t.Fatal("重复 join 应失败")
+	if !sess.commitSlot(1, c) {
+		t.Fatal("空槽提交应成功")
 	}
-	if sess.join(3, c) {
-		t.Fatal("越界 join 应失败")
+	if sess.slotFree(1) {
+		t.Fatal("已占槽预检应失败")
+	}
+	if sess.commitSlot(1, c) {
+		t.Fatal("重复提交应失败")
+	}
+	if sess.slotFree(3) || sess.commitSlot(3, c) {
+		t.Fatal("越界槽应失败")
 	}
 	if got := sess.slot(1); got == sess.slots[0] {
-		t.Fatal("join 后槽 1 应可用")
+		t.Fatal("提交后槽 1 应可用")
 	}
 	sess.leave(1, c)
 	if got := sess.slot(1); got != sess.slots[0] {

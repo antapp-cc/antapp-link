@@ -144,7 +144,7 @@ func (s *Server) pumpTun(ctx context.Context) {
 		batch = proto.AppendHeader(batch[:0], proto.TypeIP, n)
 		batch = append(batch, buf[:n]...)
 
-		for len(batch) < proto.MaxBatchBytes-proto.HeaderSize-readBufferSize {
+		for len(batch) < proto.MaxBatchBytes-proto.HeaderSize-proto.MaxPayload {
 			m, rerr := s.tun.TryRead(buf)
 			if rerr != nil || m <= 0 {
 				break
@@ -227,19 +227,30 @@ func (s *Server) handleMember(ctx context.Context, tlsConn *tls.Conn, name strin
 		_ = proto.WriteFrame(tlsConn, proto.TypeBye, []byte("没有匹配的逻辑会话（控制连接未建立或 sid 不符）"))
 		return
 	}
-	if !sess.join(hello.Member, tlsConn) {
+	if !sess.slotFree(hello.Member) {
 		_ = proto.WriteFrame(tlsConn, proto.TypeBye, []byte("槽位不可用"))
 		s.noteJoinFailure(sess)
 		return
 	}
 	if err := proto.WriteFrame(tlsConn, proto.TypeMemberAck, nil); err != nil {
-		sess.leave(hello.Member, tlsConn)
 		return
 	}
-	s.log.Info("成员连接已加入", "client", name, "member", hello.Member,
-		"live", sess.liveMembers())
+	s.log.Info("成员连接已加入", "client", name, "member", hello.Member)
 
 	defer sess.leave(hello.Member, tlsConn)
+	// 就绪信号：读循环已在本协程启动（下面的 for），发带槽位号的第二个 ACK
+	// —— 客户端收到它才把流量切进本连接，消除「写进还没人读的连接」的黑洞
+	if err := proto.WriteFrame(tlsConn, proto.TypeMemberAck,
+		[]byte(fmt.Sprintf("{\"member\":%d}", hello.Member))); err != nil {
+		return
+	}
+	if !sess.commitSlot(hello.Member, tlsConn) {
+		_ = proto.WriteFrame(tlsConn, proto.TypeBye, []byte("槽位不可用"))
+		s.noteJoinFailure(sess)
+		return
+	}
+	s.log.Info("成员连接已就位", "client", name, "member", hello.Member,
+		"live", sess.liveMembers())
 	for {
 		typ, payload, err := proto.ReadFrame(tlsConn)
 		if err != nil {
@@ -476,8 +487,16 @@ func (s *session) slot(k int) *slotConn {
 	return s.slots[k]
 }
 
-// join 把成员连接放进槽 k；槽被占或越界返回 false。
-func (s *session) join(k int, conn net.Conn) bool {
+// slotFree 预检槽位是否可占（不占位）。
+func (s *session) slotFree(k int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return k > 0 && k < len(s.slots) && s.slots[k] == nil
+}
+
+// commitSlot 把成员连接正式放进槽 k（读循环已启动后才调用）。
+// 预检（slotFree）到提交之间被抢 → 返回 false。
+func (s *session) commitSlot(k int, conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if k <= 0 || k >= len(s.slots) || s.slots[k] != nil {

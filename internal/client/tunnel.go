@@ -254,6 +254,7 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 		sid:     sid,
 		members: ack.Members,
 	}
+	sess.slots = make([]net.Conn, ack.Members) // 立即分配：ack.Members>=1，槽 0 恒有值
 	sess.slots[0] = conn
 	if ack.Members > 1 {
 		t.log.Info(fmt.Sprintf("多连接并发已启用：%d 条并行连接（含控制连接）", ack.Members))
@@ -302,17 +303,6 @@ func (s *clientSession) slot(k int) net.Conn {
 	return s.slots[k]
 }
 
-// writeSlot 把一个内层 IP 包按流哈希送进对应槽位。
-func (s *clientSession) writeSlot(pkt []byte) error {
-	k := proto.Slot(pkt, s.members)
-	conn := s.slot(k)
-	if k == 0 {
-		s.writeMu.Lock()
-		defer s.writeMu.Unlock()
-	}
-	return proto.WriteFrame(conn, proto.TypeIP, pkt)
-}
-
 // dialMember 拨一条成员连接并完成认亲握手；成功后进入该连接的读循环（阻塞）。
 func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) error {
 	tlsCfg, err := pki.ClientTLSConfig(t.inv)
@@ -346,14 +336,25 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 		conn.Close()
 		return err
 	}
-	_ = conn.SetReadDeadline(time.Time{})
 	if typ == proto.TypeBye {
 		conn.Close()
-		return fmt.Errorf("成员连接 %d 被服务端拒绝", k)
+		return fmt.Errorf("成员连接 %d 被服务端拒绝: %s", k, "见服务端日志")
 	}
 	if typ != proto.TypeMemberAck {
 		conn.Close()
 		return fmt.Errorf("成员连接 %d 期望 MEMBER_ACK 收到 %s", k, typ.String())
+	}
+	// 第一个 ACK 收到：加入被接受。继续等第二个 ACK（带槽位号）=
+	// 服务端读循环已启动的信号，收到它才把连接当可用
+	typ2, _, err := proto.ReadFrame(conn)
+	if err != nil {
+		conn.Close()
+		return err
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	if typ2 != proto.TypeMemberAck {
+		conn.Close()
+		return fmt.Errorf("成员连接 %d 期望就绪 ACK 收到 %s", k, typ2.String())
 	}
 
 	sess.mu.Lock()
@@ -390,54 +391,36 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 	}
 }
 
-// maintainMembers 维持成员连接：任何槽位空缺（初始或断开）就退避重拨。
+// maintainMembers 每个成员槽位一条常驻协程：退避重拨，断开后自动补位。
 // JOIN 失败绝不结束会话——最坏情况所有流量都走控制连接。
 func maintainMembers(ctx context.Context, t *Tunnel, sess *clientSession) {
 	var wg sync.WaitGroup
-	for {
-		sess.mu.Lock()
-		var missing []int
-		for k := 1; k < len(sess.slots); k++ {
-			if sess.slots[k] == nil {
-				missing = append(missing, k)
-			}
-		}
-		sess.mu.Unlock()
-
-		for _, k := range missing {
-			k := k
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				attempt := 0
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(Backoff(attempt)):
-					}
-					if err := t.dialMember(ctx, sess, k); err != nil {
-						if ctx.Err() != nil {
-							return
-						}
-						t.log.Debug("成员连接拨接失败，退避重试", "member", k, "err", err)
-						if attempt < 10 {
-							attempt++
-						}
-						continue
-					}
-					return // 读循环退出（断开）后由下一轮维护循环补拨
+	for k := 1; k < sess.members; k++ {
+		k := k
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			attempt := 0
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(Backoff(attempt)):
 				}
-			}()
-		}
-
-		select {
-		case <-ctx.Done():
-			wg.Wait()
-			return
-		case <-time.After(2 * time.Second):
-		}
+				if err := t.dialMember(ctx, sess, k); err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					if attempt < 10 {
+						attempt++
+					}
+					continue
+				}
+				attempt = 0 // 读循环退出（连接断开），重置退避继续补拨
+			}
+		}()
 	}
+	wg.Wait()
 }
 
 // liveCount 报告当前存活连接数（日志用）。
@@ -531,21 +514,23 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 		}
 		pktLen := n
 		k := proto.Slot(buf[:n], s.members)
+		s.stats.TxBytes.Add(uint64(pktLen))
 
 		batch = proto.AppendHeader(batch[:0], proto.TypeIP, pktLen)
 		batch = append(batch, buf[:pktLen]...)
 
 		// 收割现成的同槽包：不等待、批量不超上限；设备不支持就单包模式
-		for len(batch) < proto.MaxBatchBytes-proto.HeaderSize-readBufferSize {
+		for len(batch) < proto.MaxBatchBytes-proto.HeaderSize-proto.MaxPayload {
 			m, rerr := s.dev.TryRead(buf)
 			if rerr != nil || m <= 0 {
 				break
 			}
-			if proto.Slot(buf[:m], s.members) != k {
+			if kk := proto.Slot(buf[:m], s.members); kk != k {
 				// 不同槽的包放回没有手段（Device 是单读接口），直接单发处理完再收
 				if err := flushBatch(s, k, batch); err != nil {
 					return err
 				}
+				k = kk
 				batch = batch[:0]
 				batch = proto.AppendHeader(batch, proto.TypeIP, m)
 				batch = append(batch, buf[:m]...)
@@ -570,11 +555,15 @@ func flushBatch(s *clientSession, k int, batch []byte) error {
 		return nil
 	}
 	conn := s.slot(k)
+	if conn == nil {
+		return fmt.Errorf("写隧道: 槽 %d 连接为 nil", k)
+	}
 	if k == 0 {
 		s.writeMu.Lock()
 		defer s.writeMu.Unlock()
 	}
 	if _, err := conn.Write(batch); err != nil {
+		s.log.Error("写隧道失败", "slot", k, "bytes", len(batch), "err", err)
 		return fmt.Errorf("写隧道: %w", err)
 	}
 	return nil
