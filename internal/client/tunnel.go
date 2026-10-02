@@ -2,8 +2,10 @@ package client
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +47,7 @@ type Ack struct {
 	MTU      int      `json:"mtu"`
 	MSS      int      `json:"mss"`
 	DNS      []string `json:"dns"`
+	Members  int      `json:"members,omitempty"` // 服务端批准的并行连接数（0/1=单连接）
 }
 
 type Stats struct {
@@ -195,7 +198,21 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	}
 	defer conn.Close()
 
-	hello, err := json.Marshal(map[string]any{"version": protoVersion, "client": t.inv.Name})
+	// 多连接并发数据面：sid 是本次逻辑会话的团队编号，成员连接靠它认亲。
+	// members 请求来自连接码（0/1=单连接）；服务端在 ACK 里批准实际值。
+	sid := newSessionID()
+	wantMembers := t.inv.Members
+	if wantMembers < 1 {
+		wantMembers = 1
+	}
+	if wantMembers > 4 {
+		wantMembers = 4
+	}
+
+	hello, err := json.Marshal(map[string]any{
+		"version": protoVersion, "client": t.inv.Name,
+		"sid": sid, "members": wantMembers, "member": 0,
+	})
 	if err != nil {
 		return false, err
 	}
@@ -225,24 +242,208 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	t.Stats.Connected.Store(true)
 	defer t.Stats.Connected.Store(false)
 
-	sess := &clientSession{conn: conn, dev: t.dev, log: t.log, stats: &t.Stats}
+	sess := &clientSession{
+		tunnel: t, dev: t.dev, log: t.log, stats: &t.Stats,
+		sid:     sid,
+		members: ack.Members,
+	}
+	sess.slots[0] = conn
+	if ack.Members > 1 {
+		t.log.Info("多连接并发已启用", "members", ack.Members)
+	}
 	return true, sess.run(ctx)
 }
 
+// newSessionID 生成 16 字节随机数的 hex（32 字符），成员连接的认亲凭证。
+func newSessionID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand 失败极罕见；退回时间戳保证唯一性足够
+		return fmt.Sprintf("%032x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
 type clientSession struct {
-	conn     net.Conn
+	tunnel   *Tunnel
 	dev      Device
 	log      *slog.Logger
 	stats    *Stats
-	writeMu  sync.Mutex
 	lastSeen atomic.Int64
+
+	sid     string // 逻辑会话 ID
+	members int    // 生效连接数（含控制连接）
+	mu      sync.Mutex
+	slots   []net.Conn // slots[0]=控制连接；成员槽位从 1 开始，nil=空
+	writeMu sync.Mutex // 仅保护控制连接的写（成员连接各自在 writeSlot 内串行）
 }
 
-// write 串行化对同一条 TLS 连接的写：搬包和心跳来自不同 goroutine。
+// write 串行化对控制连接的写：搬包和心跳来自不同 goroutine。
 func (s *clientSession) write(t proto.Type, payload []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return proto.WriteFrame(s.conn, t, payload)
+	return proto.WriteFrame(s.slot(0), t, payload)
+}
+
+// slot 返回槽位 k 的连接；越界或空槽 → 控制连接兜底。
+func (s *clientSession) slot(k int) net.Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if k < 0 || k >= len(s.slots) || s.slots[k] == nil {
+		return s.slots[0]
+	}
+	return s.slots[k]
+}
+
+// writeSlot 把一个内层 IP 包按流哈希送进对应槽位。
+func (s *clientSession) writeSlot(pkt []byte) error {
+	k := proto.Slot(pkt, s.members)
+	conn := s.slot(k)
+	if k == 0 {
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+	}
+	return proto.WriteFrame(conn, proto.TypeIP, pkt)
+}
+
+// dialMember 拨一条成员连接并完成认亲握手；成功后进入该连接的读循环（阻塞）。
+func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) error {
+	tlsCfg, err := pki.ClientTLSConfig(t.inv)
+	if err != nil {
+		return err
+	}
+	dialer := &net.Dialer{Timeout: handshakeTimeout}
+	raw, err := dialer.DialContext(ctx, "tcp", t.inv.Server)
+	if err != nil {
+		return fmt.Errorf("成员连接 %d 拨号: %w", k, err)
+	}
+	conn := tls.Client(raw, tlsCfg)
+	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+	defer cancel()
+	if err := conn.HandshakeContext(hctx); err != nil {
+		raw.Close()
+		return fmt.Errorf("成员连接 %d TLS 握手: %w", k, err)
+	}
+
+	hello, _ := json.Marshal(map[string]any{
+		"version": protoVersion, "client": t.inv.Name,
+		"sid": sess.sid, "members": sess.members, "member": k,
+	})
+	if err := proto.WriteFrame(conn, proto.TypeHello, hello); err != nil {
+		conn.Close()
+		return err
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	typ, _, err := proto.ReadFrame(conn)
+	if err != nil {
+		conn.Close()
+		return err
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	if typ == proto.TypeBye {
+		conn.Close()
+		return fmt.Errorf("成员连接 %d 被服务端拒绝", k)
+	}
+	if typ != proto.TypeMemberAck {
+		conn.Close()
+		return fmt.Errorf("成员连接 %d 期望 MEMBER_ACK 收到 %s", k, typ.String())
+	}
+
+	sess.mu.Lock()
+	if k >= len(sess.slots) || sess.slots[k] != nil {
+		sess.mu.Unlock()
+		conn.Close()
+		return fmt.Errorf("成员连接 %d 槽位不可用", k)
+	}
+	sess.slots[k] = conn
+	sess.mu.Unlock()
+	t.log.Info("成员连接已就位", "member", k, "live", sess.liveCount())
+
+	// 读循环：成员连接上来的包写网卡；断开摘槽（该槽流量落回控制连接）
+	for {
+		typ, payload, err := proto.ReadFrame(conn)
+		if err != nil {
+			sess.mu.Lock()
+			if sess.slots[k] == conn {
+				sess.slots[k] = nil
+			}
+			sess.mu.Unlock()
+			t.log.Info("成员连接断开", "member", k, "err", err)
+			return err
+		}
+		sess.touch()
+		switch typ {
+		case proto.TypeIP:
+			if _, err := sess.dev.Write(payload); err != nil {
+				return err
+			}
+		default:
+			// 成员连接只搬数据，其他帧忽略
+		}
+	}
+}
+
+// maintainMembers 维持成员连接：任何槽位空缺（初始或断开）就退避重拨。
+// JOIN 失败绝不结束会话——最坏情况所有流量都走控制连接。
+func maintainMembers(ctx context.Context, t *Tunnel, sess *clientSession) {
+	var wg sync.WaitGroup
+	for {
+		sess.mu.Lock()
+		var missing []int
+		for k := 1; k < len(sess.slots); k++ {
+			if sess.slots[k] == nil {
+				missing = append(missing, k)
+			}
+		}
+		sess.mu.Unlock()
+
+		for _, k := range missing {
+			k := k
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				attempt := 0
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(Backoff(attempt)):
+					}
+					if err := t.dialMember(ctx, sess, k); err != nil {
+						if ctx.Err() != nil {
+							return
+						}
+						t.log.Debug("成员连接拨接失败，退避重试", "member", k, "err", err)
+						if attempt < 10 {
+							attempt++
+						}
+						continue
+					}
+					return // 读循环退出（断开）后由下一轮维护循环补拨
+				}
+			}()
+		}
+
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// liveCount 报告当前存活连接数（日志用）。
+func (s *clientSession) liveCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, c := range s.slots {
+		if c != nil {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *clientSession) run(ctx context.Context) error {
@@ -254,6 +455,9 @@ func (s *clientSession) run(ctx context.Context) error {
 	go func() { errCh <- s.pumpFromTunnel(ctx) }()
 	go func() { errCh <- s.pumpFromDevice(ctx) }()
 	go func() { errCh <- s.heartbeat(ctx) }()
+	if s.members > 1 {
+		go maintainMembers(ctx, s.tunnel, s)
+	}
 
 	select {
 	case <-ctx.Done():
@@ -272,7 +476,7 @@ func (s *clientSession) pumpFromTunnel(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-		typ, payload, err := proto.ReadFrame(s.conn)
+		typ, payload, err := proto.ReadFrame(s.slot(0))
 		if err != nil {
 			return fmt.Errorf("读隧道: %w", err)
 		}
@@ -312,7 +516,7 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 		if n <= 0 {
 			continue
 		}
-		if err := s.write(proto.TypeIP, buf[:n]); err != nil {
+		if err := s.writeSlot(buf[:n]); err != nil {
 			return fmt.Errorf("写隧道: %w", err)
 		}
 		s.stats.TxBytes.Add(uint64(n))

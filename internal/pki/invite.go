@@ -234,5 +234,8 @@ func ClientTLSConfig(inv Invite) (*tls.Config, error) {
 		ServerName:   ServerName,
 		MinVersion:   tls.VersionTLS13,
 		NextProtos:   []string{ALPN},
+		// 多连接并发：成员连接复用 TLS 会话（老熟人免重验），省服务端计算量。
+		// 不开 EarlyData：Go 无客户端 0-RTT 支持且有重放风险。
+		ClientSessionCache: tls.NewLRUClientSessionCache(8),
 	}, nil
 }
