@@ -244,7 +244,8 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("解析 HELLO_ACK: %w", err)
 	}
 	t.log.Info("隧道已建立",
-		"server", t.inv.Server, "tunnel_ip", ack.TunnelIP, "gateway", ack.Gateway, "mtu", ack.MTU)
+		"server", t.inv.Server, "tunnel_ip", ack.TunnelIP, "gateway", ack.Gateway, "mtu", ack.MTU,
+		"sid", sid, "want_members", wantMembers, "ack_members", ack.Members)
 	t.Stats.Connected.Store(true)
 	defer t.Stats.Connected.Store(false)
 
@@ -255,7 +256,7 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	}
 	sess.slots[0] = conn
 	if ack.Members > 1 {
-		t.log.Info("多连接并发已启用", "members", ack.Members)
+		t.log.Info(fmt.Sprintf("多连接并发已启用：%d 条并行连接（含控制连接）", ack.Members))
 	}
 	return true, sess.run(ctx)
 }
@@ -462,6 +463,7 @@ func (s *clientSession) run(ctx context.Context) error {
 	go func() { errCh <- s.pumpFromDevice(ctx) }()
 	go func() { errCh <- s.heartbeat(ctx) }()
 	if s.members > 1 {
+		s.log.Info(fmt.Sprintf("多连接模式：目标 %d 条，启动成员维护", s.members))
 		go maintainMembers(ctx, s.tunnel, s)
 	}
 
