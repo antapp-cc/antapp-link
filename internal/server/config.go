@@ -25,8 +25,8 @@ type Config struct {
 	// 它会被写进签发的连接码，客户端据此选择。
 	Mode string `json:"mode,omitempty"`
 
-	// MaxMembers 是单个逻辑会话允许的最大并行连接数（1-4，默认 1=关闭多连接）。
-	// 客户端请求的 members 会被压到这个上限以下。
+	// MaxMembers 是早期版本写在顶层的 max_members，只用于兼容读取：
+	// LoadConfig / SaveConfig 会把它并进 Tunnel.MaxMembers（文档里的位置）。
 	MaxMembers int `json:"max_members,omitempty"`
 }
 
@@ -36,6 +36,10 @@ type TunnelConfig struct {
 	ServerIP string `json:"server_ip"`
 	ClientIP string `json:"client_ip"`
 	MTU      int    `json:"mtu"`
+
+	// MaxMembers 是单个逻辑会话允许的最大并行连接数（1-4，默认 1=关闭多连接）。
+	// 客户端请求的 members 会被压到这个上限以下。
+	MaxMembers int `json:"max_members,omitempty"`
 }
 
 type PortRange struct {
@@ -51,11 +55,12 @@ func Default() Config {
 	return Config{
 		Listen: "0.0.0.0:62233",
 		Tunnel: TunnelConfig{
-			Device:   "antapp0",
-			Network:  "10.10.0.0/24",
-			ServerIP: "10.10.0.1",
-			ClientIP: "10.10.0.2",
-			MTU:      1400,
+			Device:     "antapp0",
+			Network:    "10.10.0.0/24",
+			ServerIP:   "10.10.0.1",
+			ClientIP:   "10.10.0.2",
+			MTU:        1400,
+			MaxMembers: 1,
 		},
 		// 客户端的 DNS 指向隧道网关：服务端在网关上跑 dnsmasq（filter-AAAA）。
 		// 隧道只接管 IPv4，绝不能把 AAAA 发给客户端 —— 浏览器拿到 v6 地址会
@@ -63,8 +68,16 @@ func Default() Config {
 		DNS:          []string{"10.10.0.1"},
 		ForwardPorts: PortRange{Start: 31400, End: 31409},
 		PKIDir:       "/etc/antapp-link/pki",
-		MaxMembers:   1,
 	}
+}
+
+// migrateLegacyMaxMembers 把早期写在顶层的 max_members 并进 tunnel 层。
+// 顶层有值时以它为准（那是用户显式写下的旧配置），随后清空，只留 tunnel 一个真值来源。
+func (c *Config) migrateLegacyMaxMembers() {
+	if c.MaxMembers > 0 {
+		c.Tunnel.MaxMembers = c.MaxMembers
+	}
+	c.MaxMembers = 0
 }
 
 // LoadConfig 先铺默认值再让文件覆盖，所以配置文件只需要写想改的字段。
@@ -77,6 +90,7 @@ func LoadConfig(path string) (Config, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return Config{}, fmt.Errorf("解析配置 %s: %w", path, err)
 	}
+	cfg.migrateLegacyMaxMembers()
 	if err := cfg.Validate(); err != nil {
 		return Config{}, fmt.Errorf("配置 %s 不合法: %w", path, err)
 	}
@@ -85,6 +99,7 @@ func LoadConfig(path string) (Config, error) {
 
 // SaveConfig 把配置写回文件。
 func SaveConfig(path string, cfg Config) error {
+	cfg.migrateLegacyMaxMembers()
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -191,8 +206,8 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.PKIDir) == "" {
 		return errors.New("pki_dir 不能为空")
 	}
-	if c.MaxMembers < 1 || c.MaxMembers > 4 {
-		return fmt.Errorf("max_members %d 越界（1-4）", c.MaxMembers)
+	if c.Tunnel.MaxMembers < 1 || c.Tunnel.MaxMembers > 4 {
+		return fmt.Errorf("max_members %d 越界（1-4）", c.Tunnel.MaxMembers)
 	}
 	return nil
 }

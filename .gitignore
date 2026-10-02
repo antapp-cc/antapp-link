@@ -15,3 +15,7 @@ third_party/wintun-0.14.1.zip
 cmd/antapp-setup/assets/antapp-link.exe
 cmd/antapp-setup/assets/THIRD-PARTY-NOTICES.md
 cloud-server-backup-20260928/
+
+# CodeGraph 索引与运行期日志：都不是源码
+/.codegraph/
+/logs/

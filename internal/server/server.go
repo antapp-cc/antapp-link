@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,6 +53,7 @@ type Server struct {
 
 	mu      sync.Mutex
 	current *session
+	joins   *joinGuard
 }
 
 // Run 阻塞运行隧道，直到 ctx 被取消。
@@ -77,7 +79,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	}
 	defer ln.Close()
 
-	s := &Server{cfg: cfg, tun: tun, tlsCfg: tlsCfg, log: logger}
+	s := &Server{cfg: cfg, tun: tun, tlsCfg: tlsCfg, log: logger, joins: newJoinGuard()}
 	logger.Info("隧道已就绪",
 		"listen", cfg.Listen,
 		"device", tun.Name(),
@@ -94,7 +96,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	// 连接再经隧道转给节点机）。
 	stopRelay, err := startPortRelay(ctx, cfg, logger)
 	if err != nil {
-		logger.Warn("端口转发监听启动失败", "err", err)
+		logger.Warn("端口转发监听启动失败", connLogAttrs(err, nil, "listen", cfg.Listen)...)
 	} else {
 		defer stopRelay()
 	}
@@ -152,7 +154,7 @@ func (s *Server) pumpTun(ctx context.Context) {
 			kk := proto.Slot(buf[:m], sess.membersN())
 			if kk != k {
 				if err := sess.flushBatch(k, batch); err != nil {
-					s.log.Debug("转发给客户端失败", "client", sess.name, "err", err)
+					s.log.Debug("转发给客户端失败", connLogAttrs(err, nil, "client", sess.name)...)
 				}
 				batch = batch[:0]
 				k = kk
@@ -165,7 +167,7 @@ func (s *Server) pumpTun(ctx context.Context) {
 		}
 
 		if err := sess.flushBatch(k, batch); err != nil {
-			s.log.Debug("转发给客户端失败", "client", sess.name, "err", err)
+			s.log.Debug("转发给客户端失败", connLogAttrs(err, nil, "client", sess.name)...)
 		}
 		batch = batch[:0]
 	}
@@ -177,8 +179,7 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	tlsConn := tls.Server(raw, s.tlsCfg)
 	_ = tlsConn.SetDeadline(time.Now().Add(handshakeTimeout))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		s.log.Warn("TLS 握手失败（客户端证书不受信或版本不符）",
-			"remote", raw.RemoteAddr().String(), "err", err)
+		s.log.Warn("TLS 握手失败（客户端证书不受信或版本不符）", connLogAttrs(err, raw)...)
 		return
 	}
 	_ = tlsConn.SetDeadline(time.Time{})
@@ -191,7 +192,7 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	_ = tlsConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	typ, payload, err := proto.ReadFrame(tlsConn)
 	if err != nil {
-		s.log.Warn("读首帧失败", "client", name, "err", err)
+		s.log.Warn("读首帧失败", connLogAttrs(err, tlsConn, "client", name)...)
 		return
 	}
 	if typ != proto.TypeHello {
@@ -227,6 +228,12 @@ func (s *Server) handleMember(ctx context.Context, tlsConn *tls.Conn, name strin
 		_ = proto.WriteFrame(tlsConn, proto.TypeBye, []byte("没有匹配的逻辑会话（控制连接未建立或 sid 不符）"))
 		return
 	}
+	// 熔断：拒绝不等于结束会话，客户端退避后到窗口外边自然会重试成功
+	if !s.joins.allow(sess.sid, time.Now()) {
+		_ = proto.WriteFrame(tlsConn, proto.TypeBye, []byte("成员连接失败次数过多，已暂停加入"))
+		s.log.Debug("成员加入被熔断拒绝", "client", name, "sid", sess.sid)
+		return
+	}
 	if !sess.slotFree(hello.Member) {
 		_ = proto.WriteFrame(tlsConn, proto.TypeBye, []byte("槽位不可用"))
 		s.noteJoinFailure(sess)
@@ -254,12 +261,16 @@ func (s *Server) handleMember(ctx context.Context, tlsConn *tls.Conn, name strin
 	for {
 		typ, payload, err := proto.ReadFrame(tlsConn)
 		if err != nil {
-			s.log.Info("成员连接断开", "client", name, "member", hello.Member, "err", err)
+			s.log.Info("成员连接断开", connLogAttrs(err, tlsConn,
+				"client", name, "member", hello.Member)...)
 			return
 		}
 		sess.touch()
 		switch typ {
 		case proto.TypeIP:
+			if sl := sess.slotEntry(hello.Member); sl != nil {
+				sl.noteRx(len(payload))
+			}
 			if _, err := s.tun.Write(payload); err != nil {
 				s.log.Error("写网卡失败", "err", err)
 				return
@@ -270,29 +281,156 @@ func (s *Server) handleMember(ctx context.Context, tlsConn *tls.Conn, name strin
 	}
 }
 
-// joinFailures 记录各 sid 的连续 JOIN 失败次数（熔断拨接风暴）。
-var joinFailures = struct {
-	sync.Mutex
-	m map[string]int
-}{m: map[string]int{}}
+// 成员连接熔断：窗口内 JOIN 失败超阈值就拒绝该 sid 的后续加入。
+const (
+	joinWindow  = 60 * time.Second
+	joinMaxFail = 20
+)
+
+// joinGuard 跟踪各 sid 的 JOIN 失败次数，防客户端 bug 打成拨接风暴。
+// 计数只活在窗口内、随会话结束清掉——不会像全局 map 那样只涨不消。
+type joinGuard struct {
+	mu  sync.Mutex
+	rec map[string]*joinRec
+}
+
+type joinRec struct {
+	n     int
+	since time.Time
+}
+
+func newJoinGuard() *joinGuard { return &joinGuard{rec: map[string]*joinRec{}} }
+
+// allow 报告该 sid 现在是否还能尝试加入。
+func (g *joinGuard) allow(sid string, now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	r := g.rec[sid]
+	if r == nil {
+		return true
+	}
+	if now.Sub(r.since) > joinWindow {
+		delete(g.rec, sid)
+		return true
+	}
+	return r.n < joinMaxFail
+}
+
+// fail 记一次 JOIN 失败，返回是否刚刚达到阈值（阈值只告警一次）。
+func (g *joinGuard) fail(sid string, now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	r := g.rec[sid]
+	if r == nil || now.Sub(r.since) > joinWindow {
+		r = &joinRec{since: now}
+		g.rec[sid] = r
+	}
+	r.n++
+	return r.n == joinMaxFail
+}
+
+// failures 报告该 sid 当前窗口内的失败次数（状态展示用）。
+func (g *joinGuard) failures(sid string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if r := g.rec[sid]; r != nil {
+		return r.n
+	}
+	return 0
+}
+
+// forget 在会话结束时清掉该 sid 的计数。
+func (g *joinGuard) forget(sid string) {
+	g.mu.Lock()
+	delete(g.rec, sid)
+	g.mu.Unlock()
+}
 
 func (s *Server) noteJoinFailure(sess *session) {
-	joinFailures.Lock()
-	joinFailures.m[sess.sid]++
-	n := joinFailures.m[sess.sid]
-	joinFailures.Unlock()
-	if n == 20 {
-		s.log.Warn("成员连接连续失败达到阈值，可能为客户端异常，建议检查", "client", sess.name)
+	if s.joins.fail(sess.sid, time.Now()) {
+		s.log.Warn("成员连接连续失败达到阈值，暂停该会话的成员加入",
+			"client", sess.name, "failures", joinMaxFail, "window", joinWindow)
 	}
+}
+
+// connBrokenReason 把连接断开的 error 翻成一句人话；认不出返回空串。
+// 客户端侧有一份对应实现（Windows 的 syscall 文案也需要它）。
+func connBrokenReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "use of closed network connection"):
+		return "本端主动关闭（写超时或会话正在收尾）"
+	case strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "forcibly closed"),
+		strings.Contains(msg, "connection abort"):
+		return "对端强制断开（连接被重置）"
+	case strings.Contains(msg, "did not properly respond after a period of time"),
+		strings.Contains(msg, "host has failed to respond"),
+		strings.Contains(msg, "i/o timeout"),
+		strings.Contains(msg, "timed out"):
+		return "对端一段时间没有响应（线路中断，或对端进程卡住）"
+	case strings.Contains(msg, "eof"):
+		return "对端正常关闭了连接"
+	case strings.Contains(msg, "unreachable"):
+		return "网络不可达"
+	case strings.Contains(msg, "refused"):
+		return "连接被拒绝（对端没在监听这个端口）"
+	case strings.Contains(msg, "address already in use"):
+		return "端口已被占用（另一个进程在监听这个端口）"
+	case strings.Contains(msg, "didn't provide a certificate"),
+		strings.Contains(msg, "certificate required"):
+		return "对端没有提供证书"
+	case strings.Contains(msg, "bad certificate"),
+		strings.Contains(msg, "unknown authority"):
+		return "证书不被信任（签发者不认识）"
+	case strings.Contains(msg, "certificate has expired"):
+		return "证书已过期"
+	case strings.Contains(msg, "broken pipe"):
+		return "对端已经断开（写不进去）"
+	case strings.Contains(msg, "no route to host"):
+		return "没有到对端的路由（网络不通）"
+	default:
+		return ""
+	}
+}
+
+// connLogAttrs 组装断开日志的字段，认不出原因时才附上原始 error（它是英文）。
+func connLogAttrs(err error, conn net.Conn, attrs ...any) []any {
+	reason := connBrokenReason(err)
+	out := append([]any{}, attrs...)
+	out = append(out, "reason", reason)
+	if conn != nil {
+		out = append(out, "local", conn.LocalAddr(), "remote", conn.RemoteAddr())
+	}
+	if reason == "" {
+		out = append(out, "err", err)
+	}
+	return out
+}
+
+// sameControlSession 判断新来的控制连接是不是当前会话的重复连接。
+// 只有双方都带 sid 且相同才算重复：老客户端没有 sid，保持原来的踢旧接新行为。
+func sameControlSession(cur *session, sid string) bool {
+	return cur != nil && sid != "" && cur.sid == sid
 }
 
 // handleControl 是原有控制连接路径（member==0），多连接时是会话的"老大"。
 func (s *Server) handleControl(ctx context.Context, tlsConn *tls.Conn, name string, hello helloPayload) {
+	if sameControlSession(s.currentSession(), hello.Sid) {
+		// 同会话的第二条控制连接：踢掉旧的会连累整条隧道，直接拒绝这一条
+		_ = proto.WriteFrame(tlsConn, proto.TypeBye, []byte("同一会话的控制连接已存在"))
+		s.log.Warn("拒绝重复的控制连接", "client", name, "sid", hello.Sid)
+		return
+	}
+
 	approved := 1
-	if hello.Members > 1 && s.cfg.MaxMembers > 1 {
+	if hello.Members > 1 && s.cfg.Tunnel.MaxMembers > 1 {
 		approved = hello.Members
-		if approved > s.cfg.MaxMembers {
-			approved = s.cfg.MaxMembers
+		if approved > s.cfg.Tunnel.MaxMembers {
+			approved = s.cfg.Tunnel.MaxMembers
 		}
 	}
 
@@ -321,7 +459,7 @@ func (s *Server) handleControl(ctx context.Context, tlsConn *tls.Conn, name stri
 	sess.slots[0] = &slotConn{conn: tlsConn}
 	sess.touch()
 	if err := sess.write(proto.TypeHelloAck, ack); err != nil {
-		s.log.Warn("回 HELLO_ACK 失败", "client", name, "err", err)
+		s.log.Warn("回 HELLO_ACK 失败", connLogAttrs(err, tlsConn, "client", name)...)
 		return
 	}
 
@@ -342,7 +480,7 @@ func (s *Server) serveSession(ctx context.Context, sess *session) {
 			typ, payload, err := proto.ReadFrame(sess.slot(0).conn)
 			if err != nil {
 				if !errors.Is(err, io.EOF) && ctx.Err() == nil {
-					s.log.Debug("读客户端失败", "client", sess.name, "err", err)
+					s.log.Debug("读客户端失败", connLogAttrs(err, sess.slot(0).conn, "client", sess.name)...)
 				}
 				sess.close()
 				return
@@ -350,6 +488,9 @@ func (s *Server) serveSession(ctx context.Context, sess *session) {
 			sess.touch()
 			switch typ {
 			case proto.TypeIP:
+				if sl := sess.slotEntry(0); sl != nil {
+					sl.noteRx(len(payload))
+				}
 				if _, err := s.tun.Write(payload); err != nil {
 					s.log.Error("写网卡失败", "err", err)
 					sess.close()
@@ -414,6 +555,7 @@ func (s *Server) detach(sess *session) {
 		s.current = nil
 	}
 	s.mu.Unlock()
+	s.joins.forget(sess.sid)
 	sess.close()
 }
 
@@ -440,6 +582,8 @@ func (s *Server) reportStatus(ctx context.Context) {
 			st.ConnectedAt = sess.connectedAt.Format(time.RFC3339)
 			st.Members = sess.membersN()
 			st.LiveMembers = sess.liveMembers()
+			st.Slots = sess.slotStats()
+			st.JoinFailures = s.joins.failures(sess.sid)
 		}
 		if err := WriteStatus(st); err != nil {
 			s.log.Debug("写状态文件失败", "err", err)
@@ -469,12 +613,47 @@ type session struct {
 type slotConn struct {
 	conn    net.Conn
 	writeMu sync.Mutex
+	txBytes atomic.Uint64 // 写出的链路字节（含帧头）
+	rxBytes atomic.Uint64 // 读入的链路字节（含帧头）
 }
+
+// slotWriteTimeout 限制单次写槽。pumpTun 是单 goroutine 串行往各槽写，
+// 一条卡住的连接会把它后面的几条一起拖停。
+var slotWriteTimeout = 5 * time.Second
 
 func (s *slotConn) write(t proto.Type, payload []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return proto.WriteFrame(s.conn, t, payload)
+	if err := s.conn.SetWriteDeadline(time.Now().Add(slotWriteTimeout)); err != nil {
+		return err
+	}
+	if err := proto.WriteFrame(s.conn, t, payload); err != nil {
+		_ = s.conn.Close() // 写不动就断开这一条，别让它拖住整条分发链路
+		return err
+	}
+	s.txBytes.Add(uint64(len(payload) + proto.HeaderSize))
+	return nil
+}
+
+// writeRaw 整批原样写出：批里每帧的帧头已由 AppendHeader 拼好，不能再走 WriteFrame
+// （否则对端会把多出来的 4 字节帧头当成 IP 包内容，下行数据全被内核丢弃）。
+func (s *slotConn) writeRaw(batch []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.conn.SetWriteDeadline(time.Now().Add(slotWriteTimeout)); err != nil {
+		return err
+	}
+	if _, err := s.conn.Write(batch); err != nil {
+		_ = s.conn.Close()
+		return err
+	}
+	s.txBytes.Add(uint64(len(batch)))
+	return nil
+}
+
+// noteRx 记一次读入，按链路上的字节算（含帧头）。
+func (s *slotConn) noteRx(payloadLen int) {
+	s.rxBytes.Add(uint64(payloadLen + proto.HeaderSize))
 }
 
 // slot 返回槽位 k 的连接；k 越界或槽位已空 → 控制连接（槽 0）兜底。
@@ -485,6 +664,32 @@ func (s *session) slot(k int) *slotConn {
 		return s.slots[0]
 	}
 	return s.slots[k]
+}
+
+// slotEntry 返回槽位 k 的连接条目本身（不落回控制连接）；越界或空槽返回 nil。
+func (s *session) slotEntry(k int) *slotConn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if k < 0 || k >= len(s.slots) {
+		return nil
+	}
+	return s.slots[k]
+}
+
+// slotStats 快照各槽的收发字节（status 展示用）。
+func (s *session) slotStats() []SlotStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]SlotStatus, 0, len(s.slots))
+	for i, sl := range s.slots {
+		st := SlotStatus{Slot: i}
+		if sl != nil {
+			st.RxBytes = sl.rxBytes.Load()
+			st.TxBytes = sl.txBytes.Load()
+		}
+		out = append(out, st)
+	}
+	return out
 }
 
 // slotFree 预检槽位是否可占（不占位）。
@@ -545,17 +750,12 @@ func (s *session) write(t proto.Type, payload []byte) error {
 	return ctrl.write(t, payload)
 }
 
-// writePkt 把一个内层 IP 包按流哈希送到对应槽位；槽位死亡落控制连接。
-func (s *session) writePkt(pkt []byte) error {
-	return s.slot(proto.Slot(pkt, s.membersN())).write(proto.TypeIP, pkt)
-}
-
 // flushBatch 把合并缓冲一次写入槽位 k 的连接。
 func (s *session) flushBatch(k int, batch []byte) error {
 	if len(batch) == 0 {
 		return nil
 	}
-	return s.slot(k).write(proto.TypeIP, batch)
+	return s.slot(k).writeRaw(batch)
 }
 
 // membersN 返回生效的连接总数（读锁内拷贝，避免与握手竞态）。

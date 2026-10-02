@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"strings"
@@ -26,6 +27,9 @@ const (
 	handshakeTimeout = 15 * time.Second
 	readBufferSize   = 65535
 	protoVersion     = 1
+
+	// maxMembers 是单会话允许的并行连接数上限（与连接码、服务端 max_members 同界）。
+	maxMembers = 4
 )
 
 // Device 是虚拟网卡。Windows 上是 Wintun，其它平台是桩实现。
@@ -98,6 +102,10 @@ type Tunnel struct {
 	// wake 在网络出口迁移时被 watcher 触发：把重连从「最长 30s 退避」变成
 	// 「网络一恢复立刻试」。带缓冲，连续多次通知合并成一次。
 	wake chan struct{}
+
+	// Trace 是联调用的顺序追踪（nil = 关闭，零开销）。它记录每个包的槽位，
+	// 用来断言「同一内层流始终走同一条外层连接」。
+	Trace *OrderTracer
 }
 
 func NewTunnel(inv pki.Invite, dev Device, logger *slog.Logger) *Tunnel {
@@ -136,6 +144,65 @@ func sessionEndInfo(err error) (slog.Level, string) {
 	}
 }
 
+// connBrokenReason 把连接断开的原始 error 翻成一句人话。
+// 按原文匹配是因为 Windows 的 syscall 文案很长、且不含 timeout 这类关键词；
+// 认不出来就返回空串，不编原因。
+func connBrokenReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "use of closed network connection"):
+		return "本端主动关闭（写超时或会话正在收尾）"
+	case strings.Contains(msg, "did not properly respond after a period of time"),
+		strings.Contains(msg, "host has failed to respond"),
+		strings.Contains(msg, "i/o timeout"),
+		strings.Contains(msg, "timed out"):
+		return "对端一段时间没有响应（线路中断，或对端进程卡住/被防火墙丢包）"
+	case strings.Contains(msg, "forcibly closed"),
+		strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "connection abort"):
+		return "对端强制断开（连接被重置）"
+	case strings.Contains(msg, "eof"):
+		return "对端正常关闭了连接"
+	case strings.Contains(msg, "unreachable"):
+		return "网络不可达（本机网络变动或出口中断）"
+	case strings.Contains(msg, "refused"):
+		return "连接被拒绝（服务端没在运行或端口没放行）"
+	case strings.Contains(msg, "address already in use"):
+		return "端口已被占用（另一个进程在监听这个端口）"
+	case strings.Contains(msg, "didn't provide a certificate"),
+		strings.Contains(msg, "certificate required"):
+		return "对端没有提供证书"
+	case strings.Contains(msg, "bad certificate"),
+		strings.Contains(msg, "unknown authority"):
+		return "证书不被信任（签发者不认识）"
+	case strings.Contains(msg, "certificate has expired"):
+		return "证书已过期"
+	case strings.Contains(msg, "broken pipe"):
+		return "对端已经断开（写不进去）"
+	case strings.Contains(msg, "no route to host"):
+		return "没有到对端的路由（网络不通）"
+	default:
+		return ""
+	}
+}
+
+// connLogAttrs 组装断开日志的字段，认不出原因时才附上原始 error（它是英文）。
+func connLogAttrs(err error, conn net.Conn, attrs ...any) []any {
+	reason := connBrokenReason(err)
+	out := append([]any{}, attrs...)
+	out = append(out, "reason", reason)
+	if conn != nil {
+		out = append(out, "local", conn.LocalAddr(), "remote", conn.RemoteAddr())
+	}
+	if reason == "" {
+		out = append(out, "err", err)
+	}
+	return out
+}
+
 // Run 保持隧道可用，断线自动重连，直到 ctx 结束。
 //
 // 网卡与路由在整个过程中保持不动：隧道断掉时靠「原默认路由仍在、只是 metric 更高」
@@ -163,9 +230,10 @@ func (t *Tunnel) Run(ctx context.Context) error {
 				return nil
 			}
 			lvl, reason := sessionEndInfo(err)
-			args := []any{"err", err, "retry_in", Backoff(attempt)}
-			if reason != "" {
-				args = append(args, "reason", reason)
+			// 同样不摆英文原文：认得出原因就只给中文，认不出才附 err 当线索
+			args := []any{"reason", reason, "retry_in", Backoff(attempt)}
+			if reason == "" {
+				args = append(args, "err", err)
 			}
 			t.log.Log(ctx, lvl, "会话结束", args...)
 		}
@@ -207,13 +275,7 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	// 多连接并发数据面：sid 是本次逻辑会话的团队编号，成员连接靠它认亲。
 	// members 请求来自连接码（0/1=单连接）；服务端在 ACK 里批准实际值。
 	sid := newSessionID()
-	wantMembers := t.inv.Members
-	if wantMembers < 1 {
-		wantMembers = 1
-	}
-	if wantMembers > 4 {
-		wantMembers = 4
-	}
+	wantMembers := effectiveMembers(t.inv.Members)
 
 	hello, err := json.Marshal(map[string]any{
 		"version": protoVersion, "client": t.inv.Name,
@@ -249,15 +311,10 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	t.Stats.Connected.Store(true)
 	defer t.Stats.Connected.Store(false)
 
-	sess := &clientSession{
-		tunnel: t, dev: t.dev, log: t.log, stats: &t.Stats,
-		sid:     sid,
-		members: ack.Members,
-	}
-	sess.slots = make([]net.Conn, ack.Members) // 立即分配：ack.Members>=1，槽 0 恒有值
-	sess.slots[0] = conn
-	if ack.Members > 1 {
-		t.log.Info(fmt.Sprintf("多连接并发已启用：%d 条并行连接（含控制连接）", ack.Members))
+	sess := newClientSession(t, conn, sid, tlsCfg, ack)
+	sess.trace = t.Trace
+	if sess.members > 1 {
+		t.log.Info(fmt.Sprintf("多连接并发已启用：%d 条并行连接（含控制连接）", sess.members))
 	}
 	return true, sess.run(ctx)
 }
@@ -272,6 +329,32 @@ func newSessionID() string {
 	return hex.EncodeToString(b)
 }
 
+// effectiveMembers 把连接数归一到 1..maxMembers：连接码里 0/1=单连接，老服务端
+// 不回 members 字段也是 0 —— 两种都必须退化成单连接，绝不能造出 0 长度槽表。
+func effectiveMembers(n int) int {
+	if n < 1 {
+		return 1
+	}
+	if n > maxMembers {
+		return maxMembers
+	}
+	return n
+}
+
+// newClientSession 组装一次逻辑会话：槽 0 恒为控制连接，成员槽从 1 开始。
+// tlsCfg 是控制连接握手用的那份，成员连接必须复用它——各自新建会得到空会话缓存。
+func newClientSession(t *Tunnel, conn net.Conn, sid string, tlsCfg *tls.Config, ack Ack) *clientSession {
+	n := effectiveMembers(ack.Members)
+	sess := &clientSession{
+		tunnel: t, dev: t.dev, log: t.log, stats: &t.Stats,
+		sid: sid, members: n, tlsCfg: tlsCfg,
+		slots:  make([]net.Conn, n),
+		writes: make([]sync.Mutex, n),
+	}
+	sess.slots[0] = conn
+	return sess
+}
+
 type clientSession struct {
 	tunnel   *Tunnel
 	dev      Device
@@ -281,16 +364,42 @@ type clientSession struct {
 
 	sid     string // 逻辑会话 ID
 	members int    // 生效连接数（含控制连接）
+	tlsCfg  *tls.Config
+	trace   *OrderTracer    // 联调顺序追踪（nil = 关闭）
+	ctx     context.Context // 会话上下文（run 里赋值），收尾时用来判断写失败是否预期内
 	mu      sync.Mutex
-	slots   []net.Conn // slots[0]=控制连接；成员槽位从 1 开始，nil=空
-	writeMu sync.Mutex // 仅保护控制连接的写（成员连接各自在 writeSlot 内串行）
+	slots   []net.Conn   // slots[0]=控制连接；成员槽位从 1 开始，nil=空
+	writes  []sync.Mutex // 每槽一把写锁；成员槽空时流量落回控制连接，锁也跟着落回
+}
+
+// sessionEnded 报告会话是否已进入收尾（此时连接会随会话一起关，写失败是预期内的）。
+func (s *clientSession) sessionEnded() bool {
+	return s.ctx != nil && s.ctx.Err() != nil
+}
+
+// slotWriteTimeout 限制单次写连接。卡住的连接必须能摘掉，否则会拖停整条分发链路。
+var slotWriteTimeout = 5 * time.Second
+
+// writeSlot 返回实际承载的连接、它的写锁与实际槽号。锁必须跟着落回控制连接，
+// 否则会和心跳的两次 Write 交错把帧撕开；实际槽号用来区分写不动的是成员还是会话命脉。
+func (s *clientSession) writeSlot(k int) (int, net.Conn, *sync.Mutex) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if k <= 0 || k >= len(s.slots) || s.slots[k] == nil {
+		return 0, s.slots[0], &s.writes[0]
+	}
+	return k, s.slots[k], &s.writes[k]
 }
 
 // write 串行化对控制连接的写：搬包和心跳来自不同 goroutine。
 func (s *clientSession) write(t proto.Type, payload []byte) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	return proto.WriteFrame(s.slot(0), t, payload)
+	_, conn, mu := s.writeSlot(0)
+	mu.Lock()
+	defer mu.Unlock()
+	if err := conn.SetWriteDeadline(time.Now().Add(slotWriteTimeout)); err != nil {
+		return err
+	}
+	return proto.WriteFrame(conn, t, payload)
 }
 
 // slot 返回槽位 k 的连接；越界或空槽 → 控制连接兜底。
@@ -303,23 +412,42 @@ func (s *clientSession) slot(k int) net.Conn {
 	return s.slots[k]
 }
 
+// closeOnDone 在 ctx 结束时关闭 conn，把阻塞在 ReadFrame 上的读循环放出来；
+// 返回的 stop 供会话正常结束时收掉监听协程。
+func closeOnDone(ctx context.Context, conn io.Closer) (stop func()) {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
+}
+
 // dialMember 拨一条成员连接并完成认亲握手；成功后进入该连接的读循环（阻塞）。
+// TLS 配置复用会话里那一份：会话缓存在成员连接之间共享，才有机会走会话恢复。
 func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) error {
-	tlsCfg, err := pki.ClientTLSConfig(t.inv)
-	if err != nil {
-		return err
-	}
 	dialer := &net.Dialer{Timeout: handshakeTimeout}
 	raw, err := dialer.DialContext(ctx, "tcp", t.inv.Server)
 	if err != nil {
 		return fmt.Errorf("成员连接 %d 拨号: %w", k, err)
 	}
-	conn := tls.Client(raw, tlsCfg)
+	conn := tls.Client(raw, sess.tlsCfg)
+	// 握手失败、被拒、读循环退出、ctx 结束都收口到这一处：不关连接就会漏 fd，
+	// 读循环也会永远卡在 ReadFrame 上
+	defer conn.Close()
+	defer closeOnDone(ctx, conn)()
+
 	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
 	if err := conn.HandshakeContext(hctx); err != nil {
-		raw.Close()
 		return fmt.Errorf("成员连接 %d TLS 握手: %w", k, err)
+	}
+	if conn.ConnectionState().DidResume {
+		// 每次补拨都有，日常日志里纯噪声；验收会话恢复时开 Debug 看
+		t.log.Debug("成员连接复用了 TLS 会话", "member", k, "did_resume", true)
 	}
 
 	hello, _ := json.Marshal(map[string]any{
@@ -327,40 +455,33 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 		"sid": sess.sid, "members": sess.members, "member": k,
 	})
 	if err := proto.WriteFrame(conn, proto.TypeHello, hello); err != nil {
-		conn.Close()
 		return err
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	typ, _, err := proto.ReadFrame(conn)
 	if err != nil {
-		conn.Close()
 		return err
 	}
 	if typ == proto.TypeBye {
-		conn.Close()
 		return fmt.Errorf("成员连接 %d 被服务端拒绝: %s", k, "见服务端日志")
 	}
 	if typ != proto.TypeMemberAck {
-		conn.Close()
 		return fmt.Errorf("成员连接 %d 期望 MEMBER_ACK 收到 %s", k, typ.String())
 	}
 	// 第一个 ACK 收到：加入被接受。继续等第二个 ACK（带槽位号）=
 	// 服务端读循环已启动的信号，收到它才把连接当可用
 	typ2, _, err := proto.ReadFrame(conn)
 	if err != nil {
-		conn.Close()
 		return err
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 	if typ2 != proto.TypeMemberAck {
-		conn.Close()
 		return fmt.Errorf("成员连接 %d 期望就绪 ACK 收到 %s", k, typ2.String())
 	}
 
 	sess.mu.Lock()
 	if k >= len(sess.slots) || sess.slots[k] != nil {
 		sess.mu.Unlock()
-		conn.Close()
 		return fmt.Errorf("成员连接 %d 槽位不可用", k)
 	}
 	sess.slots[k] = conn
@@ -376,19 +497,38 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 				sess.slots[k] = nil
 			}
 			sess.mu.Unlock()
-			t.log.Info("成员连接断开", "member", k, "err", err)
+			t.log.Info("成员连接断开", connLogAttrs(err, conn, "member", k)...)
 			return err
 		}
 		sess.touch()
 		switch typ {
 		case proto.TypeIP:
+			sess.trace.Record("rx", k, payload)
 			if _, err := sess.dev.Write(payload); err != nil {
 				return err
 			}
+		case proto.TypeBye:
+			// 服务端拒绝了这条成员连接，或正在关它：立刻摘槽，别继续往里写
+			sess.mu.Lock()
+			if sess.slots[k] == conn {
+				sess.slots[k] = nil
+			}
+			sess.mu.Unlock()
+			t.log.Warn("成员连接被服务端关闭", "member", k, "reason", string(payload))
+			return fmt.Errorf("成员连接 %d 被服务端关闭: %s", k, string(payload))
 		default:
 			// 成员连接只搬数据，其他帧忽略
 		}
 	}
+}
+
+// memberRetryDelay 是补拨成员连接前的等待：首次立刻拨（几条连接本来就该并发建），
+// 失败之后才按退避来。
+func memberRetryDelay(attempt int) time.Duration {
+	if attempt <= 0 {
+		return 0
+	}
+	return Backoff(attempt - 1)
 }
 
 // maintainMembers 每个成员槽位一条常驻协程：退避重拨，断开后自动补位。
@@ -402,15 +542,22 @@ func maintainMembers(ctx context.Context, t *Tunnel, sess *clientSession) {
 			defer wg.Done()
 			attempt := 0
 			for {
-				select {
-				case <-ctx.Done():
+				if d := memberRetryDelay(attempt); d > 0 {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(d):
+					}
+				} else if ctx.Err() != nil {
 					return
-				case <-time.After(Backoff(attempt)):
 				}
 				if err := t.dialMember(ctx, sess, k); err != nil {
 					if ctx.Err() != nil {
 						return
 					}
+					// 补拨失败原本是完全静默的，出问题时看不出卡在哪一步
+					t.log.Debug("成员连接补拨失败", connLogAttrs(err, nil,
+						"member", k, "retry_in", memberRetryDelay(attempt+1))...)
 					if attempt < 10 {
 						attempt++
 					}
@@ -439,6 +586,7 @@ func (s *clientSession) liveCount() int {
 func (s *clientSession) run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	s.ctx = ctx
 	s.touch()
 
 	errCh := make(chan error, 3)
@@ -474,6 +622,7 @@ func (s *clientSession) pumpFromTunnel(ctx context.Context) error {
 		s.touch()
 		switch typ {
 		case proto.TypeIP:
+			s.trace.Record("rx", 0, payload)
 			if _, err := s.dev.Write(payload); err != nil {
 				return fmt.Errorf("写网卡: %w", err)
 			}
@@ -514,6 +663,7 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 		}
 		pktLen := n
 		k := proto.Slot(buf[:n], s.members)
+		s.trace.Record("tx", k, buf[:pktLen])
 		s.stats.TxBytes.Add(uint64(pktLen))
 
 		batch = proto.AppendHeader(batch[:0], proto.TypeIP, pktLen)
@@ -525,7 +675,9 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 			if rerr != nil || m <= 0 {
 				break
 			}
-			if kk := proto.Slot(buf[:m], s.members); kk != k {
+			kk := proto.Slot(buf[:m], s.members)
+			s.trace.Record("tx", kk, buf[:m])
+			if kk != k {
 				// 不同槽的包放回没有手段（Device 是单读接口），直接单发处理完再收
 				if err := flushBatch(s, k, batch); err != nil {
 					return err
@@ -549,24 +701,50 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 	}
 }
 
-// flushBatch 把合并缓冲一次写出（写入失败返回错误终止会话）。
+// flushBatch 把合并缓冲一次写出。写失败按实际落槽分流：成员连接只摘那一条并补拨，
+// 会话继续跑；只有控制连接写不动才算会话断了。
 func flushBatch(s *clientSession, k int, batch []byte) error {
 	if len(batch) == 0 {
 		return nil
 	}
-	conn := s.slot(k)
+	actual, conn, mu := s.writeSlot(k)
 	if conn == nil {
 		return fmt.Errorf("写隧道: 槽 %d 连接为 nil", k)
 	}
-	if k == 0 {
-		s.writeMu.Lock()
-		defer s.writeMu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
+	// SetWriteDeadline 在连接已关时就会失败，所以它和 Write 的失败要一起分流：
+	// 只处理 Write 的话，"对端已经关了"这条最常见的路径会绕过日志与摘槽。
+	werr := conn.SetWriteDeadline(time.Now().Add(slotWriteTimeout))
+	if werr == nil {
+		_, werr = conn.Write(batch)
 	}
-	if _, err := conn.Write(batch); err != nil {
-		s.log.Error("写隧道失败", "slot", k, "bytes", len(batch), "err", err)
-		return fmt.Errorf("写隧道: %w", err)
+	if werr != nil {
+		if s.sessionEnded() {
+			// 会话收尾：槽位连接随会话一起关，写失败是预期内的竞态，记成 ERROR 会误导排障
+			s.log.Debug("会话收尾中写隧道失败", connLogAttrs(werr, conn, "slot", k, "bytes", len(batch))...)
+			return fmt.Errorf("写隧道: %w", werr)
+		}
+		if actual > 0 {
+			// 一条成员连接出问题不该重启整条隧道：摘掉它，让维护协程补一条新的
+			s.dropSlot(actual, conn)
+			s.log.Warn("成员连接写不动，已摘除该槽", connLogAttrs(werr, conn, "slot", actual)...)
+			return nil
+		}
+		s.log.Error("写隧道失败", connLogAttrs(werr, conn, "slot", actual, "bytes", len(batch))...)
+		return fmt.Errorf("写隧道: %w", werr)
 	}
 	return nil
+}
+
+// dropSlot 摘掉写不动的成员连接。关闭放在锁外，避免持锁做 IO。
+func (s *clientSession) dropSlot(k int, conn net.Conn) {
+	s.mu.Lock()
+	if k > 0 && k < len(s.slots) && s.slots[k] == conn {
+		s.slots[k] = nil
+	}
+	s.mu.Unlock()
+	_ = conn.Close()
 }
 
 func (s *clientSession) heartbeat(ctx context.Context) error {

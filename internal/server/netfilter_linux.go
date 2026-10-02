@@ -23,7 +23,7 @@ func Up(cfg Config, logger *slog.Logger, force bool) error {
 		if !force {
 			return err
 		}
-		logger.Warn("转发端口已被别的进程占用，按 --force 继续", "err", err)
+		logger.Warn("转发端口已被别的进程占用，按 --force 继续", connLogAttrs(err, nil)...)
 	}
 	if err := enableForwarding(); err != nil {
 		return err

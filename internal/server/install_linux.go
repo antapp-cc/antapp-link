@@ -21,10 +21,23 @@ const (
 )
 
 // BBR + fq：Pi 节点上传流量占比高，换成 BBR 对丢包链路改善明显。
+//
+// 后面几项是多连接数据面的调优。deploy/install.sh 也会用 sysctl -w 逐项直写一遍
+// （为了当场生效并回读校验），但那份重启就没了，持久化靠这份文件——两处必须一致。
 var sysctlContent = strings.Join([]string{
 	"net.ipv4.ip_forward=1",
 	"net.core.default_qdisc=fq",
 	"net.ipv4.tcp_congestion_control=bbr",
+	"",
+	"# 多连接并发：空闲后不重新起步、放宽单连接缓冲上限、开 MTU 探测",
+	"net.ipv4.tcp_slow_start_after_idle=0",
+	"net.core.rmem_max=16777216",
+	"net.core.wmem_max=16777216",
+	"net.ipv4.tcp_rmem=4096 87380 16777216",
+	"net.ipv4.tcp_wmem=4096 65536 16777216",
+	"net.ipv4.tcp_mtu_probing=1",
+	"# tcp_fastopen 是占位：Go 标准库不发起 TFO，配了也不生效",
+	"net.ipv4.tcp_fastopen=3",
 	"",
 }, "\n")
 

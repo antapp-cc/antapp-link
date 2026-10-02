@@ -238,8 +238,8 @@ func cmdInvite(stdout, stderr io.Writer, args []string) int {
 	if members < 0 {
 		members = 0
 	}
-	if members > cfg.MaxMembers {
-		members = cfg.MaxMembers
+	if members > cfg.Tunnel.MaxMembers {
+		members = cfg.Tunnel.MaxMembers
 	}
 
 	inv, err := pki.Issue(cfg.PKIDir, name, addr, pki.TunnelParams{
@@ -283,6 +283,15 @@ func cmdInvite(stdout, stderr io.Writer, args []string) int {
 	fmt.Fprintf(stdout, "服务端        : %s\n", addr)
 	fmt.Fprintf(stdout, "隧道地址      : %s/%d（网关 %s）\n", cfg.Tunnel.ClientIP, cfg.PrefixLen(), cfg.Tunnel.ServerIP)
 	fmt.Fprintf(stdout, "MTU           : %d\n", cfg.Tunnel.MTU)
+	if members > 1 {
+		fmt.Fprintf(stdout, "并行连接      : %d 条（多连接并发）\n", members)
+	} else {
+		fmt.Fprintf(stdout, "并行连接      : 1 条（单连接）\n")
+	}
+	if *membersFlag > members {
+		fmt.Fprintf(stdout, "              ↑ 请求 %d 条，受 max_members=%d 限制，实际写入 %d\n",
+			*membersFlag, cfg.Tunnel.MaxMembers, members)
+	}
 	fmt.Fprintf(stdout, "DNS           : %s\n", strings.Join(cfg.DNS, ", "))
 	fmt.Fprintf(stdout, "转发端口      : %d-%d（只转 TCP）\n", cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
 	fmt.Fprintf(stdout, "连接码文件    : %s\n", path)
@@ -382,6 +391,14 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 			fmt.Fprintf(stdout, "已接入节点  : %s（自 %s）\n", st.Client, st.ConnectedAt)
 			if st.Members > 1 {
 				fmt.Fprintf(stdout, "并行连接    : %d/%d 条存活\n", st.LiveMembers, st.Members)
+				for _, sl := range st.Slots {
+					fmt.Fprintf(stdout, "  槽 %d        : 收 %d 字节，发 %d 字节\n",
+						sl.Slot, sl.RxBytes, sl.TxBytes)
+				}
+			}
+			if st.JoinFailures > 0 {
+				fmt.Fprintf(stdout, "加入失败    : %d 次（达 %d 次会熔断 %v）\n",
+					st.JoinFailures, joinMaxFail, joinWindow)
 			}
 		} else {
 			fmt.Fprintln(stdout, "已接入节点  : 无")

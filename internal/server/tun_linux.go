@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -67,17 +66,23 @@ func runIP(args ...string) error {
 func (t *TUN) Read(p []byte) (int, error) { return t.file.Read(p) }
 
 // TryRead 非阻塞收割一个已就绪的包（写合并的收割端）：无包立即 (0, nil)。
-// Linux 的 /dev/net/tun 永远可立即读（内核缓冲空才阻塞），所以这里直接探测：
-// 先读，EAGAIN 视为无包。为不干扰阻塞读，用 syscall 直接读 fd。
+//
+// /dev/net/tun 的 fd 是阻塞模式，空队列上直接 read 会挂住 —— pumpTun 的收割循环
+// 一旦卡在这里，服务端就再也不往下发 IP 包，而连接看着还全在（控制帧走另一条
+// 循环）。所以先用零超时的 poll 探测，确认有包才去读。
 func (t *TUN) TryRead(p []byte) (int, error) {
-	n, err := syscall.Read(int(t.file.Fd()), p)
-	if err == syscall.EAGAIN {
-		return 0, nil
-	}
+	fds := []unix.PollFd{{Fd: int32(t.file.Fd()), Events: unix.POLLIN}}
+	n, err := unix.Poll(fds, 0)
 	if err != nil {
+		if err == unix.EINTR {
+			return 0, nil
+		}
 		return 0, err
 	}
-	return n, nil
+	if n == 0 {
+		return 0, nil
+	}
+	return t.file.Read(p)
 }
 func (t *TUN) Write(p []byte) (int, error) { return t.file.Write(p) }
 func (t *TUN) Close() error                { return t.file.Close() }
