@@ -188,6 +188,24 @@ fi
 [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ]] || die "BBR 启用失败——内核不支持且模块加载不了"
 log "BBR 已生效（$(sysctl -n net.ipv4.tcp_congestion_control) + $(sysctl -n net.core.default_qdisc)）"
 
+log "调优内核缓冲（多连接数据面）"
+apply_sysctl() {
+  sysctl -w "$1" >/dev/null 2>&1
+}
+apply_or_die() {
+  apply_sysctl "$1"
+  want="${1#*=}"
+  got="$(sysctl -n "${1%%=*}")"
+  [[ "$got" == "$want" ]] || die "内核参数 $1 应用失败（当前 $got，期望 $want）"
+}
+apply_or_die "net.ipv4.tcp_slow_start_after_idle=0"
+apply_or_die "net.core.rmem_max=16777216"
+apply_or_die "net.core.wmem_max=16777216"
+apply_or_die "net.ipv4.tcp_mtu_probing=1"
+sysctl -w "net.ipv4.tcp_rmem=4096 87380 16777216" >/dev/null
+sysctl -w "net.ipv4.tcp_wmem=4096 65536 16777216" >/dev/null
+log "内核缓冲调优完成（rmem/wmem 上限 16MB，空闲不重新起步）"
+
 log "安装 systemd 服务"
 "$BIN" install -c "$CONF"
 
