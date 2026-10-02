@@ -25,9 +25,11 @@ func EnableAutostart() error {
 		// schtasks 的 /tr 需要自带引号才能容纳带空格的路径
 		target = `"` + exe + `"`
 	}
+	// /delay 登录后延迟 30 秒再拉起：给网络栈留出就绪时间（DHCP/默认路由），
+	// 配合客户端自身的开机重试，双保险
 	return runCommand(Command{"schtasks", []string{
 		"/create", "/tn", autostartTask, "/tr", target,
-		"/sc", "onlogon", "/rl", "highest", "/f",
+		"/sc", "onlogon", "/delay", "0000:30", "/rl", "highest", "/f",
 	}})
 }
 
