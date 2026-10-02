@@ -108,6 +108,7 @@ func Issue(dir, name, server string, tp TunnelParams) (Invite, error) {
 		MTU:      tp.MTU,
 		DNS:      tp.DNS,
 		Mode:     tp.Mode,
+		Members:  tp.Members,
 		CAPEM:    string(caPEM),
 		CertPEM:  string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})),
 		KeyPEM:   string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})),
