@@ -269,8 +269,19 @@ func Uninstall(opts Options, log func(string)) error {
 	} else {
 		log("  保留 config / logs / data（连接码、日志与运行状态）")
 	}
-	_ = os.Remove(filepath.Join(opts.InstallDir, AppExeName))
-	_ = os.Remove(filepath.Join(opts.InstallDir, "wintun.dll"))
+	// 逐个点名删太容易漏：README.md 是安装时写进去的，却因为安装侧改过名
+	// （THIRD-PARTY-NOTICES.md → README.md）而没进删除列表；它留在原地又让
+	// 下面的 os.Remove 因目录非空而失败，整个目录就残留了。
+	// 安装目录里本来就只该有程序文件，用户数据都在 config/logs/data 子目录，
+	// 上面已按 RemoveData 处理过，所以这里把剩下的文件一扫而空。
+	if entries, err := os.ReadDir(opts.InstallDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			_ = os.Remove(filepath.Join(opts.InstallDir, e.Name()))
+		}
+	}
 	// 目录非空时会失败，忽略即可 —— 不强行删掉用户自己放进去的东西
 	_ = os.Remove(opts.InstallDir)
 
