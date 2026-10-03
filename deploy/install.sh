@@ -122,7 +122,7 @@ if command -v apt-get >/dev/null; then
 fi
 
 if [[ -f $CONF ]]; then
-  log "检测到已安装 AntApp Link——本次按升级处理：只更新程序与配置，CA、已签发证书和 /root/pinode.antapp 全部原样保留，老连接码继续有效"
+  log "检测到已安装 AntApp Link——本次按升级处理：更新程序与配置，并重新签发 /root/pinode.antapp（CA 不变，客户端证书换新）"
 fi
 if [[ ! -f "$SRC_DIR/antapp-linkd" ]]; then
   log "目录下没有 antapp-linkd，从 GitHub Release 自动下载（约 7 MB）……"
@@ -243,18 +243,15 @@ sleep 2
 log "当前状态"
 "$BIN" status -c "$CONF" || true
 
-if [[ -f /root/pinode.antapp ]]; then
-  log "已签发过连接码：/root/pinode.antapp 继续有效，本次不重签（确认要重签才执行: $BIN invite pi-node-01 -o /root）"
-else
-  log "首次安装，自动签发连接码文件到 /root（只签这一个）"
-  "$BIN" invite pi-node-01 -o /root || log "警告: 签发失败，可手动执行: $BIN invite pi-node-01 -o /root"
-fi
+log "重新签发连接码到 /root（覆盖旧文件，让里面的参数跟上当前配置）"
+"$BIN" invite pi-node-01 -c "$CONF" -o /root || log "警告: 签发失败，可手动执行: $BIN invite pi-node-01 -c $CONF -o /root"
 
 cat <<EOF
 
 [antapp-link] --------------------------------------------------
-[antapp-link] 安装完成。连接码文件：/root/pinode.antapp
+[antapp-link] 安装完成。连接码文件：/root/pinode.antapp（本次已重新签发）
 [antapp-link] 把它发给节点机双击导入即可（内含私钥，等同密码，注意保管）。
-[antapp-link] 升级重装不会动这个文件；确认要重签才执行: $BIN invite pi-node-01 -o /root
+[antapp-link] 本次客户端证书已换新，之前发出去的旧连接码作废，节点机必须重新导入。
+[antapp-link] 只想重启服务、不换连接码时别跑本脚本，直接: systemctl restart antapp-linkd
 [antapp-link] --------------------------------------------------
 EOF
