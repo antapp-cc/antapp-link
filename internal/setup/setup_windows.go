@@ -169,6 +169,9 @@ func Install(opts Options, log func(string)) error {
 	if err := os.MkdirAll(opts.InstallDir, 0o755); err != nil {
 		return fmt.Errorf("创建安装目录: %w", err)
 	}
+	// 连接码放这里。客户端自己也会建，但装完还没启动时 config\ 并不存在 ——
+	// 那时想把 .antapp 放进去还得先手动建目录。顺手建一个空的。
+	_ = os.MkdirAll(filepath.Join(opts.InstallDir, "config"), 0o755)
 
 	dst := filepath.Join(opts.InstallDir, AppExeName)
 	// Windows 不允许覆盖正在运行的 exe，但允许给它改名 —— 覆盖安装时先把手头
