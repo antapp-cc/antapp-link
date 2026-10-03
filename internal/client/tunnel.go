@@ -524,7 +524,13 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 	}
 }
 
-// memberRetryDelay 是补拨成员连接前的等待：首次立刻拨（几条连接本来就该并发建），
+// memberStagger 是成员连接首次拨号之间的间隔。
+//
+// 刻意不并发建：几条 TLS 在几十毫秒内挤向同一个 IP:端口是很好认的行为特征，
+// 正常客户端不会这样。错开也不影响可用性 —— 成员没就位时数据走控制连接。
+const memberStagger = 400 * time.Millisecond
+
+// memberRetryDelay 是补拨成员连接前的等待：首次立刻拨（错开由调用方负责），
 // 失败之后才按退避来。
 func memberRetryDelay(attempt int) time.Duration {
 	if attempt <= 0 {
@@ -542,6 +548,14 @@ func maintainMembers(ctx context.Context, t *Tunnel, sess *clientSession) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// 只在首次建连时错开；断开后的补拨走退避 —— 那是恢复路径，不快不行。
+			if k > 1 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(memberStagger * time.Duration(k-1)):
+				}
+			}
 			attempt := 0
 			for {
 				if d := memberRetryDelay(attempt); d > 0 {
