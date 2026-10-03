@@ -70,6 +70,7 @@ type UI struct {
 	trayHinted    bool
 	trayConnected bool
 	wasOnline     bool
+	hideAt        time.Time
 	logSeq        uint64
 	done          chan struct{}
 	pending       *update.Manifest
@@ -696,9 +697,16 @@ func (u *UI) refresh() {
 		u.txtLog.SendMessage(wmVScroll, sbBottom, 0)
 	}
 
-	// 连上就把窗口收进托盘，每次从断到连都收一次。hintTray 自带「只提示一次」，
-	// 所以气泡只在头一回弹。
+	// 连上 5 秒后再收进托盘，留出时间让人看清状态；期间又断线就取消，重连重新
+	// 计时。hintTray 自带「只提示一次」，所以气泡只在头一回弹。
 	if st.Online && !u.wasOnline {
+		u.hideAt = time.Now().Add(5 * time.Second)
+	}
+	if !st.Online {
+		u.hideAt = time.Time{}
+	}
+	if !u.hideAt.IsZero() && !time.Now().Before(u.hideAt) {
+		u.hideAt = time.Time{}
 		u.mw.Hide()
 		u.hintTray()
 	}
