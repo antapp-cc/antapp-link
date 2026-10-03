@@ -265,7 +265,8 @@ func (u *UI) build() error {
 }
 
 // watchInvite 盯着 config\*.antapp 的内容变化：运行期间用户放进新文件、或改了
-// 现有文件的内容，都会在这里被发现并弹列表让用户确认切换。
+// 现有文件的内容，都会在这里被发现。从「没有配置」变成「恰好一个」时自动选用
+// 并连接（与启动时一致）；其余情况只提示，让用户从托盘菜单选。
 //
 // 用户在客户端已经运行时双击一个 .antapp 文件，那个新进程只会把文件复制进 config\
 // 然后退出（单实例闸门挡着）。真正的切换得由这条链完成 —— 否则双击看起来毫无反应。
@@ -302,7 +303,21 @@ func (u *UI) watchInvite() {
 		if !changed {
 			continue
 		}
+		prev := last
 		last = now
+
+		// 从「没有配置」变成「恰好一个」时自动选用并连接，与启动时的行为一致。
+		// 原来这里只记一条日志、主按钮始终停在「导入连接码」，用户手动把文件放进
+		// config\ 之后会以为没生效，只能绕到托盘菜单去连。
+		if len(now) == 1 && len(prev) == 0 {
+			for name := range now {
+				if u.adoptByName(name) {
+					u.app.Log().Info(fmt.Sprintf("已自动连接配置 %s", name))
+				}
+				break
+			}
+			continue
+		}
 
 		u.app.Log().Info("config 文件夹的连接码有变化；如需切换，请使用托盘菜单的「切换配置文件」")
 	}
