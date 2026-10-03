@@ -124,23 +124,39 @@ fi
 if [[ -f $CONF ]]; then
   log "检测到已安装 AntApp Link——本次按升级处理：更新程序与配置，并重新签发 /root/pinode.antapp（CA 不变，客户端证书换新）"
 fi
-if [[ ! -f "$SRC_DIR/antapp-linkd" ]]; then
-  log "目录下没有 antapp-linkd，从 GitHub Release 自动下载（约 7 MB）……"
-  url="https://github.com/antapp-cc/antapp-link/releases/latest/download/antapp-linkd"
-  if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
-    log "没有 wget 也没有 curl，先装 wget"
-    DEBIAN_FRONTEND=noninteractive apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y wget
-  fi
-  if command -v wget >/dev/null 2>&1; then
-    wget -O "$SRC_DIR/antapp-linkd" "$url" || die "下载失败：检查网络后重试，或手动上传 antapp-linkd 到同目录"
-  else
-    curl -fL -S --progress-bar -o "$SRC_DIR/antapp-linkd" "$url" || die "下载失败：检查网络后重试，或手动上传 antapp-linkd 到同目录"
-  fi
-  [[ "$(head -c 4 "$SRC_DIR/antapp-linkd")" == $'\x7fELF' ]] || die "下载到的不是有效二进制（网络或 CDN 异常），请手动上传 antapp-linkd 到同目录"
-  log "下载完成（$(du -h "$SRC_DIR/antapp-linkd" | cut -f1)）"
-  chmod +x "$SRC_DIR/antapp-linkd"
+url="https://github.com/antapp-cc/antapp-link/releases/latest/download/antapp-linkd"
+downloaded=0
+if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+  log "没有 wget 也没有 curl，先装 wget"
+  DEBIAN_FRONTEND=noninteractive apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y wget
 fi
+if command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1; then
+  log "从 GitHub Release 下载 antapp-linkd（约 7 MB）……"
+  tmp_dl="$SRC_DIR/antapp-linkd.download"
+  rm -f "$tmp_dl"
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO "$tmp_dl" "$url" || true
+  else
+    curl -fsSL --max-time 180 -o "$tmp_dl" "$url" || true
+  fi
+  if [[ -f "$tmp_dl" ]] && [[ "$(head -c 4 "$tmp_dl")" == $'\x7fELF' ]]; then
+    mv -f "$tmp_dl" "$SRC_DIR/antapp-linkd"
+    downloaded=1
+    log "下载完成（$(du -h "$SRC_DIR/antapp-linkd" | cut -f1)）"
+  else
+    rm -f "$tmp_dl"
+    log "下载失败或拿到的不是有效二进制（网络 / CDN 异常）"
+  fi
+fi
+if [[ "$downloaded" -eq 0 ]]; then
+  if [[ -f "$SRC_DIR/antapp-linkd" ]]; then
+    log "警告: 改用同目录现成的 antapp-linkd —— 它不一定是最新版，想确保最新请让网络可用后重跑"
+  else
+    die "下载失败，同目录也没有 antapp-linkd。请检查网络，或手动上传 antapp-linkd 到 $SRC_DIR"
+  fi
+fi
+chmod +x "$SRC_DIR/antapp-linkd"
 
 log "检查系统依赖"
 missing=()
