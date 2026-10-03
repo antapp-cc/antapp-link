@@ -26,6 +26,7 @@ func run() int {
 		noNetCfg   = flag.Bool("no-netcfg", false, "只建隧道、只配虚拟网卡，不改路由与 DNS（联调端口转发用）")
 		orderTrace = flag.String("order-trace", "",
 			"联调用：把每个进出隧道的包（方向/槽位/五元组/seq）记到该文件，用来断言同一内层流不跨外层连接")
+		restoreNet = flag.Bool("restore-network", false, "只还原上次残留的网络配置后退出（卸载器调用）")
 		showVer = flag.Bool("version", false, "显示版本")
 	)
 	flag.Parse()
@@ -112,6 +113,11 @@ func run() int {
 		if err := app.HealIfNeeded(); err != nil {
 			logger.Warn("自愈未完全成功", "err", err)
 		}
+	}
+	// 卸载器把客户端硬停之后借这个入口还原网络：上面那步自愈已经干完了活，
+	// 这里只要在碰隧道之前退出。
+	if *restoreNet {
+		return 0
 	}
 
 	if *once {

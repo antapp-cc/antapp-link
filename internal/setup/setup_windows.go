@@ -245,6 +245,12 @@ func Uninstall(opts Options, log func(string)) error {
 	log("停止客户端")
 	stopClient()
 
+	// 上面是 taskkill /F 硬停，客户端来不及还原 DNS 和路由；而这些残留会让用户
+	// 整机解析不了域名（DNS 还指着已经消失的隧道网关）。所以再拉起一次客户端，
+	// 走它的自愈路径。setup 不能直接 import client —— client 已经 import 了 setup。
+	log("还原网络配置")
+	_ = runHidden(filepath.Join(opts.InstallDir, AppExeName), "-restore-network", "-data", opts.InstallDir)
+
 	// 计划任务留着的话，卸载后每次登录还会去启动一个已经不存在的程序
 	log("清理开机自启计划任务")
 	_ = runHidden("schtasks", "/delete", "/tn", AutostartTask, "/f")
