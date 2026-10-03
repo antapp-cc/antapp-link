@@ -18,7 +18,6 @@ const (
 	upUnit     = "/etc/systemd/system/antapp-link-up.service"
 	sysctlFile = "/etc/sysctl.d/99-antapp-link.conf"
 	dnsConf    = "/etc/dnsmasq.d/antapp.conf"
-	cnDNSConf  = "/etc/dnsmasq.d/antapp-cn.conf"
 )
 
 // BBR + fq：Pi 节点上传流量占比高，换成 BBR 对丢包链路改善明显。
@@ -70,9 +69,6 @@ func Install(stdout, stderr io.Writer, args []string) int {
 		{"安装二进制到 " + binaryPath, installBinary},
 		{"写 " + sysctlFile, func() error { return os.WriteFile(sysctlFile, []byte(sysctlContent), 0o644) }},
 		{"写 " + dnsConf, func() error { return os.WriteFile(dnsConf, []byte(dnsRelayConfContent(cfg)), 0o644) }},
-		// dnsmasq 的 conf-file 指向的文件不存在会启动失败，所以先落一个空的；
-		// 有内容才有分流规则，空文件与不做分流等价。
-		{"确保 " + cnDNSConf + " 存在", func() error { return ensureEmptyFile(cnDNSConf) }},
 		{"启用 dnsmasq DNS 中继", enableDNSRelay},
 		{"写 " + daemonUnit, func() error { return os.WriteFile(daemonUnit, []byte(daemonUnitContent(*cfgPath)), 0o644) }},
 		{"写 " + upUnit, func() error { return os.WriteFile(upUnit, []byte(upUnitContent(*cfgPath)), 0o644) }},
@@ -175,23 +171,10 @@ bind-dynamic
 no-resolv
 server=8.8.8.8
 server=1.1.1.1
-# 国内域名改问国内 DNS。DNS 返回哪个 CDN 节点取决于解析器自己的位置：用境外
-# 解析器会把百度/淘宝解析到海外节点，客户端的分流表认不出，内容就绕道隧道，
-# 白占云服带宽。规则由 deploy/update-cn-domains.sh 写入；文件为空时 dnsmasq
-# 照常启动，行为与不做分流完全一致。
-conf-file=%s
 filter-AAAA
 no-hosts
 cache-size=1000
-`, cfg.Tunnel.ServerIP, cnDNSConf)
-}
-
-// ensureEmptyFile 保证路径存在，但不动已有内容。
-func ensureEmptyFile(path string) error {
-	if _, err := os.Stat(path); err == nil {
-		return nil
-	}
-	return os.WriteFile(path, nil, 0o644)
+`, cfg.Tunnel.ServerIP)
 }
 
 // enableDNSRelay 启动并自启 dnsmasq。包不存在时不报错（install.sh 负责

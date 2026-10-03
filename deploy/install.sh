@@ -230,34 +230,6 @@ log "内核缓冲调优完成（rmem/wmem 上限 16MB，空闲不重新起步；
 log "安装 systemd 服务"
 "$BIN" install -c "$CONF"
 
-log "配置国内域名 DNS 分流"
-CN_DOMAINS=/etc/dnsmasq.d/antapp-cn.conf
-CN_URLS=(
-  "https://cdn.jsdelivr.net/gh/felixonmars/dnsmasq-china-list@master/accelerated-domains.china.conf"
-  "https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf"
-)
-if command -v wget >/dev/null 2>&1; then
-  cn_dl() { wget -qO "$2" --timeout=60 "$1"; }
-else
-  cn_dl() { curl -fsSL --max-time 60 "$1" -o "$2"; }
-fi
-cn_tmp="$(mktemp)"
-cn_ok=0
-for u in "${CN_URLS[@]}"; do
-  if cn_dl "$u" "$cn_tmp" 2>/dev/null && [[ "$(wc -l < "$cn_tmp")" -gt 1000 ]]; then
-    cn_ok=1
-    break
-  fi
-done
-if [[ "$cn_ok" -eq 1 ]]; then
-  sed 's|/114\.114\.114\.114|/223.5.5.5|' "$cn_tmp" > "$CN_DOMAINS"
-  log "国内域名表已写入 $CN_DOMAINS（$(wc -l < "$CN_DOMAINS") 条）"
-else
-  : > "$CN_DOMAINS"
-  log "警告: 国内域名表下载失败，DNS 分流未启用（隧道本身不受影响）"
-fi
-rm -f "$cn_tmp"
-
 systemctl enable dnsmasq >/dev/null 2>&1 || true
 systemctl restart dnsmasq >/dev/null 2>&1 || log "警告: dnsmasq 未启动，隧道 DNS 中继不可用"
 
