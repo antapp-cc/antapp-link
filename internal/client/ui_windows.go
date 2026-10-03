@@ -69,6 +69,7 @@ type UI struct {
 	quitting      bool
 	trayHinted    bool
 	trayConnected bool
+	wasOnline     bool
 	logSeq        uint64
 	done          chan struct{}
 	pending       *update.Manifest
@@ -694,6 +695,14 @@ func (u *UI) refresh() {
 		)
 		u.txtLog.SendMessage(wmVScroll, sbBottom, 0)
 	}
+
+	// 连上就把窗口收进托盘，每次从断到连都收一次。hintTray 自带「只提示一次」，
+	// 所以气泡只在头一回弹。
+	if st.Online && !u.wasOnline {
+		u.mw.Hide()
+		u.hintTray()
+	}
+	u.wasOnline = st.Online
 }
 
 // Connect/Disconnect 会做网络操作（探测、改路由、跑 PowerShell），不能卡住界面线程。

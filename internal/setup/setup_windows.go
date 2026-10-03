@@ -57,6 +57,17 @@ func runHidden(name string, args ...string) error {
 	return cmd.Run()
 }
 
+// enableAutostart 注册「登录时自动启动」计划任务。参数与客户端的 EnableAutostart
+// 逐字一致：同一个任务名，托盘菜单里那个勾选状态才对得上。
+func enableAutostart(exe string) error {
+	target := exe
+	if strings.ContainsAny(exe, " \t") {
+		target = `"` + exe + `"`
+	}
+	return runHidden("schtasks", "/create", "/tn", AutostartTask, "/tr", target,
+		"/sc", "onlogon", "/delay", "0000:30", "/rl", "highest", "/f")
+}
+
 func runHiddenOutput(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	cmd.SysProcAttr = hiddenProcAttr()
@@ -233,6 +244,13 @@ func Install(opts Options, log func(string)) error {
 		log("注册 " + InviteExt + " 文件关联失败（不影响使用）：" + err.Error())
 	} else {
 		log("已关联 " + InviteExt + " 文件，双击连接码就能导入")
+	}
+
+	// 装完默认就开机自启；失败不算安装失败，托盘菜单里还能手动勾
+	if err := enableAutostart(dst); err != nil {
+		log("开机自启设置失败（可在托盘右键菜单里手动勾选）：" + err.Error())
+	} else {
+		log("已设置开机自启")
 	}
 
 	if opts.Launch {
