@@ -43,7 +43,7 @@ const (
 )
 
 // Version 由构建脚本用 -ldflags -X 注入。
-var Version = "0.2.9"
+var Version = "0.2.8"
 
 const createNoWindow = 0x08000000
 
