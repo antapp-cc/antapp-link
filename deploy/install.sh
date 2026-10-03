@@ -230,6 +230,34 @@ log "内核缓冲调优完成（rmem/wmem 上限 16MB，空闲不重新起步；
 log "安装 systemd 服务"
 "$BIN" install -c "$CONF"
 
+# 国内域名走国内 DNS。云服在境外，用 8.8.8.8 解析百度/淘宝会拿到海外节点，
+# 客户端分流表认不出，内容就绕道隧道白占带宽。这段与 deploy/update-cn-domains.sh
+# 同逻辑，刻意内联：install.sh 是单文件下载运行的，依赖不到旁边的脚本。
+log "配置国内域名 DNS 分流"
+CN_DOMAINS=/etc/dnsmasq.d/antapp-cn.conf
+CN_URLS=(
+  "https://cdn.jsdelivr.net/gh/felixonmars/dnsmasq-china-list@master/accelerated-domains.china.conf"
+  "https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf"
+)
+cn_tmp="$(mktemp)"
+cn_ok=0
+for u in "${CN_URLS[@]}"; do
+  if curl -fsSL --max-time 60 "$u" -o "$cn_tmp" 2>/dev/null && [[ "$(wc -l < "$cn_tmp")" -gt 1000 ]]; then
+    cn_ok=1
+    break
+  fi
+done
+if [[ "$cn_ok" -eq 1 ]]; then
+  # 表里默认的上游是 114.114.114.114，从境外访问不稳，统一换成阿里公共 DNS
+  sed 's|/114\.114\.114\.114|/223.5.5.5|' "$cn_tmp" > "$CN_DOMAINS"
+  log "国内域名表已写入 $CN_DOMAINS（$(wc -l < "$CN_DOMAINS") 条）"
+else
+  # 留空文件：dnsmasq 照常启动，行为退回「不做分流」
+  : > "$CN_DOMAINS"
+  log "警告: 国内域名表下载失败，DNS 分流未启用（隧道本身不受影响）"
+fi
+rm -f "$cn_tmp"
+
 systemctl enable dnsmasq >/dev/null 2>&1 || true
 systemctl restart dnsmasq >/dev/null 2>&1 || log "警告: dnsmasq 未启动，隧道 DNS 中继不可用"
 
