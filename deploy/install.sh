@@ -198,7 +198,7 @@ apply_or_die() {
   got="$(sysctl -n "${1%%=*}")"
   [[ "$got" == "$want" ]] || die "内核参数 $1 应用失败（当前 $got，期望 $want）"
 }
-# 多值参数（tcp_rmem/tcp_wmem）内核回读是制表符分隔，比较前先归一空白
+
 apply_list_or_die() {
   apply_sysctl "$1"
   key="${1%%=*}"
@@ -207,7 +207,6 @@ apply_list_or_die() {
   [[ "$got" == "$want" ]] || die "内核参数 $key 应用失败（当前 $got，期望 $want）"
 }
 
-# 先备份原值：tcp_rmem/tcp_wmem 是整串覆盖，会冲掉机器上已有的自定义值
 mkdir -p "$CONF_DIR"
 SYSCTL_BACKUP="$CONF_DIR/sysctl-backup.txt"
 : > "$SYSCTL_BACKUP"
@@ -223,7 +222,6 @@ apply_or_die "net.core.wmem_max=16777216"
 apply_or_die "net.ipv4.tcp_mtu_probing=1"
 apply_list_or_die "net.ipv4.tcp_rmem=4096 87380 16777216"
 apply_list_or_die "net.ipv4.tcp_wmem=4096 65536 16777216"
-# 占位项：Go 标准库不发起 TFO，配了也不生效，所以只应用、不验收
 apply_sysctl "net.ipv4.tcp_fastopen=3"
 log "内核缓冲调优完成（rmem/wmem 上限 16MB，空闲不重新起步；持久化见 /etc/sysctl.d/99-antapp-link.conf）"
 
