@@ -21,13 +21,23 @@ import (
 // 连接码里的地址，不必重签任何证书。
 const ServerName = "antapp-link"
 
-// ALPN 是客户端在 TLS 握手里声明的协议名。刻意取一个最常见的值：自研名字等于
-// 在明文握手里挂一块牌子，中间设备看一眼就知道这不是普通 HTTPS。
-const ALPN = "h2"
+// ALPN 是客户端在 TLS 握手里声明的协议名。取最常见的两个值、顺序也和浏览器一致：
+// 自研名字等于在明文握手里挂一块牌子，中间设备看一眼就知道这不是普通 HTTPS。
+// 真实浏览器都带 http/1.1 作为降级，只声明 h2 反而不太常见。
+const (
+	ALPN         = "h2"
+	ALPNFallback = "http/1.1"
+)
 
 // ALPNLegacy 是上线时用过的名字。服务端继续接受它，否则已经发出去的连接码会
 // 一次性全部连不上 —— 连接码里没有协商 ALPN 的余地。
 const ALPNLegacy = "antapp-link/1"
+
+// 两个列表刻意分开：客户端只声明伪装值，服务端要多留一个旧名字给没升级的客户端。
+var (
+	clientALPN = []string{ALPN, ALPNFallback}
+	serverALPN = []string{ALPN, ALPNFallback, ALPNLegacy}
+)
 
 const (
 	caCertFile  = "ca.crt"
@@ -174,7 +184,7 @@ func ServerTLSConfig(dir string) (*tls.Config, error) {
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		ClientCAs:    pool,
 		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{ALPN, ALPNLegacy},
+		NextProtos:   serverALPN,
 	}, nil
 }
 

@@ -85,6 +85,15 @@ func TestServerAcceptsBothNewAndLegacyALPN(t *testing.T) {
 	if got != ALPNLegacy {
 		t.Errorf("旧客户端协商出 %q，期望 %q", got, ALPNLegacy)
 	}
+
+	// 只声明降级值的客户端也要能连 —— 那正是浏览器禁掉 h2 时的行为
+	got, err = dial([]string{ALPNFallback})
+	if err != nil {
+		t.Fatalf("只声明 %s 的客户端握手失败: %v", ALPNFallback, err)
+	}
+	if got != ALPNFallback {
+		t.Errorf("协商出 %q，期望 %q", got, ALPNFallback)
+	}
 }
 
 // 客户端默认就该声明伪装值，否则这个改动等于没做。
@@ -96,7 +105,12 @@ func TestClientTLSConfigDeclaresDisguisedALPN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.NextProtos) != 1 || cfg.NextProtos[0] != ALPN {
-		t.Errorf("客户端 NextProtos = %v，期望 [%s]", cfg.NextProtos, ALPN)
+	if len(cfg.NextProtos) != len(clientALPN) {
+		t.Fatalf("客户端 NextProtos = %v，期望 %v", cfg.NextProtos, clientALPN)
+	}
+	for i, want := range clientALPN {
+		if cfg.NextProtos[i] != want {
+			t.Errorf("客户端 NextProtos[%d] = %q，期望 %q", i, cfg.NextProtos[i], want)
+		}
 	}
 }
