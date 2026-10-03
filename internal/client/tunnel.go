@@ -509,6 +509,7 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 			if _, err := sess.dev.Write(payload); err != nil {
 				return err
 			}
+			sess.stats.RxBytes.Add(uint64(len(payload)))
 		case proto.TypeBye:
 			// 服务端拒绝了这条成员连接，或正在关它：立刻摘槽，别继续往里写
 			sess.mu.Lock()
