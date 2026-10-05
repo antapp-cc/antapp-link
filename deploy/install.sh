@@ -10,11 +10,13 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TUNNEL_PORT=""
 FORWARD_RANGE=""
 NETWORK=""
+ASSUME_YES=0
 
 usage() {
   cat <<'EOF'
-用法: bash install.sh [--forward 31400-31409] [--tunnel-port 62233] [--network 10.10.0.0/24]
+用法: bash install.sh [--forward 31400-31409] [--tunnel-port 62233] [--network 10.10.0.0/24] [--yes]
 不带参数时全部用默认值。
+--yes 已装过时不再询问，直接重装。
 EOF
 }
 
@@ -40,6 +42,10 @@ while [[ $# -gt 0 ]]; do
       [[ "$net" =~ ^[0-9.]+/[0-9]+$ ]] || die "--network 需要形如 10.10.0.0/24 的参数"
       NETWORK="$net"
       shift 2
+      ;;
+    --yes|-y)
+      ASSUME_YES=1
+      shift
       ;;
     -h|--help)
       usage
@@ -122,7 +128,25 @@ if command -v apt-get >/dev/null; then
 fi
 
 if [[ -f $CONF ]]; then
-  log "检测到已安装 AntApp Link——本次按升级处理：更新程序与配置，并重新签发 /root/pinode.antapp（CA 不变，客户端证书换新）"
+  log "检测到这台机器已经装过 AntApp Link。继续安装会："
+  log "  · 把 antapp-linkd 更新到最新版"
+  log "  · 重写 dnsmasq / sysctl / systemd 的配置文件"
+  log "  · 重新签发 /root/pinode.antapp —— 客户端证书换新，旧连接码立即作废，"
+  log "    正在用它的节点机会掉线，必须重新导入新连接码"
+  log "  · 不会动 CA，也不会动 $CONF（端口/网段等设置保留）"
+  log "什么都不做的话，现有安装保持原样。"
+  if [[ $ASSUME_YES -eq 1 ]]; then
+    log "已指定 --yes，直接继续重装"
+  elif [[ -t 0 ]]; then
+    ans=""
+    read -r -p "[antapp-link] 继续安装？[y/N] " ans || ans=""
+    case "$ans" in
+      y|Y|yes|YES) log "继续安装" ;;
+      *) log "已取消，什么都没改"; exit 0 ;;
+    esac
+  else
+    log "非交互环境（读不到键盘）——默认继续；想跳过这段提示请加 --yes"
+  fi
 fi
 url="https://github.com/antapp-cc/antapp-link/releases/latest/download/antapp-linkd"
 downloaded=0
