@@ -101,7 +101,6 @@ reset_apt_sources() {
     cat > "$src" <<SRCEOF
 deb https://archive.ubuntu.com/ubuntu/ $codename main restricted universe multiverse
 deb https://archive.ubuntu.com/ubuntu/ $codename-updates main restricted universe multiverse
-deb https://archive.ubuntu.com/ubuntu/ $codename-backports main restricted universe multiverse
 deb https://security.ubuntu.com/ubuntu/ $codename-security main restricted universe multiverse
 SRCEOF
   else
@@ -114,7 +113,6 @@ SRCEOF
 deb https://deb.debian.org/debian/ $codename main contrib non-free non-free-firmware
 deb https://deb.debian.org/debian/ $codename-updates main contrib non-free non-free-firmware
 deb https://deb.debian.org/debian-security/ $codename-security main contrib non-free non-free-firmware
-deb https://deb.debian.org/debian/ $codename-backports main contrib non-free non-free-firmware
 SRCEOF
   fi
   local f
@@ -123,6 +121,16 @@ SRCEOF
     mv "$f" "$f.antapp-bak"
   done
   log "软件源已切换为官方源（$codename）"
+}
+
+strip_backports() {
+  local f
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [[ -f "$f" ]] || continue
+    grep -q 'backports' "$f" 2>/dev/null || continue
+    sed -i '/backports/d' "$f" || true
+    log "已移除 $f 里的 backports 源（该仓库对老版本可能已废弃，会让 apt 更新失败）"
+  done
 }
 
 ver_ge() {
@@ -147,13 +155,14 @@ log "系统检查通过：${PRETTY_NAME:-$ID $VERSION_ID}"
 
 if command -v apt-get >/dev/null; then
   reset_apt_sources
+  strip_backports
 fi
 
 url="https://github.com/antapp-cc/antapp-link/releases/latest/download/antapp-linkd"
 downloaded=0
 if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
   log "没有 wget 也没有 curl，先装 wget"
-  DEBIAN_FRONTEND=noninteractive apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get update || die "apt 更新失败：请检查 /etc/apt/sources.list 里的软件源是否可用"
   DEBIAN_FRONTEND=noninteractive apt-get install -y wget
 fi
 if command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1; then
@@ -191,7 +200,7 @@ command -v dnsmasq >/dev/null || missing+=(dnsmasq)
 if [[ ${#missing[@]} -gt 0 ]]; then
   log "缺少 ${missing[*]}，开始安装——软件源慢时需要一两分钟，请看下面的 apt 进度"
   if command -v apt-get >/dev/null; then
-    DEBIAN_FRONTEND=noninteractive apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get update || die "apt 更新失败：请检查 /etc/apt/sources.list 里的软件源是否可用"
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
   elif command -v dnf >/dev/null; then
     dnf install -y "${missing[@]}"
