@@ -138,17 +138,17 @@ ver_ge() {
   lo=$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)
   [[ "$lo" == "$2" ]]
 }
-[[ -r /etc/os-release ]] || die "不支持该系统：读不到 /etc/os-release，仅支持 Debian 11+ / Ubuntu 22.04+"
+[[ -r /etc/os-release ]] || die "不支持该系统：读不到 /etc/os-release，仅支持 Debian 12+ / Ubuntu 22.04+"
 . /etc/os-release
 case "${ID:-}" in
   debian)
-    ver_ge "${VERSION_ID:-0}" "11" || die "Debian 版本过旧（检测到 ${VERSION_ID:-未知}），需要 Debian 11 及以上"
+    ver_ge "${VERSION_ID:-0}" "12" || die "Debian 版本过旧（检测到 ${VERSION_ID:-未知}），需要 Debian 12 及以上。Debian 11 已于 2026-08-31 结束支持，它的 backports 和 security 仓库都已下架，装了也没法正常更新——建议先升级系统。"
     ;;
   ubuntu)
     ver_ge "${VERSION_ID:-0}" "22.04" || die "Ubuntu 版本过旧（检测到 ${VERSION_ID:-未知}），需要 Ubuntu 22.04 及以上"
     ;;
   *)
-    die "不支持该系统（检测到 ${PRETTY_NAME:-${ID:-未知}}）：仅支持 Debian 11+ / Ubuntu 22.04+"
+    die "不支持该系统（检测到 ${PRETTY_NAME:-${ID:-未知}}）：仅支持 Debian 12+ / Ubuntu 22.04+"
     ;;
 esac
 log "系统检查通过：${PRETTY_NAME:-$ID $VERSION_ID}"
