@@ -417,5 +417,8 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 	fmt.Fprintf(stdout, "\n端口转发（服务端应答，经隧道转给节点机）:\n")
 	fmt.Fprintf(stdout, "  %d-%d/TCP → %s（同端口）\n",
 		cfg.ForwardPorts.Start, cfg.ForwardPorts.End, cfg.Tunnel.ClientIP)
+	// 「端口在监听」不等于「转发能用」：节点机没接入时转发器会立刻关掉外部连接，
+	// 而不是让它挂到拨号超时。不写这一句，运维看到端口开着会以为转发是好的。
+	fmt.Fprintln(stdout, "  注意：节点机未接入时，外部连接会被立即关闭（不挂超时）")
 	return 0
 }

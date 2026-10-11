@@ -54,6 +54,11 @@ type Server struct {
 	mu      sync.Mutex
 	current *session
 	joins   *joinGuard
+
+	// 搬运链路的致命错误（缓冲 1、非阻塞投递）：Run 收到就退出，交给 systemd 重启。
+	// 没有它，pumpTun 一死进程仍然"健康"、systemd 不会重启，而转发器还会继续往一张
+	// 已经没人读的网卡上拨号。
+	fatal chan error
 }
 
 // Run 阻塞运行隧道，直到 ctx 被取消。
@@ -79,7 +84,8 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	}
 	defer ln.Close()
 
-	s := &Server{cfg: cfg, tun: tun, tlsCfg: tlsCfg, log: logger, joins: newJoinGuard()}
+	s := &Server{cfg: cfg, tun: tun, tlsCfg: tlsCfg, log: logger, joins: newJoinGuard(),
+		fatal: make(chan error, 1)}
 	logger.Info("隧道已就绪",
 		"listen", cfg.Listen,
 		"device", tun.Name(),
@@ -106,15 +112,30 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		_ = ln.Close()
 	}()
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
+	// accept 挪进 goroutine，Run 才能同时盯住搬运链路的致命错误
+	acceptErr := make(chan error, 1)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				if ctx.Err() != nil {
+					acceptErr <- nil
+					return
+				}
+				acceptErr <- fmt.Errorf("accept: %w", err)
+				return
 			}
-			return fmt.Errorf("accept: %w", err)
+			go s.handle(ctx, conn)
 		}
-		go s.handle(ctx, conn)
+	}()
+
+	select {
+	case err := <-s.fatal:
+		// 搬运停了、进程却"健康"时 systemd 不会重启，运维只会看到字节不涨；明确退出，
+		// 让 systemd 拉起一个干净的进程（也顺带结束"往没人读的网卡拨号"那种空转）
+		return err
+	case err := <-acceptErr:
+		return err
 	}
 }
 
@@ -133,6 +154,13 @@ func (s *Server) pumpTun(ctx context.Context) {
 				return
 			}
 			s.log.Error("读网卡失败，搬运停止", "err", err)
+			// 唯一的搬运 goroutine 一退出，下行就永久中断，而 accept / 心跳 / 会话都还在：
+			// 进程看起来仍然健康、systemd 不会重启，转发器还会继续往没人读的网卡拨号。
+			// 投给 Run 让它退出。缓冲 1 + default：没人收也不阻塞这里的收尾。
+			select {
+			case s.fatal <- fmt.Errorf("读网卡失败，下行搬运停止: %w", err):
+			default:
+			}
 			return
 		}
 		if n <= 0 {
