@@ -51,6 +51,41 @@ antapp-linkd up -c /etc/antapp-link/server.json        # 重配 netfilter（幂�
 antapp-linkd down -c /etc/antapp-link/server.json      # 清理 netfilter
 ```
 
+## 服务端自动更新
+
+0.2.9 起服务端会自己升级。`antapp-linkd install` 会装一个 `antapp-link-update.timer`，每小时跑一次 `antapp-linkd update`：读 GitHub Release 的 `latest.json`，发现版本比当前新就下载 `server` 段指向的 `antapp-linkd`，校验 sha256 → 备份 → 原子替换 → `systemctl restart` → 确认新版本真的起来了才算成功。
+
+**起不来会自动回滚**到 `$BIN.bak`，并把这一版记进 `/run/antapp-link/update-failed`，之后不再反复重试（否则会变成每小时重启一次服务、把所有节点反复打断）。回滚的判据是 systemd 的 `NRestarts` —— 光看进程 active 或状态文件时间戳都会被"启动→写状态→崩溃→重启→再写"这种循环骗过去。
+
+**升级只替换二进制这一个文件**：不调用 `init`、不碰 `/etc/antapp-link/pki/`、不改 `server.json`、不动已签发的连接码。CA 不变，所以老连接码继续有效。
+
+> ⚠ **引导步骤：已经装好的机器必须再跑一次安装，自动更新才会启动。**
+> timer 是 `install` 子命令写进去的，老二进制里既没有 `update` 子命令也没有 timer：
+>
+> ```bash
+> bash install.sh --yes
+> # 或等价地：
+> /usr/local/bin/antapp-linkd install -c /etc/antapp-link/server.json
+> ```
+>
+> 不跑这一步的话，二进制换新了但永远不会有定时任务去升级它。
+
+手动操作：
+
+```bash
+antapp-linkd update -c /etc/antapp-link/server.json --check   # 只查，不下载不重启
+antapp-linkd update -c /etc/antapp-link/server.json           # 真更新（timer 干的就是这个）
+systemctl list-timers antapp-link-update.timer                # 下次什么时候跑
+journalctl -u antapp-link-update -n 50                        # 上一次更新做了什么
+cat /run/antapp-link/update-failed                            # 被锁住的失败版本（删掉即可重试）
+ls -la /usr/local/bin/antapp-linkd.bak                        # 回滚副本；手动回滚：install -m755 它 /usr/local/bin/antapp-linkd
+```
+
+**两种版本不要走自动更新**（自动更新不会破坏现场，但也解决不了）：
+
+- **改了 `protoVersion` 的版本** —— 必须等客户端先更新到位，否则老客户端会因版本不符连不上新服务端；
+- **需要改 PKI 或配置格式的版本** —— 得人工跑 `install.sh`。
+
 ## 和现网 OpenVPN + rinetd 并行 / 切换
 
 两套东西**不能共用同一段转发端口**：DNAT 在 `PREROUTING` 里跑，会抢在本地监听之前把包改走，占用方（rinetd）会**静默失效** —— 老节点看起来「突然连不上」却没有任何报错。
