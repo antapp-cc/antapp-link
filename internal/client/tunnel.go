@@ -28,6 +28,14 @@ const (
 	readBufferSize   = 65535
 	protoVersion     = 1
 
+	// memberPingInterval 是成员连接的心跳间隔。
+	//
+	// 成员连接上只有数据帧、没有控制帧：流量稀疏时它会长时间没有包往返，
+	// 跨境链路的 NAT 会把这种连接的状态清掉，客户端随后读到 i/o timeout、
+	// 摘槽重拨（实测 3 条数据连接时每 1~2 分钟一次）。定期发一个小帧保活，
+	// 比事后重拨便宜得多。取 15s 是为了短于常见 NAT 超时（30s 起）。
+	memberPingInterval = 15 * time.Second
+
 	// maxMembers 是单会话允许的并行连接数上限（与连接码、服务端 max_members 同界）。
 	maxMembers = 4
 )
@@ -453,6 +461,46 @@ func (s *clientSession) write(t proto.Type, payload []byte) error {
 	return proto.WriteFrame(conn, t, payload)
 }
 
+// pingMember 往指定成员槽写一个心跳帧保活。
+//
+// 持该槽的写锁：同一条连接上还有数据批在写（flushBatch），裸写会把帧撕开。
+func (s *clientSession) pingMember(k int) error {
+	actual, conn, mu := s.writeSlot(k)
+	if actual != k {
+		// 槽已空，流量落回控制连接，没什么可保活的
+		return nil
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if err := conn.SetWriteDeadline(time.Now().Add(slotWriteTimeout)); err != nil {
+		return err
+	}
+	ts := make([]byte, 8)
+	binary.BigEndian.PutUint64(ts, uint64(time.Now().UnixNano()))
+	return proto.WriteFrame(conn, proto.TypePing, ts)
+}
+
+// memberHeartbeat 给一条成员连接保活，直到会话结束或这条连接写不动。
+//
+// 服务端会回 PONG（老服务端会忽略，但上行有包就已经能刷新 NAT 映射了）。
+func (s *clientSession) memberHeartbeat(ctx context.Context, k int) {
+	ticker := time.NewTicker(memberPingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.closed:
+			return
+		case <-ticker.C:
+			if err := s.pingMember(k); err != nil {
+				// 写失败不在这里收尾：读循环会摘槽、维护协程会补拨
+				return
+			}
+		}
+	}
+}
+
 // slot 返回槽位 k 的连接；越界或空槽 → 控制连接兜底。
 func (s *clientSession) slot(k int) net.Conn {
 	s.mu.Lock()
@@ -539,6 +587,9 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 	sess.mu.Unlock()
 	t.log.Info("成员连接已就位", "member", k, "live", sess.liveCount())
 
+	// 这条连接要自己保活（理由见 memberPingInterval）：会话收尾或写不动时退出
+	go sess.memberHeartbeat(ctx, k)
+
 	// 读循环：成员连接上来的包写网卡；断开摘槽（该槽流量落回控制连接）
 	for {
 		typ, payload, err := proto.ReadFrame(conn)
@@ -574,6 +625,8 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 			sess.mu.Unlock()
 			t.log.Warn("成员连接被服务端关闭", "member", k, "reason", string(payload))
 			return fmt.Errorf("成员连接 %d 被服务端关闭: %s", k, string(payload))
+		case proto.TypePong:
+			// 心跳得到应答，说明这条连接还活着；不需要别的动作
 		default:
 			// 成员连接只搬数据，其他帧忽略
 		}

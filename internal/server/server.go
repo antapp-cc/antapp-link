@@ -342,6 +342,16 @@ func (s *Server) handleMember(ctx context.Context, tlsConn *tls.Conn, name strin
 				s.log.Error("写网卡失败", "err", err)
 				return
 			}
+		case proto.TypePing:
+			// 成员连接上的心跳应答：客户端定期发 PING 让这条连接两端一直有包
+			// 往返，免得被跨境链路上的 NAT 当成空闲连接清掉状态。回 PONG 必须
+			// 走 slotConn.write 而不是裸 proto.WriteFrame —— pumpTun 在另一个
+			// goroutine 上往同一条连接写数据，两者要共用写锁，否则帧会交错。
+			if sl := sess.slotEntry(hello.Member); sl != nil {
+				if err := sl.write(proto.TypePong, payload); err != nil {
+					return
+				}
+			}
 		default:
 			// 成员连接只搬数据；未知帧按兼容契约忽略
 		}
