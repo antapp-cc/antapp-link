@@ -852,11 +852,21 @@ func (s *session) write(t proto.Type, payload []byte) error {
 }
 
 // flushBatch 把合并缓冲一次写入槽位 k 的连接。
+//
+// 用 slotEntry 而不是 slot：slot 在槽为空时会回落到控制连接，而控制连接的职责是
+// 心跳 —— 成员一断，本该发那条的数据就全涌进槽 0，把 PING/PONG 挤到排队，面板延迟
+// 立刻从两百毫秒涨到上千；断两条时一半流量都挤过去，这也正是「有成员断开延迟就大」
+// 的原因。槽空就把这批丢掉：那条链路的 TCP 本来也在重传或重连，等成员回来自会恢复。
+// 控制帧（PING/PONG）仍然走 slot() 回落，它们必须发出去。
 func (s *session) flushBatch(k int, batch []byte) error {
 	if len(batch) == 0 {
 		return nil
 	}
-	return s.slot(k).writeRaw(batch)
+	sc := s.slotEntry(k)
+	if sc == nil {
+		return nil
+	}
+	return sc.writeRaw(batch)
 }
 
 // membersN 返回生效的连接总数（读锁内拷贝，避免与握手竞态）。

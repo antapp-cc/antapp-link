@@ -450,6 +450,19 @@ func (s *clientSession) writeSlot(k int) (int, net.Conn, *sync.Mutex) {
 	return k, s.slots[k], &s.writes[k]
 }
 
+// writeSlotData 与 writeSlot 一样取槽，但空槽返回 nil 而不落回控制连接。
+// 数据批必须走这条：成员断一条，本该发它的包若灌进跑心跳的槽 0，PING/PONG 就要排队，
+// 面板延迟立刻从两百毫秒涨到上千（服务端那份 flushBatch 踩过同一个坑）。
+// k == 0 仍然合法 —— 单连接模式下所有流量本来就在控制连接上。
+func (s *clientSession) writeSlotData(k int) (int, net.Conn, *sync.Mutex) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if k < 0 || k >= len(s.slots) || s.slots[k] == nil {
+		return 0, nil, nil
+	}
+	return k, s.slots[k], &s.writes[k]
+}
+
 // write 串行化对控制连接的写：搬包和心跳来自不同 goroutine。
 func (s *clientSession) write(t proto.Type, payload []byte) error {
 	_, conn, mu := s.writeSlot(0)
@@ -851,9 +864,11 @@ func flushBatch(s *clientSession, k int, batch []byte) error {
 	if len(batch) == 0 {
 		return nil
 	}
-	actual, conn, mu := s.writeSlot(k)
+	actual, conn, mu := s.writeSlotData(k)
 	if conn == nil {
-		return fmt.Errorf("写隧道: 槽 %d 连接为 nil", k)
+		// 槽空（成员断了或正在补）：丢掉这批，等成员回来。
+		// 绝不能落回控制连接 —— 那是心跳通道，数据挤上去面板延迟立刻上千。
+		return nil
 	}
 	mu.Lock()
 	defer mu.Unlock()

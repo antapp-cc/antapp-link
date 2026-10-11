@@ -145,9 +145,11 @@ func (c *blockedConn) SetDeadline(time.Time) error      { return nil }
 func (c *blockedConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *blockedConn) SetWriteDeadline(time.Time) error { return nil }
 
-// 槽位为空（成员连接断了、正在补拨）时数据落回控制连接。这条路径必须和心跳共用
-// 控制连接的写锁：WriteFrame 是"帧头 + 载荷"两次 Write，插在中间的批会把帧撕开。
-func TestFlushBatchWaitsForControlWrite(t *testing.T) {
+// 成员槽为空（断了、正在补拨）时，数据批必须直接丢掉，绝不能落回控制连接。
+// 控制连接跑心跳，数据挤上去会让 PING/PONG 排队，面板延迟从两百毫秒涨到上千
+// （服务端那份 flushBatch 踩过同一个坑）。k == 0 是另一回事：单连接模式下所有流量
+// 本来就在控制连接上，那条路径必须和心跳共用写锁，见 TestControlSlotWriteFailureEndsSession。
+func TestFlushBatchDropsWhenMemberSlotEmpty(t *testing.T) {
 	conn := newBlockedConn()
 	sess := newClientSession(testTunnel(t), conn, "sid", nil, Ack{Members: 2})
 
@@ -162,17 +164,13 @@ func TestFlushBatchWaitsForControlWrite(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-		t.Fatal("槽位落回控制连接时绕过了控制连接的写锁：两个帧会交错")
-	case <-time.After(200 * time.Millisecond):
-	}
-	conn.release()
+	// 控制连接的写锁此刻被心跳占着；槽 1 空的批不该去碰它，应当立刻返回
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("释放控制连接的写之后，落回的批仍然没写出去")
+		t.Fatal("槽 1 为空时 flushBatch 卡住了：它不该去碰被占用的控制连接写锁")
 	}
+	conn.release()
 }
 
 // 会话进入收尾（ctx 已取消）后，槽位连接会随会话一起关，此时的写失败是预期内的
@@ -252,7 +250,7 @@ func TestMemberSlotWriteFailureDropsSlotOnly(t *testing.T) {
 		t.Fatal("flushBatch 卡住了：成员槽的写必须有超时")
 	}
 	if sess.slots[1] != nil {
-		t.Error("写失败的成员槽应被摘掉，让流量落回控制连接")
+		t.Error("写失败的成员槽应被摘掉，让维护协程补一条新的")
 	}
 }
 
