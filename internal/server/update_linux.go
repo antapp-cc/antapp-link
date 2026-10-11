@@ -3,16 +3,43 @@
 package server
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/antapp-cc/antapp-link/internal/update"
 )
+
+func updateSupported() bool { return true }
+
+// updateLockPath 是互斥锁文件。放 /run：tmpfs 一定可写，机器重启后也会自动清掉，
+// 不会留下一个锁死后续更新的僵尸文件。
+const updateLockPath = "/run/antapp-link/update.lock"
+
+// tryUpdateLock 拿非阻塞排他锁。拿不到说明另一个 update 正在跑，调用方应直接退出：
+// 两边同时干会抢同一个备份文件与临时文件，最坏的结果是把别人刚换上去的坏版本备份
+// 成 .bak —— 那就连回滚都回不到好版本了。
+func tryUpdateLock() (func(), bool) {
+	if err := os.MkdirAll(filepath.Dir(updateLockPath), 0o755); err != nil {
+		return func() {}, false
+	}
+	f, err := os.OpenFile(updateLockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return func() {}, false
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return func() {}, false
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, true
+}
 
 // applyUpdate 备份 → 替换 → 重启 → 健康检查；任何一步失败都回滚。
 //
@@ -20,21 +47,30 @@ import (
 // .bak 就只能人工上传旧二进制救场。
 func applyUpdate(newBinary string, out io.Writer) error {
 	if os.Geteuid() != 0 {
-		return errors.New("需要 root：要替换二进制并重启 systemd 服务")
+		return fmt.Errorf("%w：要替换二进制并重启 systemd 服务，需要 root", errNothingChanged)
 	}
 	self, err := selfPath()
 	if err != nil {
-		return err
+		return fmt.Errorf("%w：%v", errNothingChanged, err)
 	}
+	// 只认安装位置那一份。从 /root 下的拷贝跑 update 时替换的是这份拷贝，而
+	// systemctl restart 重启的还是没变的旧文件 —— 健康检查照样通过，于是打印
+	// 「更新完成」却什么都没更新。
+	if self != binaryPath {
+		return fmt.Errorf("%w：当前跑的是 %s，不是安装位置 %s；请在安装位置执行",
+			errNothingChanged, self, binaryPath)
+	}
+
 	// 记下更新前那一份状态文件的时间戳：健康检查要靠它变化来确认新进程真的在写。
 	// 读不到（首次启动、文件被清）就留空，任何时间戳都算变化。
 	before := ""
 	if st, err := ReadStatus(); err == nil {
 		before = st.UpdatedAt
 	}
+
 	backup := self + ".bak"
 	if err := copyBinary(self, backup); err != nil {
-		return fmt.Errorf("备份当前版本到 %s 失败（未做任何改动）: %w", backup, err)
+		return fmt.Errorf("%w：备份当前版本到 %s 失败: %v", errNothingChanged, backup, err)
 	}
 	fmt.Fprintf(out, "已备份当前版本到 %s\n", backup)
 
@@ -52,8 +88,8 @@ func applyUpdate(newBinary string, out io.Writer) error {
 	return nil
 }
 
-// rollback 把旧二进制放回去并重启。它自己也失败时要讲清旧版本在哪，别让现场既没有
-// 能跑的、也没有能回滚的。
+// rollback 把旧二进制放回去并重启，然后同样做一次健康检查。它自己失败时要讲清旧版本
+// 在哪，别让现场既没有能跑的、也没有能回滚的。
 func rollback(self, backup string, cause error) error {
 	if err := copyBinary(backup, self); err != nil {
 		return fmt.Errorf("%v；回滚也失败（旧版本仍在 %s，可用 install -m755 手动放回）: %w", cause, backup, err)
@@ -61,14 +97,19 @@ func rollback(self, backup string, cause error) error {
 	if err := runSystemctl("restart", "antapp-linkd"); err != nil {
 		return fmt.Errorf("%v；文件已回滚但重启失败: %w", cause, err)
 	}
+	// restart 返回 0 只代表 systemd 接下了请求，不代表服务真起来了
+	if err := waitHealthy(30*time.Second, ""); err != nil {
+		return fmt.Errorf("%v；文件已回滚但回滚后的服务也没就绪: %w", cause, err)
+	}
 	return fmt.Errorf("%w（已回滚到备份版本）", cause)
 }
 
-// waitHealthy 等到「systemd 认为它 active」且「状态文件正在被刷新」。
+// waitHealthy 等到「systemd 认为它 active」且「状态文件被写过一份新的」。
 //
-// 光看 is-active 会误判：Restart=always 下启动即崩的进程在 activating 和
-// auto-restart 之间循环，systemd 照样能报 active。状态文件每 5 秒刷一次，
-// 它新鲜才说明真有个进程在跑隧道。
+// 光看 is-active 会误判：Restart=always 下启动即崩的进程会在 activating 和
+// auto-restart 之间循环，systemd 照样能报 active。光看状态文件「新鲜」也会误判：
+// 旧进程每 5 秒写一次、重启只要几秒，20 秒窗口内读到的那份必然还是旧的。
+// 所以必须等时间戳相对 before 真的变了。
 func waitHealthy(timeout time.Duration, before string) error {
 	deadline := time.Now().Add(timeout)
 	last := "（还没有一次检查完成）"
@@ -83,8 +124,6 @@ func waitHealthy(timeout time.Duration, before string) error {
 			last = fmt.Sprintf("读状态文件失败: %v", err)
 			continue
 		}
-		// 必须等到时间戳变化：systemctl restart 只要几秒，而旧进程 5 秒前写的状态
-		// 文件在 20 秒窗口内照样算"新鲜"，只看新鲜度会把"新进程还没起来"当成健康。
 		if st.UpdatedAt == before {
 			last = "状态文件还是启动前那一份（新进程尚未写入）"
 			continue
@@ -114,7 +153,7 @@ func serviceActive() bool {
 	return exec.Command("systemctl", "is-active", "--quiet", "antapp-linkd").Run() == nil
 }
 
-// selfPath 取当前可执行文件的真实路径（解开符号链接），备份与替换都以它为基准。
+// selfPath 取当前可执行文件的真实路径（解开符号链接）。
 func selfPath() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -126,20 +165,51 @@ func selfPath() (string, error) {
 	return exe, nil
 }
 
-// copyBinary 先写同目录临时文件再改名。目标可能是正在运行的程序：直接截断写会拿到
-// ETXTBSY，而 rename 覆盖正在运行的 ELF 是允许的（旧 inode 留到进程退出）。
+// copyBinary 先写同目录的随机临时文件再改名。目标可能是正在运行的程序：直接截断写
+// 会拿到 ETXTBSY，而 rename 覆盖正在运行的 ELF 是允许的（旧 inode 留到进程退出）。
 func copyBinary(src, dst string) error {
 	raw, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(filepath.Dir(dst), "."+filepath.Base(dst)+".tmp")
-	if err := os.WriteFile(tmp, raw, 0o755); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+"-*.tmp")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
+	tmpName := f.Name()
+	defer func() {
+		if tmpName != "" {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := f.Write(raw); err != nil {
+		_ = f.Close()
 		return err
 	}
+	// 先落盘再改名，理由同 install_binary
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return err
+	}
+	tmpName = ""
+	syncDir(filepath.Dir(dst))
 	return nil
+}
+
+// syncDir 把目录项刷到盘上，保证 rename 掉电后不丢。目录 fsync 失败无关紧要
+// （部分文件系统不支持），只尽力而为。
+func syncDir(dir string) {
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 }

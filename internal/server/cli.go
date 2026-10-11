@@ -19,10 +19,12 @@ import (
 	"github.com/antapp-cc/antapp-link/internal/pki"
 )
 
-const (
-	DefaultConfigPath = "/etc/antapp-link/server.json"
-	Version           = "0.1.0"
-)
+const DefaultConfigPath = "/etc/antapp-link/server.json"
+
+// Version 是 var 而不是 const：发布构建用 -ldflags -X 注入版本号，而 const 无法在
+// 链接期覆盖 —— 更糟的是 -X 指向 const 时既不报错也不生效，服务端会永远自认 0.1.0，
+// 于是自动更新每小时都判定「有新版本」、下载替换重启一遍，节点机跟着每小时断一次。
+var Version = "0.1.0"
 
 // RunCLI 是 antapp-linkd 的入口，返回进程退出码。
 func RunCLI(args []string, stdout, stderr io.Writer) int {

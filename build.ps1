@@ -41,8 +41,10 @@ function Build-Target {
 }
 
 # 服务端：Linux 单二进制，不依赖任何外部程序
+# 版本号必须注入：服务端的自动更新就是拿它跟清单里的 version 比，注入失效会让它
+# 永远自认旧版、每小时更新重启一次。
 Build-Target -Goos 'linux' -Goarch 'amd64' -Out 'antapp-linkd' -Pkg './cmd/antapp-linkd' `
-    -Ldflags '-s -w'
+    -Ldflags "-s -w -X github.com/antapp-cc/antapp-link/internal/server.Version=$Version"
 
 # 客户端：GUI 子系统，双击不弹控制台黑框；wintun.dll 已内嵌
 Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-link.exe' -Pkg './cmd/antapp-link' `
