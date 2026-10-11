@@ -194,6 +194,29 @@ func flushResolverCache() {
 	_, _, _ = windows.NewLazySystemDLL("dnsapi.dll").NewProc("DnsFlushResolverCache").Call()
 }
 
+// sweepTunnelHalfRoutes 删掉隧道网卡上的 /1 接管路由，不按下一跳匹配。
+//
+// 给「快照损坏」或「快照来自还没记录隧道网关的旧版本」这种拿不到网关的保守
+// 还原用：0.0.0.0/1 与 128.0.0.0/1 只可能是本程序铺的（Windows 自己不会这么
+// 分半默认路由），所以无条件撤掉是安全的 —— 不撤掉的话，全部流量会继续灌进
+// 一张没人读的网卡，而这正是保守还原唯一能兑现的承诺。
+func sweepTunnelHalfRoutes(luid winipcfg.LUID) (removed int) {
+	rows, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
+	if err != nil {
+		return 0
+	}
+	for i := range rows {
+		r := rows[i]
+		if r.InterfaceLUID != luid || r.DestinationPrefix.PrefixLength != 1 {
+			continue
+		}
+		if r.Delete() == nil {
+			removed++
+		}
+	}
+	return removed
+}
+
 // sweepSplitRoutes 删除「国内直连」残留路由：下一跳等于原默认网关且
 // route metric 为 5 的全部条目（默认路由除外）。一次全表扫描 + 逐条原生删除，
 // 毫秒级完成；不像 route.exe 那样删不存在的路由会卡死，条目不存在时静默跳过。

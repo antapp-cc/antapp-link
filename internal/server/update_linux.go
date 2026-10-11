@@ -155,7 +155,7 @@ func waitHealthy(timeout time.Duration, before string, restartsBefore int) error
 			last, healthy = "状态文件还是启动前那一份（新进程尚未写入）", 0
 			continue
 		}
-		if !statusFresh(st) {
+		if !st.Fresh() {
 			last, healthy = "状态文件没有刷新", 0
 			continue
 		}
@@ -183,19 +183,6 @@ func serviceRestarts() int {
 		return 0
 	}
 	return n
-}
-
-// statusStaleAfter 是「状态文件还在被刷新」的判定窗口：run 进程每 5 秒写一次，
-// 超过这个时间没更新就说明写它的进程已经不在了。
-//
-// 这里自己算而不复用 Status.Fresh —— 那个方法在 fix/full-audit-fixes 分支上，
-// 自动更新这条线要从 main 单独发布，不能依赖尚未合并的改动。两条线合并时把这段
-// 删掉、改用 Fresh 即可。
-const statusStaleAfter = 20 * time.Second
-
-func statusFresh(st Status) bool {
-	t, err := time.Parse(time.RFC3339, st.UpdatedAt)
-	return err == nil && time.Since(t) <= statusStaleAfter
 }
 
 func serviceActive() bool {

@@ -211,10 +211,27 @@ func (w *sessionWatcher) reconcile() {
 	if err != nil || !ok {
 		return
 	}
-	newDNS := adapterDNS(newDef.LUID)
-	newDNSStrings := make([]string, 0, len(newDNS))
-	for _, a := range newDNS {
-		newDNSStrings = append(newDNSStrings, a.String())
+	// DNS 原值只认第一次接管时记下的那份。
+	//
+	// 同一张网卡换出口（笔记本从家里 Wi-Fi 换到公司 Wi-Fi、路由器换了网段）时，
+	// 它身上的 DNS 已经是我们写进去的隧道网关 —— 直接读当前值会把「我们自己的值」
+	// 当成用户原值存进快照，断开时就把这张网卡的 DNS 永久指到一个已经拆掉的网关，
+	// 用户表现为解析全超时。换了网卡才读新网卡的当前值。
+	var newDNSStrings []string
+	reusedDNS := false
+	for _, iface := range oldSnap.Interfaces {
+		if uint32(iface.Index) == ifIndex {
+			newDNSStrings = iface.DNS
+			reusedDNS = true
+			break
+		}
+	}
+	if !reusedDNS {
+		newDNS := adapterDNS(newDef.LUID)
+		newDNSStrings = make([]string, 0, len(newDNS))
+		for _, a := range newDNS {
+			newDNSStrings = append(newDNSStrings, a.String())
+		}
 	}
 	hop, _, err := bestRouteTo(w.srv, tunLUID)
 	if err != nil {
@@ -246,7 +263,7 @@ func (w *sessionWatcher) reconcile() {
 
 	// 6) 更新现场 + 唤醒隧道立刻重连
 	w.snap = newSnapshot(gw.Unmap().String(), int(ifIndex), serverNextHop,
-		[]IfaceDNS{{Name: newDef.Name, Index: int(newDef.Index), DNS: newDNSStrings}})
+		[]IfaceDNS{{Name: newDef.Name, Index: int(newDef.Index), DNS: newDNSStrings}}, w.cfg)
 	w.lastGw = gw.Unmap()
 	w.lastIdx = ifIndex
 	if w.update != nil {

@@ -28,6 +28,14 @@ type WintunDevice struct {
 	once    sync.Once
 	recvMu  sync.Mutex
 	sendMu  sync.Mutex
+
+	// ReceivePacket/AllocateSendPacket 返回的是 ring 缓冲里的指针，EndSession 会把
+	// ring 整个释放掉，所以还有在飞调用时 End 就是 use-after-free。用 ioMu 把
+	// 「已开始关闭」和「在飞计数」放进同一个临界区判断，Close 才不会漏掉刚好挤进来的那次调用。
+	ioMu     sync.Mutex
+	closing  bool
+	inflight int
+	drained  chan struct{}
 }
 
 // OpenDevice 打开虚拟网卡。
@@ -53,11 +61,19 @@ func OpenDevice() (*WintunDevice, error) {
 		_ = adapter.Close()
 		return nil, fmt.Errorf("启动网卡会话: %w", err)
 	}
-	return &WintunDevice{adapter: adapter, session: session, closed: make(chan struct{})}, nil
+	return &WintunDevice{
+		adapter: adapter, session: session,
+		closed: make(chan struct{}), drained: make(chan struct{}),
+	}, nil
 }
 
 // Read 取一个 IP 包。ring 空时等读事件，不能忙等 —— 忙等会吃满一个核。
 func (d *WintunDevice) Read(p []byte) (int, error) {
+	if !d.enter() {
+		return 0, ErrDeviceClosed
+	}
+	defer d.leave()
+
 	for {
 		select {
 		case <-d.closed:
@@ -93,11 +109,10 @@ func (d *WintunDevice) Read(p []byte) (int, error) {
 // TryRead 非阻塞收割一个已就绪的包：Wintun 的 ReceivePacket 本就是"无包立即
 // 返回 ERROR_NO_MORE_ITEMS"的轮询语义，正好当非阻塞读用（写合并的收割端）。
 func (d *WintunDevice) TryRead(p []byte) (int, error) {
-	select {
-	case <-d.closed:
+	if !d.enter() {
 		return 0, ErrDeviceClosed
-	default:
 	}
+	defer d.leave()
 	d.recvMu.Lock()
 	defer d.recvMu.Unlock()
 	packet, err := d.session.ReceivePacket()
@@ -118,11 +133,10 @@ func (d *WintunDevice) TryRead(p []byte) (int, error) {
 // Write 把包交给内核。发送队列满时重试一小会儿，再不行就丢弃 ——
 // IP 层本就是尽力而为，丢一个包远好过让整条隧道重连。
 func (d *WintunDevice) Write(p []byte) (int, error) {
-	select {
-	case <-d.closed:
+	if !d.enter() {
 		return 0, ErrDeviceClosed
-	default:
 	}
+	defer d.leave()
 
 	for attempt := 0; attempt < 64; attempt++ {
 		d.sendMu.Lock()
@@ -148,9 +162,40 @@ func (d *WintunDevice) Write(p []byte) (int, error) {
 
 func (d *WintunDevice) Name() string { return AdapterName }
 
+// enter 登记一次在飞收发。设备已开始关闭时返回 false，调用方必须立刻退出，
+// 绝不能再碰 session。
+func (d *WintunDevice) enter() bool {
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
+	if d.closing {
+		return false
+	}
+	d.inflight++
+	return true
+}
+
+func (d *WintunDevice) leave() {
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
+	d.inflight--
+	if d.closing && d.inflight == 0 {
+		close(d.drained)
+	}
+}
+
 func (d *WintunDevice) Close() error {
 	d.once.Do(func() {
+		d.ioMu.Lock()
+		d.closing = true
+		// 唤醒轮询中的 waitReadable，让阻塞在 dev.Read 上的调用尽快返回
 		close(d.closed)
+		if d.inflight == 0 {
+			close(d.drained)
+		}
+		d.ioMu.Unlock()
+
+		// 顺序不能动：等在飞的收发包全部退出之后才能 End
+		<-d.drained
 		d.session.End()
 		_ = d.adapter.Close()
 	})

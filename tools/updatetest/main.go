@@ -12,9 +12,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/antapp-cc/antapp-link/internal/client"
 	"github.com/antapp-cc/antapp-link/internal/pki"
+	"github.com/antapp-cc/antapp-link/internal/update"
 )
 
 // 注意版本号：比较用的是 client.Version，所以构建时要注入它 ——
@@ -30,11 +32,17 @@ func run() int {
 	apply := flag.Bool("apply", false, "下载完成后真的替换自己并重启")
 	flag.Parse()
 
+	// 更新源现在只能由代码指定：环境变量覆盖是一个本地提权面（任何能写
+	// HKCU\Environment 的进程都能让客户端以管理员身份装上攻击者的 exe）。
+	// 直接改包变量等价于编译期写死，不影响这条自测链路。
 	if *sources != "" {
-		if err := os.Setenv("ANTAPP_UPDATE_SOURCES", *sources); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
+		var custom []update.Source
+		for i, u := range strings.Split(*sources, ";") {
+			if u = strings.TrimSpace(u); u != "" {
+				custom = append(custom, update.Source{Name: fmt.Sprintf("custom%d", i+1), Manifest: u})
+			}
 		}
+		update.DefaultSources = custom
 	}
 	if *dir == "" {
 		d, err := os.MkdirTemp("", "antapp-updatetest")

@@ -252,7 +252,7 @@ func openSealedCache(sealed []byte) ([]byte, error) {
 	}
 	body := make([]byte, len(sealed)-1)
 	for i := 1; i < len(sealed); i++ {
-		body[i-1] = sealed[i] ^ cacheObfuscateKey[(i-1)%len(cacheObfuscateKey)]
+		body[i-1] = sealed[i] ^ cacheObfuscateKey[i%len(cacheObfuscateKey)]
 	}
 	gz, err := gzip.NewReader(bytes.NewReader(body))
 	if err != nil {

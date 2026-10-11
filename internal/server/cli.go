@@ -19,11 +19,11 @@ import (
 	"github.com/antapp-cc/antapp-link/internal/pki"
 )
 
-const DefaultConfigPath = "/etc/antapp-link/server.json"
+const (
+	DefaultConfigPath = "/etc/antapp-link/server.json"
+)
 
-// Version 是 var 而不是 const：发布构建用 -ldflags -X 注入版本号，而 const 无法在
-// 链接期覆盖 —— 更糟的是 -X 指向 const 时既不报错也不生效，服务端会永远自认 0.1.0，
-// 于是自动更新每小时都判定「有新版本」、下载替换重启一遍，节点机跟着每小时断一次。
+// Version 是 var 而不是 const：发布构建用 -ldflags -X 注入版本号，const 无法在链接期覆盖。
 var Version = "0.1.0"
 
 // RunCLI 是 antapp-linkd 的入口，返回进程退出码。
@@ -392,7 +392,9 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 	fmt.Fprintf(stdout, "转发端口    : %d-%d（只转 TCP）\n", cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
 	fmt.Fprintf(stdout, "PKI 目录    : %s\n", cfg.PKIDir)
 
-	if st, err := ReadStatus(); err == nil {
+	st, statusErr := ReadStatus()
+	running := statusErr == nil && st.Fresh()
+	if running {
 		fmt.Fprintf(stdout, "\n隧道进程    : 运行中（状态更新于 %s）\n", st.UpdatedAt)
 		if st.Client != "" {
 			fmt.Fprintf(stdout, "已接入节点  : %s（自 %s）\n", st.Client, st.ConnectedAt)
@@ -410,13 +412,28 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 		} else {
 			fmt.Fprintln(stdout, "已接入节点  : 无")
 		}
-	} else {
+	} else if statusErr != nil {
 		fmt.Fprintln(stdout, "\n隧道进程    : 状态文件不存在，可能没在运行（systemctl status antapp-linkd）")
+	} else {
+		fmt.Fprintf(stdout, "\n隧道进程    : 未运行（状态文件已过期，最后更新于 %s）\n", st.UpdatedAt)
 	}
 
 	fmt.Fprintf(stdout, "\n端口转发（服务端应答，经隧道转给节点机）:\n")
-	fmt.Fprintf(stdout, "  %d-%d/TCP → %s（同端口）\n",
-		cfg.ForwardPorts.Start, cfg.ForwardPorts.End, cfg.Tunnel.ClientIP)
+	switch {
+	case !running:
+		// 进程状态都不确定，就不能替它宣称端口已在监听
+		fmt.Fprintln(stdout, "  转发器      : 状态未知（状态文件未确认隧道进程在运行）")
+	case !st.ForwardKnown:
+		// 状态文件是升级前那个 daemon 写的，它不认识这两个字段——零值不代表没起来
+		fmt.Fprintln(stdout, "  转发器      : 状态未知（状态文件来自旧版本，重启 antapp-linkd 后可确认）")
+	case st.ForwardReady:
+		fmt.Fprintf(stdout, "  转发器      : 已启动（%d-%d/TCP → %s 同端口）\n",
+			cfg.ForwardPorts.Start, cfg.ForwardPorts.End, cfg.Tunnel.ClientIP)
+	case st.ForwardError != "":
+		fmt.Fprintf(stdout, "  转发器      : 未启动（%s）\n", st.ForwardError)
+	default:
+		fmt.Fprintln(stdout, "  转发器      : 尚未就绪（隧道进程刚启动，状态还没刷新）")
+	}
 	// 「端口在监听」不等于「转发能用」：节点机没接入时转发器会立刻关掉外部连接，
 	// 而不是让它挂到拨号超时。不写这一句，运维看到端口开着会以为转发是好的。
 	fmt.Fprintln(stdout, "  注意：节点机未接入时，外部连接会被立即关闭（不挂超时）")

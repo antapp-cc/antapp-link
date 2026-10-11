@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,8 +23,13 @@ const (
 	// 客户端每 10 秒发一次 PING，这里给六倍宽限，避免网络抖动就误踢。
 	clientDeadAfter  = 60 * time.Second
 	handshakeTimeout = 15 * time.Second
-	readBufferSize   = 65535
-	protoVersion     = 1
+	// 成员连接不参与心跳（只有控制连接有 PING/PONG），一整天没数据也是正常的。
+	// 但只剩单方向可用的半死连接会让读循环永不返回、槽位被永久占死（客户端补拨
+	// 一直拿到「槽位不可用」），所以给一个宽松的空闲上限：120s 不误杀安静连接，
+	// 又把「永久」变成有界。
+	memberIdleTimeout = 120 * time.Second
+	readBufferSize    = 65535
+	protoVersion      = 1
 )
 
 type helloPayload struct {
@@ -59,6 +65,14 @@ type Server struct {
 	// 没有它，pumpTun 一死进程仍然"健康"、systemd 不会重启，而转发器还会继续往一张
 	// 已经没人读的网卡上拨号。
 	fatal chan error
+	// 端口转发监听结果，nil 表示还没跑起来；status 据此报真实可用性
+	relay atomic.Pointer[relayState]
+}
+
+// relayState 是端口转发器的启动结果：就绪，或一句能被 status 展示的失败原因。
+type relayState struct {
+	ready bool
+	err   string
 }
 
 // Run 阻塞运行隧道，直到 ctx 被取消。
@@ -95,24 +109,29 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		"mtu", cfg.Tunnel.MTU,
 		"forward_ports", fmt.Sprintf("%d-%d", cfg.ForwardPorts.Start, cfg.ForwardPorts.End))
 
-	go s.pumpTun(ctx)
-	go s.reportStatus(ctx)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go s.pumpTun(runCtx)
+	go s.reportStatus(runCtx)
 
 	// 端口转发：本机应答式转发器（握手在云服完成，延迟只算到云服为止；
 	// 连接再经隧道转给节点机）。
 	// tunnelUp 传进去：节点机不在线时转发器直接关连接，不去拨一个没人接的地址
-	stopRelay, err := startPortRelay(ctx, cfg, logger, func() bool { return s.currentSession() != nil })
+	stopRelay, err := startPortRelay(runCtx, cfg, logger, func() bool { return s.currentSession() != nil })
 	if err != nil {
 		// 不走 connLogAttrs：它把 "address already in use" 翻成人话后会把原始 err
 		// 吞掉，而这里的 err 带着失败的转发端口号，正是排障要看的东西。listen 字段
 		// 要填转发端口段，别填隧道 TLS 端口。
 		logger.Warn("端口转发监听启动失败，外部流量进不了隧道", "err", err,
 			"forward_ports", fmt.Sprintf("%d-%d", cfg.ForwardPorts.Start, cfg.ForwardPorts.End))
+		s.relay.Store(&relayState{err: err.Error()})
 	} else {
+		s.relay.Store(&relayState{ready: true})
 		defer stopRelay()
 	}
 	go func() {
-		<-ctx.Done()
+		<-runCtx.Done()
 		_ = ln.Close()
 	}()
 
@@ -122,14 +141,14 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				if ctx.Err() != nil {
+				if runCtx.Err() != nil {
 					acceptErr <- nil
 					return
 				}
 				acceptErr <- fmt.Errorf("accept: %w", err)
 				return
 			}
-			go s.handle(ctx, conn)
+			go s.handle(runCtx, conn)
 		}
 	}()
 
@@ -137,7 +156,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	case err := <-s.fatal:
 		// 与 ctx 取消同时发生时按正常停止处理：pumpTun 投递前判了 ctx.Err()，但两个
 		// case 同时就绪时 select 是随机选的，不判这一下会把正常关闭报成非 0 退出。
-		if ctx.Err() != nil {
+		if runCtx.Err() != nil {
 			return nil
 		}
 		// 搬运停了、进程却"健康"时 systemd 不会重启，运维只会看到字节不涨；明确退出，
@@ -176,9 +195,9 @@ func (s *Server) pumpTun(ctx context.Context) {
 			continue
 		}
 		if n > proto.MaxPayload {
-			// 帧头装不下：AppendHeader 在超限时什么都不追加，而下面照样把包塞进批里，
-			// 对端会把裸 IP 数据当帧头解析、整条流从此错位。当前 MTU 被配置锁在
-			// 576–1500、读不到这么大的包，这是给将来放宽 MTU 兜的底。
+			// 帧头装不下。硬塞进去会让对端把这 4 字节 IP 头当帧头解析、整条流从此
+			// 错位（连接还在、数据全垃圾），所以宁可丢这个包。正常 MTU ≤1500 且没开
+			// GSO 的 tun 读不到这么大的包，这是给将来放宽 MTU 兜的底。
 			s.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", n, "max", proto.MaxPayload)
 			continue
 		}
@@ -308,10 +327,20 @@ func (s *Server) handleMember(ctx context.Context, tlsConn *tls.Conn, name strin
 	s.log.Info("成员连接已就位", "client", name, "member", hello.Member,
 		"live", sess.liveMembers())
 	for {
+		// 每读到一帧就续期。成员连接没有自己的心跳，安静是正常的；只有单方向可用的
+		// 半死连接才会一直读不到帧，超时后必须断开这条，否则槽位被永久占死
+		if err := tlsConn.SetReadDeadline(time.Now().Add(memberIdleTimeout)); err != nil {
+			return
+		}
 		typ, payload, err := proto.ReadFrame(tlsConn)
 		if err != nil {
-			s.log.Info("成员连接断开", connLogAttrs(err, tlsConn,
-				"client", name, "member", hello.Member)...)
+			if errors.Is(err, os.ErrDeadlineExceeded) || os.IsTimeout(err) {
+				s.log.Warn("成员连接空闲超时（该方向已死），断开该槽等客户端补拨",
+					"client", name, "member", hello.Member, "idle_timeout", memberIdleTimeout)
+			} else {
+				s.log.Info("成员连接断开", connLogAttrs(err, tlsConn,
+					"client", name, "member", hello.Member)...)
+			}
 			return
 		}
 		sess.touch()
@@ -323,6 +352,16 @@ func (s *Server) handleMember(ctx context.Context, tlsConn *tls.Conn, name strin
 			if _, err := s.tun.Write(payload); err != nil {
 				s.log.Error("写网卡失败", "err", err)
 				return
+			}
+		case proto.TypePing:
+			// 成员连接上的心跳应答：客户端定期发 PING 让这条连接两端一直有包
+			// 往返，免得被跨境链路上的 NAT 当成空闲连接清掉状态。回 PONG 必须
+			// 走 slotConn.write 而不是裸 proto.WriteFrame —— pumpTun 在另一个
+			// goroutine 上往同一条连接写数据，两者要共用写锁，否则帧会交错。
+			if sl := sess.slotEntry(hello.Member); sl != nil {
+				if err := sl.write(proto.TypePong, payload); err != nil {
+					return
+				}
 			}
 		default:
 			// 成员连接只搬数据；未知帧按兼容契约忽略
@@ -626,6 +665,11 @@ func (s *Server) reportStatus(ctx context.Context) {
 			ServerIP: s.cfg.Tunnel.ServerIP,
 			ClientIP: s.cfg.Tunnel.ClientIP,
 		}
+		if rs := s.relay.Load(); rs != nil {
+			st.ForwardReady = rs.ready
+			st.ForwardError = rs.err
+			st.ForwardKnown = true
+		}
 		if sess := s.currentSession(); sess != nil {
 			st.Client = sess.name
 			st.ConnectedAt = sess.connectedAt.Format(time.RFC3339)
@@ -750,9 +794,17 @@ func (s *session) slotFree(k int) bool {
 
 // commitSlot 把成员连接正式放进槽 k（读循环已启动后才调用）。
 // 预检（slotFree）到提交之间被抢 → 返回 false。
+//
+// 会话已关闭也返回 false：close() 遍历槽位时这条连接还没进槽，之后更不会关它，
+// 放进来就脱离了生命周期。检查与 close(s.closed) 同在锁内，才能堵住这个窗口。
 func (s *session) commitSlot(k int, conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	select {
+	case <-s.closed:
+		return false
+	default:
+	}
 	if k <= 0 || k >= len(s.slots) || s.slots[k] != nil {
 		return false
 	}
@@ -817,12 +869,13 @@ func (s *session) membersN() int {
 func (s *session) close() {
 	s.once.Do(func() {
 		s.mu.Lock()
+		defer s.mu.Unlock()
 		for _, sl := range s.slots {
 			if sl != nil {
 				_ = sl.conn.Close()
 			}
 		}
-		s.mu.Unlock()
+		// 在锁内关闭：commitSlot 也在锁内查它，否则刚提交的连接会晚于收尾、没人再关
 		close(s.closed)
 	})
 }

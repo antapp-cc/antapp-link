@@ -129,17 +129,22 @@ func (a *App) HealIfNeeded() error {
 		return nil
 	}
 
+	// inv 在这里多半是零值：自愈跑在界面选中连接码之前（App 以「未配置」状态启动）。
+	// 所以还原要用的隧道网关/云服地址一律取自快照，cfg 只是旧快照的回退值；连快照
+	// 都坏了的时候，至少还能靠隧道网卡上前缀整批清扫把 /1 路由撤掉。
+	cfg := BuildNetConfig(inv)
+
 	if err != nil {
 		// 快照本身坏了，DNS 原值已无从得知。至少把接管路由和隧道地址撤掉，
 		// 否则用户会一直卡在「所有流量都进了一条没人读的网卡」。
 		a.log.Warn("状态文件损坏，做一次保守还原（DNS 可能需要手动确认）", "err", err)
-		_ = Snapshot{}.Restore(BuildNetConfig(inv))
+		_ = Snapshot{}.Restore(cfg)
 		_ = RemoveSnapshot(a.statePath)
 		return err
 	}
 
 	a.log.Info("发现上次残留的网络配置，先还原", "captured_at", snap.CapturedAt)
-	if err := snap.Restore(BuildNetConfig(inv)); err != nil {
+	if err := snap.Restore(cfg); err != nil {
 		return fmt.Errorf("还原上次的网络配置失败: %w", err)
 	}
 	if err := RemoveSnapshot(a.statePath); err != nil {
@@ -211,7 +216,7 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 		return fmt.Errorf("连接服务端失败，未改动网络: %w", probeErr)
 	}
 
-	snap, err := Capture(cfg.ServerIP)
+	snap, err := Capture(cfg)
 	if err != nil {
 		_ = dev.Close()
 		return fmt.Errorf("抓取网络现场失败: %w", err)
@@ -223,8 +228,14 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 	}
 	if err := snap.Apply(cfg); err != nil {
 		// 网络已经改了一半，立刻还原，别把用户留在半截状态
-		_ = snap.Restore(cfg)
+		restoreErr := snap.Restore(cfg)
 		_ = dev.Close()
+		if restoreErr != nil {
+			// 还原也没成功：留住状态文件让下次启动接着自愈。删掉它等于把唯一的
+			// 线索也丢了，用户就只能手动改 DNS —— 与 Disconnect 的处理保持一致。
+			return fmt.Errorf("接管网络失败，且还原未完全成功（状态文件已保留，下次启动会重试）: %v / %w",
+				restoreErr, err)
+		}
 		_ = RemoveSnapshot(statePath)
 		return fmt.Errorf("接管网络失败（已还原）: %w", err)
 	}
@@ -523,6 +534,30 @@ func (a *App) Disconnect() error {
 	}
 	a.mu.Unlock()
 	return restoreErr
+}
+
+// shutdownWait 是退出时等待「正在进行的连接/断开」收尾的上限。
+//
+// 要盖住连接流程里最长的两段：probeServer 的 12 秒超时，外加接管网络那几秒。
+const shutdownWait = 20 * time.Second
+
+// Shutdown 是「退出程序」专用的收尾：等正在进行的连接/断开结束，再走一次还原。
+//
+// 不能直接复用 Disconnect —— 它在 connecting 时直接返回错误、在 disconnecting 时
+// 直接返回 nil，而调用方（托盘退出）拿到返回就会关窗口退进程，于是网络停在半接管
+// 状态，用户整机断网直到下次启动。退出这条路上，网络优先于速度。
+func (a *App) Shutdown() error {
+	deadline := time.Now().Add(shutdownWait)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		busy := a.connecting || a.disconnecting
+		a.mu.Unlock()
+		if !busy {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return a.Disconnect()
 }
 
 type AppStatus struct {

@@ -8,11 +8,36 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/antapp-cc/antapp-link/internal/client"
 	"github.com/antapp-cc/antapp-link/internal/pki"
 	"github.com/antapp-cc/antapp-link/internal/update"
 )
+
+// singleInstanceWait 是「疑似撞上自动更新」时等待旧进程释放互斥体的上限。
+//
+// 旧进程在拉起新版本之后立刻 os.Exit，通常几十毫秒就放手；给足余量，但别让
+// 用户双击图标后干等太久。
+const singleInstanceWait = 3 * time.Second
+
+// cleanupHealthyWait 是等待「新版确认可用」的上限。
+//
+// 上一次更新留下的 .old 是新版启动即崩时唯一的回滚物，所以只在隧道真的连上之后
+// 才清；到点还没连上就先留着（下次成功更新时 swapExe 会顺手清掉它）。
+const cleanupHealthyWait = 2 * time.Minute
+
+// waitHealthyThenCleanup 等隧道连上再清掉上一版的备份。
+func waitHealthyThenCleanup(app *client.App) {
+	deadline := time.Now().Add(cleanupHealthyWait)
+	for time.Now().Before(deadline) {
+		if app.Status().Online {
+			update.CleanupOldAfterHealthy()
+			return
+		}
+		time.Sleep(time.Second)
+	}
+}
 
 func main() {
 	os.Exit(run())
@@ -27,12 +52,9 @@ func run() int {
 		orderTrace = flag.String("order-trace", "",
 			"联调用：把每个进出隧道的包（方向/槽位/五元组/seq）记到该文件，用来断言同一内层流不跨外层连接")
 		restoreNet = flag.Bool("restore-network", false, "只还原上次残留的网络配置后退出（卸载器调用）")
-		showVer = flag.Bool("version", false, "显示版本")
+		showVer    = flag.Bool("version", false, "显示版本")
 	)
 	flag.Parse()
-
-	// 上一次更新会在程序旁边留下 .old，这次启动顺手清掉
-	update.CleanupOld()
 
 	if *showVer {
 		fmt.Printf("antapp-link %s\n", client.Version)
@@ -54,6 +76,18 @@ func run() int {
 	if err != nil {
 		client.ShowMessage("AntApp Link", "单实例检查失败："+err.Error())
 		return 1
+	}
+	if !first {
+		// 自动更新是「旧进程先拉起新版本、自己随后退出」，而互斥体还在旧进程手里。
+		// 这时直接认输会让新进程立刻自杀，用户看到的是「更新之后程序自己消失了」。
+		// 所以先重试等一会儿，旧进程一放手就由我们接管。
+		deadline := time.Now().Add(singleInstanceWait)
+		for !first && time.Now().Before(deadline) {
+			time.Sleep(100 * time.Millisecond)
+			if r, ok, rerr := client.SingleInstance(); rerr == nil && ok {
+				release, first = r, true
+			}
+		}
 	}
 	if !first {
 		// 已经有实例在跑。如果这次是双击连接码文件进来的，先把码写进 config\，
@@ -102,9 +136,6 @@ func run() int {
 	if *orderTrace != "" {
 		opts = append(opts, client.WithOrderTrace(*orderTrace))
 	}
-	// 清掉上次在线更新留下的旧程序备份（更新时正在运行删不掉，新进程里删才删得动）
-	update.CleanupOld()
-
 	app := client.NewApp(inv, dataDir, logger, opts...)
 
 	// 上次没干净退出的话，先把网络修回来再谈连接。
@@ -140,6 +171,8 @@ func run() int {
 			fmt.Fprintf(os.Stderr, "连接失败: %v\n", err)
 			return 1
 		}
+		// 隧道真的连上了才清上一版的备份：它是新版启动即崩时唯一的回滚物
+		update.CleanupOldAfterHealthy()
 		fmt.Println("已连接，Ctrl+C 退出")
 		client.WaitForInterrupt()
 		_ = app.Disconnect()
@@ -147,6 +180,7 @@ func run() int {
 	}
 
 	// 连不连、连哪个，由界面扫描 config\*.antapp 决定：一个直接连，多个弹窗让用户挑。
+	go waitHealthyThenCleanup(app)
 	if err := client.RunUI(app, logs, dataDir); err != nil {
 		logger.Error("界面启动失败", "err", err)
 		client.ShowMessage("AntApp Link", "界面启动失败："+err.Error())
@@ -164,7 +198,8 @@ func importInviteQuietly(rootDir, arg string) {
 		client.ShowMessage("AntApp Link", "导入连接码失败："+err.Error())
 		return
 	}
-	client.ShowMessage("AntApp Link", "已导入连接码文件，正在运行的客户端会弹出选择窗口")
+	client.ShowMessage("AntApp Link",
+		"已导入连接码文件。原本没有配置时客户端会自动用它连接；\n已经有多个连接码时，请从托盘菜单的「切换配置文件」里挑。")
 }
 
 // defaultRootDir 是客户端的工作根目录：程序自己所在的目录（安装后就是

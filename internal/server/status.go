@@ -23,6 +23,22 @@ type Status struct {
 	// 每槽收发字节 + 熔断计数：灰度多连接时看流量分摊，以及 JOIN 是否正被拒
 	Slots        []SlotStatus `json:"slots,omitempty"`
 	JoinFailures int          `json:"join_failures,omitempty"`
+	// 端口转发监听结果：多出来的 JSON 字段不影响旧版 status 子命令解析
+	ForwardReady bool   `json:"forward_ready"`
+	ForwardError string `json:"forward_error,omitempty"`
+	// ForwardKnown 区分「状态文件是旧版 daemon 写的」与「新版刚启动还没刷新」。
+	// 前者读出来是零值，不能据此替 daemon 宣称转发没起来。
+	ForwardKnown bool `json:"forward_known,omitempty"`
+}
+
+// reportStatus 每 5 秒刷新一次状态文件，超过这个阈值就说明写它的进程已经不在了。
+// /run 是 tmpfs，systemctl stop 或崩溃后旧文件会一直留着，光看文件存在会长期误报「运行中」。
+const statusStaleAfter = 20 * time.Second
+
+// Fresh 报告状态文件是否还在被刷新，即写它的隧道进程是否还活着。
+func (st Status) Fresh() bool {
+	t, err := time.Parse(time.RFC3339, st.UpdatedAt)
+	return err == nil && time.Since(t) <= statusStaleAfter
 }
 
 // SlotStatus 是一条连接的收发字节，按链路上的字节算（含帧头）。

@@ -60,6 +60,25 @@ func RunPortTest(serverIP string, log *slog.Logger) ([]PortTestResult, error) {
 	}
 
 	_, piExe, piRunning := findProcess(piAppName)
+	nodeWasRunning := false
+	if out, err := run(10*time.Second, "inspect", "--format", "{{.State.Running}}", nodeContainer); err == nil {
+		nodeWasRunning = strings.TrimSpace(out) == "true"
+	}
+
+	// 恢复必须挂在 defer 上：探测阶段最长约 90 秒（10 个端口 × 4 秒连接 + 5 秒读），
+	// 中途退出或出错都不能留下「Pi 已退出、节点容器已停」的状态。只恢复本来就在跑的
+	// 东西 —— 测试前停着的容器不该被测试拉起来。
+	defer func() {
+		log.Info("恢复节点环境……")
+		_, _ = run(60*time.Second, "stop", checkerContainer)
+		if nodeWasRunning {
+			_, _ = run(60*time.Second, "start", nodeContainer)
+		}
+		if piRunning {
+			relaunchApp(piExe)
+		}
+	}()
+
 	if piRunning {
 		log.Info("临时退出 Pi 界面程序（测完自动拉起）……")
 		closeApp(log)
@@ -72,11 +91,7 @@ func RunPortTest(serverIP string, log *slog.Logger) ([]PortTestResult, error) {
 
 	log.Info("启动端口应答容器……")
 	if out, err := run(60*time.Second, "start", checkerContainer); err != nil {
-		log.Warn("端口应答容器启动失败，恢复节点", "输出", strings.TrimSpace(out))
-		_, _ = run(60*time.Second, "start", nodeContainer)
-		if piRunning {
-			relaunchApp(piExe)
-		}
+		log.Warn("端口应答容器启动失败", "输出", strings.TrimSpace(out))
 		return nil, fmt.Errorf("启动 %s 失败（先用 Pi Desktop 跑一次端口检查来创建它）", checkerContainer)
 	}
 
@@ -102,12 +117,6 @@ func RunPortTest(serverIP string, log *slog.Logger) ([]PortTestResult, error) {
 		}
 	}
 
-	log.Info("恢复节点环境……")
-	_, _ = run(60*time.Second, "stop", checkerContainer)
-	_, _ = run(60*time.Second, "start", nodeContainer)
-	if piRunning {
-		relaunchApp(piExe)
-	}
 	return results, nil
 }
 

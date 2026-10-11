@@ -430,14 +430,23 @@ func (u *UI) rebuildTrayMenu() {
 	autostart.SetText("开机自启")
 	autostart.SetChecked(AutostartEnabled())
 	autostart.Triggered().Attach(func() {
+		// 勾选状态只在真的成功之后才改：schtasks 可能被组策略拒绝，先打勾再失败
+		// 会让用户以为重启后会自动启动，实际不会。Checked() 要在主线程读。
+		wasChecked := autostart.Checked()
 		go func() {
-			if autostart.Checked() {
-				_ = DisableAutostart()
-				autostart.SetChecked(false)
-			} else {
-				_ = EnableAutostart()
-				autostart.SetChecked(true)
+			if wasChecked {
+				if err := DisableAutostart(); err != nil {
+					ShowMessage("AntApp Link", "关闭开机自启失败："+err.Error())
+					return
+				}
+				u.mw.Synchronize(func() { autostart.SetChecked(false) })
+				return
 			}
+			if err := EnableAutostart(); err != nil {
+				ShowMessage("AntApp Link", "设置开机自启失败："+err.Error())
+				return
+			}
+			u.mw.Synchronize(func() { autostart.SetChecked(true) })
 		}()
 	})
 	menu.Actions().Add(autostart)
@@ -446,6 +455,9 @@ func (u *UI) rebuildTrayMenu() {
 }
 
 func (u *UI) showWindow() {
+	// 用户主动打开窗口就取消「连上 5 秒后自动收起」的计时。不取消的话，连上后
+	// 立刻点开窗口，它会显示两三秒又自己消失，看着像程序把自己关了。
+	u.hideAt = time.Time{}
 	u.mw.Show()
 	u.mw.Activate()
 }
@@ -476,7 +488,8 @@ func (u *UI) adoptByName(name string) bool {
 		u.alert("切换配置失败", err.Error())
 		return false
 	}
-	u.refresh()
+	// watchInvite 是后台协程调进来的，控件操作必须回主线程
+	u.mw.Synchronize(u.refresh)
 	go func() {
 		_ = u.app.Connect()
 		u.mw.Synchronize(u.refresh)
@@ -1244,8 +1257,15 @@ func (u *UI) quit() {
 	}
 	u.quitting = true
 	go func() {
-		// 先把网络还原干净，再关窗口
-		_ = u.app.Disconnect()
+		// 先把网络还原干净，再关窗口。退出这条路上网络优先于速度：Shutdown 会等
+		// 正在进行的连接/断开收尾，而且还原失败也不再静默放行 —— 否则用户带着
+		// 半接管的路由与 DNS 退出，整机断网，而且只有下次启动才知道。
+		if err := u.app.Shutdown(); err != nil {
+			u.mw.Synchronize(func() {
+				ShowMessage("AntApp Link", "退出前还原网络未完全成功："+err.Error()+
+					"\n\n建议重新打开客户端，让它自愈或手动断开一次。")
+			})
+		}
 		u.mw.Synchronize(func() { u.mw.Close() })
 	}()
 }

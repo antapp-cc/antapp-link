@@ -176,6 +176,18 @@ func Install(opts Options, log func(string)) error {
 	log("停止正在运行的客户端")
 	stopClient()
 
+	// stopClient 是 taskkill /F 硬停，客户端来不及还原 DNS 和路由，而这些残留会让
+	// 用户整机解析不了域名。下面任何一步都可能直接 return，所以在这里兜住所有出口：
+	// 中途失败、以及用户选择不立即启动时，都借客户端自己的自愈路径补还原一次。
+	// 已经正常拉起客户端的那条路不能补 —— 客户端起来会自己接管网络，再跑一次还原
+	// 反而把刚配好的拆掉。
+	clientUp := false
+	defer func() {
+		if !clientUp {
+			restoreNetwork(opts, log)
+		}
+	}()
+
 	log("创建安装目录 " + opts.InstallDir)
 	if err := os.MkdirAll(opts.InstallDir, 0o755); err != nil {
 		return fmt.Errorf("创建安装目录: %w", err)
@@ -185,18 +197,9 @@ func Install(opts Options, log func(string)) error {
 	_ = os.MkdirAll(filepath.Join(opts.InstallDir, "config"), 0o755)
 
 	dst := filepath.Join(opts.InstallDir, AppExeName)
-	// Windows 不允许覆盖正在运行的 exe，但允许给它改名 —— 覆盖安装时先把手头
-	// 的旧文件挪走再写入（与 update.Apply 同一套路）。否则遇到杀软短时握着
-	// 句柄，覆盖会静默失败，装完还是旧版本。
-	_ = os.Rename(dst, dst+".old")
-	tmp := dst + ".tmp"
-	if err := os.WriteFile(tmp, client, 0o755); err != nil {
-		return fmt.Errorf("拷贝程序: %w", err)
+	if err := releaseClient(dst, client); err != nil {
+		return err
 	}
-	if err := os.Rename(tmp, dst); err != nil {
-		return fmt.Errorf("拷贝程序: %w", err)
-	}
-	_ = os.Remove(dst + ".old")
 	log("已释放 " + dst)
 
 	if len(opts.Notices) > 0 {
@@ -257,20 +260,78 @@ func Install(opts Options, log func(string)) error {
 		log("启动客户端")
 		if err := exec.Command(dst).Start(); err != nil {
 			log("启动失败（可以自己双击快捷方式）：" + err.Error())
+		} else {
+			clientUp = true
 		}
 	}
 	return nil
+}
+
+// releaseClient 把客户端程序写到 dst。
+//
+// Windows 不允许覆盖正在运行的 exe，但允许给它改名 —— 先把旧文件挪成 .old 再写新
+// 文件（与 update.Apply 同一套路），否则遇到杀软短时握着句柄，覆盖会静默失败、
+// 装完还是旧版本。
+//
+// 改名之后 dst 就不存在了，所以写失败必须把 .old 改回原名：否则用户的
+// antapp-link.exe 凭空消失、只剩一个 .old，快捷方式、计划任务和 .antapp 关联
+// 全都指向一个不存在的文件，而没人会想到去手工改回来。
+func releaseClient(dst string, client []byte) error {
+	old := dst + ".old"
+	_ = os.Remove(old) // 清掉上一次留下的
+	// 全新安装时 dst 不存在，改名失败正是预期，忽略即可
+	_ = os.Rename(dst, old)
+
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, client, 0o755); err != nil {
+		return rollbackClient(old, dst, err)
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		return rollbackClient(old, dst, err)
+	}
+	_ = os.Remove(old)
+	return nil
+}
+
+// rollbackClient 写入失败后把旧版本改回原名；回滚也失败时得说清旧版留在哪，
+// 因为那时用户手上确实什么都没有了，只能自己进安装目录改名。
+func rollbackClient(old, dst string, cause error) error {
+	if _, err := os.Stat(old); err != nil {
+		return fmt.Errorf("拷贝程序: %w", cause) // 全新安装，没有旧版可回滚
+	}
+	if err := os.Rename(old, dst); err != nil {
+		return fmt.Errorf("拷贝程序失败，且回滚也失败（旧版仍在 %s，可手动改回）: %v / %w", old, err, cause)
+	}
+	return fmt.Errorf("拷贝程序失败（已回滚）: %w", cause)
+}
+
+// restoreNetwork 借客户端自己的 -restore-network 入口还原 DNS 与路由。
+//
+// taskkill /F 之后客户端来不及自己收尾，而残留的接管路由和 DNS 会让用户整机解析
+// 不了域名（DNS 还指着已经消失的隧道网关）。setup 不能直接 import client ——
+// client 已经 import 了 setup，只能再拉起一次客户端走它的自愈路径。
+//
+// 传 -data 安装目录，是因为客户端默认就拿 exe 所在目录当工作根目录，
+// config\ 和 data\ 都挂在它下面。
+func restoreNetwork(opts Options, log func(string)) {
+	exe := filepath.Join(opts.InstallDir, AppExeName)
+	if _, err := os.Stat(exe); err != nil {
+		// 覆盖安装失败且回滚也没成时，安装目录里能跑的只剩那个备份
+		exe += ".old"
+		if _, err := os.Stat(exe); err != nil {
+			return
+		}
+	}
+	log("还原网络配置")
+	_ = runHidden(exe, "-restore-network", "-data", opts.InstallDir)
 }
 
 func Uninstall(opts Options, log func(string)) error {
 	log("停止客户端")
 	stopClient()
 
-	// 上面是 taskkill /F 硬停，客户端来不及还原 DNS 和路由；而这些残留会让用户
-	// 整机解析不了域名（DNS 还指着已经消失的隧道网关）。所以再拉起一次客户端，
-	// 走它的自愈路径。setup 不能直接 import client —— client 已经 import 了 setup。
-	log("还原网络配置")
-	_ = runHidden(filepath.Join(opts.InstallDir, AppExeName), "-restore-network", "-data", opts.InstallDir)
+	// 上面是 taskkill /F 硬停，客户端来不及自己还原网络，补一次（见 restoreNetwork）
+	restoreNetwork(opts, log)
 
 	// 计划任务留着的话，卸载后每次登录还会去启动一个已经不存在的程序
 	log("清理开机自启计划任务")

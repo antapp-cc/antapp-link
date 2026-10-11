@@ -61,6 +61,15 @@ type Snapshot struct {
 	// 这时**不加**绕行路由：现成的直连路由已经比默认路由更具体，抢不走；
 	// 硬加一条指向默认网关的 /32 反而会覆盖它，把承载隧道的连接自己掐死。
 	ServerNextHop string `json:"server_next_hop,omitempty"`
+
+	// TunnelGateway / ServerIP 是本次接管用的隧道网关与云服地址。
+	//
+	// 存进快照是为了让自愈不依赖连接码：HealIfNeeded 跑在连接码加载之前，那时
+	// App 手里是零值 Invite，而撤掉 /1 接管路由与绕行路由偏偏要用这两个值 ——
+	// 只从 cfg 取就会在自愈时全部落空，把用户留在「所有流量灌进一张没人读的
+	// 网卡」的状态里。旧快照没有这两个字段，还原时回退到 cfg。
+	TunnelGateway string `json:"tunnel_gateway,omitempty"`
+	ServerIP      string `json:"server_ip,omitempty"`
 }
 
 // NetConfig 是接管网络需要的参数。
@@ -209,12 +218,14 @@ func RemoveSnapshot(path string) error {
 	return nil
 }
 
-func newSnapshot(gateway string, ifIndex int, serverNextHop string, ifaces []IfaceDNS) Snapshot {
+func newSnapshot(gateway string, ifIndex int, serverNextHop string, ifaces []IfaceDNS, cfg NetConfig) Snapshot {
 	return Snapshot{
 		DefaultGateway: gateway,
 		DefaultIfIndex: ifIndex,
 		ServerNextHop:  serverNextHop,
 		Interfaces:     ifaces,
 		CapturedAt:     time.Now().Format(time.RFC3339),
+		TunnelGateway:  cfg.Gateway,
+		ServerIP:       cfg.ServerIP,
 	}
 }

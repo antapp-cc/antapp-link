@@ -78,7 +78,7 @@ type Checker struct {
 
 // 这里刻意不留「用环境变量覆盖更新源」的口子（曾经有过 ANTAPP_UPDATE_SOURCES）。
 //
-// 客户端的 manifest 是 requireAdministrator，而 HKCU\Environment 是普通进程就能写的：
+// 客户端 manifest 是 requireAdministrator，而 HKCU\Environment 是普通进程就能写的：
 // 任何能以该用户身份跑起来的进程都能让客户端以管理员权限去下载它指定的 URL、拿它
 // 自己算的 sha256 自校验、替换自身再拉起。环境变量对提权攻击者是零成本的入口，
 // 所以更新源只能由构建期定死。内网部署要换源，改 DefaultSources。

@@ -28,6 +28,14 @@ const (
 	readBufferSize   = 65535
 	protoVersion     = 1
 
+	// memberPingInterval 是成员连接的心跳间隔。
+	//
+	// 成员连接上只有数据帧、没有控制帧：流量稀疏时它会长时间没有包往返，
+	// 跨境链路的 NAT 会把这种连接的状态清掉，客户端随后读到 i/o timeout、
+	// 摘槽重拨（实测 3 条数据连接时每 1~2 分钟一次）。定期发一个小帧保活，
+	// 比事后重拨便宜得多。取 15s 是为了短于常见 NAT 超时（30s 起）。
+	memberPingInterval = 15 * time.Second
+
 	// maxMembers 是单会话允许的并行连接数上限（与连接码、服务端 max_members 同界）。
 	maxMembers = 4
 )
@@ -314,6 +322,7 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	defer t.Stats.Connected.Store(false)
 
 	sess := newClientSession(t, conn, sid, tlsCfg, ack)
+	defer sess.closeAll()
 	sess.trace = t.Trace
 	if sess.members > 1 {
 		t.log.Info(fmt.Sprintf("多连接并发已启用：%d 条并行连接（含控制连接）", sess.members))
@@ -349,7 +358,7 @@ func newClientSession(t *Tunnel, conn net.Conn, sid string, tlsCfg *tls.Config, 
 	n := effectiveMembers(ack.Members)
 	sess := &clientSession{
 		tunnel: t, dev: t.dev, log: t.log, stats: &t.Stats,
-		sid: sid, members: n, tlsCfg: tlsCfg,
+		sid: sid, members: n, tlsCfg: tlsCfg, closed: make(chan struct{}),
 		slots:  make([]net.Conn, n),
 		writes: make([]sync.Mutex, n),
 	}
@@ -358,25 +367,73 @@ func newClientSession(t *Tunnel, conn net.Conn, sid string, tlsCfg *tls.Config, 
 }
 
 type clientSession struct {
-	tunnel   *Tunnel
-	dev      Device
-	log      *slog.Logger
-	stats    *Stats
-	lastSeen atomic.Int64
+	tunnel *Tunnel
+	dev    Device
+	log    *slog.Logger
+	stats  *Stats
+	// ctrlSeen 只由控制连接（槽 0）的收帧刷新。判死必须看会话命脉那一条连接：
+	// 成员连接的下行数据不刷新它，否则控制连接单向半开时，只要成员槽还有流量
+	// 就永远不判死，哈希到槽 0 的内层流全部黑洞。
+	ctrlSeen atomic.Int64
 
 	sid     string // 逻辑会话 ID
 	members int    // 生效连接数（含控制连接）
 	tlsCfg  *tls.Config
 	trace   *OrderTracer    // 联调顺序追踪（nil = 关闭）
 	ctx     context.Context // 会话上下文（run 里赋值），收尾时用来判断写失败是否预期内
-	mu      sync.Mutex
-	slots   []net.Conn   // slots[0]=控制连接；成员槽位从 1 开始，nil=空
-	writes  []sync.Mutex // 每槽一把写锁；成员槽空时流量落回控制连接，锁也跟着落回
+
+	// closed 是本会话的关闭信号：run 返回后由 closeAll 关闭，让还阻塞在设备读上、
+	// 或正要往旧连接写包的 goroutine 能自己退出。设备跨会话复用、不能靠关设备来收尾。
+	closed    chan struct{}
+	closeOnce sync.Once
+
+	mu     sync.Mutex
+	slots  []net.Conn   // slots[0]=控制连接；成员槽位从 1 开始，nil=空
+	writes []sync.Mutex // 每槽一把写锁；成员槽空时流量落回控制连接，锁也跟着落回
 }
 
 // sessionEnded 报告会话是否已进入收尾（此时连接会随会话一起关，写失败是预期内的）。
 func (s *clientSession) sessionEnded() bool {
 	return s.ctx != nil && s.ctx.Err() != nil
+}
+
+// closeAll 关掉会话的全部连接，把阻塞在 ReadFrame 上的读循环放出来。
+//
+// 槽 0 只关不清空：writeSlot/slot 在槽 0 为 nil 时返回的是 nil 接口，随后的
+// SetWriteDeadline 或 ReadFrame 会 panic；留一个已关闭的连接，读写一样立刻失败。
+func (s *clientSession) closeAll() {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+
+		s.mu.Lock()
+		members := make([]net.Conn, 0, len(s.slots))
+		for i := 1; i < len(s.slots); i++ {
+			if s.slots[i] != nil {
+				members = append(members, s.slots[i])
+				s.slots[i] = nil
+			}
+		}
+		ctrl := s.slots[0]
+		s.mu.Unlock()
+
+		// 关闭放在锁外：Close 可能阻塞，不能压着槽表
+		for _, c := range members {
+			_ = c.Close()
+		}
+		if ctrl != nil {
+			_ = ctrl.Close()
+		}
+	})
+}
+
+// isClosed 报告会话是否已收尾。
+func (s *clientSession) isClosed() bool {
+	select {
+	case <-s.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 // slotWriteTimeout 限制单次写连接。卡住的连接必须能摘掉，否则会拖停整条分发链路。
@@ -402,6 +459,46 @@ func (s *clientSession) write(t proto.Type, payload []byte) error {
 		return err
 	}
 	return proto.WriteFrame(conn, t, payload)
+}
+
+// pingMember 往指定成员槽写一个心跳帧保活。
+//
+// 持该槽的写锁：同一条连接上还有数据批在写（flushBatch），裸写会把帧撕开。
+func (s *clientSession) pingMember(k int) error {
+	actual, conn, mu := s.writeSlot(k)
+	if actual != k {
+		// 槽已空，流量落回控制连接，没什么可保活的
+		return nil
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if err := conn.SetWriteDeadline(time.Now().Add(slotWriteTimeout)); err != nil {
+		return err
+	}
+	ts := make([]byte, 8)
+	binary.BigEndian.PutUint64(ts, uint64(time.Now().UnixNano()))
+	return proto.WriteFrame(conn, proto.TypePing, ts)
+}
+
+// memberHeartbeat 给一条成员连接保活，直到会话结束或这条连接写不动。
+//
+// 服务端会回 PONG（老服务端会忽略，但上行有包就已经能刷新 NAT 映射了）。
+func (s *clientSession) memberHeartbeat(ctx context.Context, k int) {
+	ticker := time.NewTicker(memberPingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.closed:
+			return
+		case <-ticker.C:
+			if err := s.pingMember(k); err != nil {
+				// 写失败不在这里收尾：读循环会摘槽、维护协程会补拨
+				return
+			}
+		}
+	}
 }
 
 // slot 返回槽位 k 的连接；越界或空槽 → 控制连接兜底。
@@ -490,6 +587,9 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 	sess.mu.Unlock()
 	t.log.Info("成员连接已就位", "member", k, "live", sess.liveCount())
 
+	// 这条连接要自己保活（理由见 memberPingInterval）：会话收尾或写不动时退出
+	go sess.memberHeartbeat(ctx, k)
+
 	// 读循环：成员连接上来的包写网卡；断开摘槽（该槽流量落回控制连接）
 	for {
 		typ, payload, err := proto.ReadFrame(conn)
@@ -502,11 +602,17 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 			t.log.Info("成员连接断开", connLogAttrs(err, conn, "member", k)...)
 			return err
 		}
-		sess.touch()
 		switch typ {
 		case proto.TypeIP:
 			sess.trace.Record("rx", k, payload)
 			if _, err := sess.dev.Write(payload); err != nil {
+				// 这条读循环马上要退出，槽位必须跟着摘掉：留着的话分发仍会哈希到它，
+				// 包只会写进这条再没人读的连接（和上面读错误路径同一个理由）。
+				sess.mu.Lock()
+				if sess.slots[k] == conn {
+					sess.slots[k] = nil
+				}
+				sess.mu.Unlock()
 				return err
 			}
 			sess.stats.RxBytes.Add(uint64(len(payload)))
@@ -519,6 +625,8 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 			sess.mu.Unlock()
 			t.log.Warn("成员连接被服务端关闭", "member", k, "reason", string(payload))
 			return fmt.Errorf("成员连接 %d 被服务端关闭: %s", k, string(payload))
+		case proto.TypePong:
+			// 心跳得到应答，说明这条连接还活着；不需要别的动作
 		default:
 			// 成员连接只搬数据，其他帧忽略
 		}
@@ -604,7 +712,7 @@ func (s *clientSession) run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	s.ctx = ctx
-	s.touch()
+	s.touchCtrl()
 
 	errCh := make(chan error, 3)
 	go func() { errCh <- s.pumpFromTunnel(ctx) }()
@@ -624,7 +732,8 @@ func (s *clientSession) run(ctx context.Context) error {
 	}
 }
 
-func (s *clientSession) touch() { s.lastSeen.Store(time.Now().UnixNano()) }
+// touchCtrl 记下控制连接最近一次收到帧的时间（心跳判死的唯一依据）。
+func (s *clientSession) touchCtrl() { s.ctrlSeen.Store(time.Now().UnixNano()) }
 
 // pumpFromTunnel：隧道来的 IP 包写进网卡，交给 Windows 内核处理。
 func (s *clientSession) pumpFromTunnel(ctx context.Context) error {
@@ -636,7 +745,7 @@ func (s *clientSession) pumpFromTunnel(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("读隧道: %w", err)
 		}
-		s.touch()
+		s.touchCtrl()
 		switch typ {
 		case proto.TypeIP:
 			s.trace.Record("rx", 0, payload)
@@ -678,6 +787,20 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 		if n <= 0 {
 			continue
 		}
+		// 会话收尾后这条搬运链路已经没有意义，但网卡是跨会话复用的、不能关，
+		// 阻塞在 dev.Read 上时叫不醒 —— 只能等下一个包到时在这里退出。代价是丢这
+		// 一个包（IP 层本就尽力而为），以及无流量时旧 goroutine 会多驻留一会儿；
+		// 不退出的话它会拿旧会话的槽表继续发包，抢新会话的流量。
+		if s.isClosed() {
+			return nil
+		}
+		if n > proto.MaxPayload {
+			// 帧头装不下。硬塞会让对端把这 4 字节 IP 头当帧头解析、整条流从此错位
+			// （连接还在、数据全垃圾），所以宁可丢这个包。正常 MTU ≤1500 时读不到
+			// 这么大的包，这是给将来放宽 MTU 兜的底。
+			s.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", n, "max", proto.MaxPayload)
+			continue
+		}
 		pktLen := n
 		k := proto.Slot(buf[:n], s.members)
 		s.trace.Record("tx", k, buf[:pktLen])
@@ -690,6 +813,10 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 		for len(batch) < proto.MaxBatchBytes-proto.HeaderSize-proto.MaxPayload {
 			m, rerr := s.dev.TryRead(buf)
 			if rerr != nil || m <= 0 {
+				break
+			}
+			if m > proto.MaxPayload {
+				s.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", m, "max", proto.MaxPayload)
 				break
 			}
 			kk := proto.Slot(buf[:m], s.members)
@@ -781,8 +908,8 @@ func (s *clientSession) heartbeat(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if idle := time.Since(time.Unix(0, s.lastSeen.Load())); idle > deadAfter {
-				return fmt.Errorf("超过 %s 没收到任何帧，判定链路已死", deadAfter)
+			if idle := time.Since(time.Unix(0, s.ctrlSeen.Load())); idle > deadAfter {
+				return fmt.Errorf("控制连接超过 %s 没收到任何帧，判定链路已死", deadAfter)
 			}
 			if err := send(); err != nil {
 				return fmt.Errorf("发 PING: %w", err)

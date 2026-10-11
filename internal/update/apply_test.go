@@ -6,7 +6,61 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// stubExecutable 把「当前程序在哪」指到临时目录里的假程序，免得测试删到别处。
+func stubExecutable(t *testing.T, path string) {
+	t.Helper()
+	prev := executablePath
+	executablePath = func() (string, error) { return path, nil }
+	t.Cleanup(func() { executablePath = prev })
+}
+
+func TestCleanupOldAfterHealthyRemovesBackup(t *testing.T) {
+	self := filepath.Join(t.TempDir(), "app.exe")
+	if err := os.WriteFile(self, []byte("new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backup := self + ".old"
+	if err := os.WriteFile(backup, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stubExecutable(t, self)
+
+	CleanupOldAfterHealthy()
+
+	if _, err := os.Stat(backup); !os.IsNotExist(err) {
+		t.Errorf("确认健康后该删掉 .old，实际 err=%v", err)
+	}
+	if got, err := os.ReadFile(self); err != nil || string(got) != "new" {
+		t.Errorf("不该动到程序自己：%q (err=%v)", got, err)
+	}
+}
+
+// 新版还没证明自己活得下来之前，回滚副本必须留着。
+func TestCleanupOldWaitsForHealthyUptime(t *testing.T) {
+	self := filepath.Join(t.TempDir(), "app.exe")
+	backup := self + ".old"
+	if err := os.WriteFile(backup, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stubExecutable(t, self)
+	prevStarted := processStarted
+	t.Cleanup(func() { processStarted = prevStarted })
+
+	processStarted = time.Now()
+	CleanupOld()
+	if _, err := os.Stat(backup); err != nil {
+		t.Error("启动早期不该删掉回滚副本")
+	}
+
+	processStarted = time.Now().Add(-minHealthyUptime - time.Second)
+	CleanupOld()
+	if _, err := os.Stat(backup); !os.IsNotExist(err) {
+		t.Errorf("跑够观察窗口后该清掉回滚副本，实际 err=%v", err)
+	}
+}
 
 func TestSwapExeSucceeds(t *testing.T) {
 	dir := t.TempDir()

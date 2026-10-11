@@ -59,7 +59,6 @@ func Down(cfg Config, logger *slog.Logger) error {
 	}
 	removeJumpsTo("nat", "PREROUTING", ChainName)
 	_ = iptables("-t", "nat", "-F", ChainName)
-	_ = iptables("-t", "nat", "-F", ChainName)
 	_ = iptables("-t", "nat", "-X", ChainName)
 
 	if wan, err := defaultInterface(); err == nil {

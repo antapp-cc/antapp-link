@@ -61,12 +61,51 @@ func Init(dir string) error {
 	}
 
 	// 服务端证书可以安全重签：客户端只校验它由 CA 签发，不认指纹。
-	if !fileExists(filepath.Join(dir, srvCertFile)) || !fileExists(filepath.Join(dir, srvKeyFile)) {
+	// 但「只重签缺文件」这条的隐含前提是 CA 没变 —— 上面的提示恰恰会引导用户删掉
+	// CA 两者重建，此时旧 server.crt 仍在，服务端继续出示旧 CA 签的证书，
+	// 与新连接码里的新 CA 对不上，全部节点在握手阶段掉线而 Init 还报成功。
+	if !fileExists(filepath.Join(dir, srvCertFile)) || !fileExists(filepath.Join(dir, srvKeyFile)) ||
+		!serverCertUsable(dir) {
 		if err := generateServerCert(dir); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// serverCertUsable 报告现有 server.crt/server.key 能否继续用：证书由当前 ca.crt 签发，
+// 且私钥可读、与证书配对。任何一项不满足都重签 —— 重签是安全的（客户端只认链，
+// 不认指纹），而读不出来的证书文件不该让 Init 彻底失败。
+func serverCertUsable(dir string) bool {
+	caPEM, err := os.ReadFile(filepath.Join(dir, caCertFile))
+	if err != nil {
+		return false
+	}
+	srvCertPath := filepath.Join(dir, srvCertFile)
+	srvPEM, err := os.ReadFile(srvCertPath)
+	if err != nil {
+		return false
+	}
+	if _, err := tls.LoadX509KeyPair(srvCertPath, filepath.Join(dir, srvKeyFile)); err != nil {
+		return false
+	}
+	caCert, srvCert := parseCertPEM(caPEM), parseCertPEM(srvPEM)
+	if caCert == nil || srvCert == nil {
+		return false
+	}
+	return srvCert.CheckSignatureFrom(caCert) == nil
+}
+
+func parseCertPEM(data []byte) *x509.Certificate {
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil
+	}
+	return cert
 }
 
 func generateCA(certPath, keyPath string) error {

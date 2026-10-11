@@ -28,10 +28,15 @@ func AppendHeader(dst []byte, t Type, n int) []byte {
 	return append(dst, hdr[:]...)
 }
 
-// Slot 返回该 IP 包应走的槽位号（0 = 控制连接）。
+// Slot 返回该 IP 包应走的槽位号。0 是控制连接，只在单连接模式与畸形包兜底时出现。
 //
 // 多连接并发数据面的流路由：同一内层流（规范化五元组）的所有包永远返回同一
 // 槽位——内层 TCP 绝不能看到乱序，这是方案的正确性基石。
+//
+// 数据刻意**不**落在槽 0：槽 0 是控制连接，PING/PONG 与它共用同一条 TCP。
+// 数据挤进去时心跳的写会排在大批数据后面，撞上写超时（5s）就是整个会话重连
+// （实测每 1~2 分钟一次，日志表现为「成员连接断开」与「会话结束」同一毫秒出现）。
+// 所以 n>1 时值域是 1..n-1；n<=1（单连接模式）没有成员槽可用，只能退回 0。
 //
 // 规则（两端必须一致，勿改）：
 //   - 非 IPv4 / 畸形包 → 0（控制连接兜底，绝不 panic）；
@@ -40,7 +45,7 @@ func AppendHeader(dst []byte, t Type, n int) []byte {
 //   - TCP/UDP → 以规范化端点对（字节序小者在前）+ protocol 哈希，方向无关；
 //   - 其他协议 → 以 (src, dst, protocol) 哈希。
 //
-// 哈希：FNV-1a 32 位；结果对 n 取模。n <= 1 时恒返 0。
+// 哈希：FNV-1a 32 位；结果对 n-1 取模后加 1。
 func Slot(payload []byte, n int) int {
 	if n <= 1 || len(payload) < 20 || payload[0]>>4 != 4 {
 		return 0
@@ -84,7 +89,8 @@ func Slot(payload []byte, n int) int {
 		input = append(input, protocol)
 	}
 
-	return int(h.sum(input) % uint32(n))
+	// 1 + (哈希 % (n-1))：值域 1..n-1，把槽 0 留给控制连接
+	return 1 + int(h.sum(input)%uint32(n-1))
 }
 
 type fnv1a struct{ v uint32 }
