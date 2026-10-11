@@ -441,7 +441,10 @@ func (s *clientSession) isClosed() bool {
 }
 
 // slotWriteTimeout 限制单次写连接。卡住的连接必须能摘掉，否则会拖停整条分发链路。
-var slotWriteTimeout = 5 * time.Second
+//
+// 20 秒而不是 5 秒：上行很满、链路实测有 30% 级别丢包时，TCP 发送窗口会长时间处于
+// 满的状态，5 秒不够把一批写完，成员连接会被反复误杀。
+var slotWriteTimeout = 20 * time.Second
 
 // writeSlot 返回实际承载的连接、它的写锁与实际槽号。锁必须跟着落回控制连接，
 // 否则会和心跳的两次 Write 交错把帧撕开；实际槽号用来区分写不动的是成员还是会话命脉。

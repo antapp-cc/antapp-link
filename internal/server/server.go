@@ -716,7 +716,12 @@ type slotConn struct {
 
 // slotWriteTimeout 限制单次写槽。pumpTun 是单 goroutine 串行往各槽写，
 // 一条卡住的连接会把它后面的几条一起拖停。
-var slotWriteTimeout = 5 * time.Second
+//
+// 20 秒而不是 5 秒：节点机同步区块时上行很满，而这条跨国链路实测有 30% 级别丢包，
+// TCP 发送窗口会长时间处于满的状态 —— 5 秒不够把一批写完，成员连接就被反复误杀
+// （日志里全是「本端主动关闭（写超时）」）。真拥塞时晚一点判死只是多等一会儿，
+// 误杀的代价却是那条槽的流量全丢、还要重新拨号。
+var slotWriteTimeout = 20 * time.Second
 
 func (s *slotConn) write(t proto.Type, payload []byte) error {
 	s.writeMu.Lock()
