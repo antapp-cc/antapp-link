@@ -205,7 +205,7 @@ func (s *Server) pumpTun(ctx context.Context) {
 		if sess == nil {
 			continue
 		}
-		k := proto.Slot(buf[:n], sess.membersN())
+		k := sess.flow.Slot(buf[:n], sess.membersN())
 
 		batch = proto.AppendHeader(batch[:0], proto.TypeIP, n)
 		batch = append(batch, buf[:n]...)
@@ -219,7 +219,7 @@ func (s *Server) pumpTun(ctx context.Context) {
 				s.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", m, "max", proto.MaxPayload)
 				break
 			}
-			kk := proto.Slot(buf[:m], sess.membersN())
+			kk := sess.flow.Slot(buf[:m], sess.membersN())
 			if kk != k {
 				if err := sess.flushBatch(k, batch); err != nil {
 					s.log.Debug("转发给客户端失败", connLogAttrs(err, nil, "client", sess.name)...)
@@ -542,6 +542,7 @@ func (s *Server) handleControl(ctx context.Context, tlsConn *tls.Conn, name stri
 		members:     approved,
 		closed:      make(chan struct{}),
 		connectedAt: time.Now(),
+		flow:        proto.NewFlowTable(),
 	}
 	sess.slots = make([]*slotConn, approved)
 	sess.slots[0] = &slotConn{conn: tlsConn}
@@ -700,6 +701,9 @@ type session struct {
 
 	mu    sync.Mutex
 	slots []*slotConn // slots[0] 恒为控制连接；成员槽位从 1 开始
+	// flow 决定下行包走哪个槽：已有流固定不变（保序），新流分给当前承载流数最少的槽。
+	// 纯哈希做不到均衡 —— 一条大流会把某条成员连接塞到写超时被摘掉，别的槽却闲着。
+	flow *proto.FlowTable
 }
 
 // slotConn 是逻辑会话里的一条物理连接。
@@ -712,7 +716,12 @@ type slotConn struct {
 
 // slotWriteTimeout 限制单次写槽。pumpTun 是单 goroutine 串行往各槽写，
 // 一条卡住的连接会把它后面的几条一起拖停。
-var slotWriteTimeout = 5 * time.Second
+//
+// 20 秒而不是 5 秒：节点机同步区块时上行很满，而这条跨国链路实测有 30% 级别丢包，
+// TCP 发送窗口会长时间处于满的状态 —— 5 秒不够把一批写完，成员连接就被反复误杀
+// （日志里全是「本端主动关闭（写超时）」）。真拥塞时晚一点判死只是多等一会儿，
+// 误杀的代价却是那条槽的流量全丢、还要重新拨号。
+var slotWriteTimeout = 20 * time.Second
 
 func (s *slotConn) write(t proto.Type, payload []byte) error {
 	s.writeMu.Lock()

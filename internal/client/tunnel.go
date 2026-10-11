@@ -361,6 +361,7 @@ func newClientSession(t *Tunnel, conn net.Conn, sid string, tlsCfg *tls.Config, 
 		sid: sid, members: n, tlsCfg: tlsCfg, closed: make(chan struct{}),
 		slots:  make([]net.Conn, n),
 		writes: make([]sync.Mutex, n),
+		flow:   proto.NewFlowTable(),
 	}
 	sess.slots[0] = conn
 	return sess
@@ -390,6 +391,9 @@ type clientSession struct {
 	mu     sync.Mutex
 	slots  []net.Conn   // slots[0]=控制连接；成员槽位从 1 开始，nil=空
 	writes []sync.Mutex // 每槽一把写锁；成员槽空时流量落回控制连接，锁也跟着落回
+	// flow 决定上行包走哪个槽：已有流固定不变（保序），新流分给当前承载流数最少的槽。
+	// 纯哈希做不到均衡，一条大流会把某条成员连接塞到写超时被摘掉。
+	flow *proto.FlowTable
 }
 
 // sessionEnded 报告会话是否已进入收尾（此时连接会随会话一起关，写失败是预期内的）。
@@ -437,7 +441,10 @@ func (s *clientSession) isClosed() bool {
 }
 
 // slotWriteTimeout 限制单次写连接。卡住的连接必须能摘掉，否则会拖停整条分发链路。
-var slotWriteTimeout = 5 * time.Second
+//
+// 20 秒而不是 5 秒：上行很满、链路实测有 30% 级别丢包时，TCP 发送窗口会长时间处于
+// 满的状态，5 秒不够把一批写完，成员连接会被反复误杀。
+var slotWriteTimeout = 20 * time.Second
 
 // writeSlot 返回实际承载的连接、它的写锁与实际槽号。锁必须跟着落回控制连接，
 // 否则会和心跳的两次 Write 交错把帧撕开；实际槽号用来区分写不动的是成员还是会话命脉。
@@ -815,7 +822,7 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 			continue
 		}
 		pktLen := n
-		k := proto.Slot(buf[:n], s.members)
+		k := s.flow.Slot(buf[:n], s.members)
 		s.trace.Record("tx", k, buf[:pktLen])
 		s.stats.TxBytes.Add(uint64(pktLen))
 
@@ -832,7 +839,7 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 				s.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", m, "max", proto.MaxPayload)
 				break
 			}
-			kk := proto.Slot(buf[:m], s.members)
+			kk := s.flow.Slot(buf[:m], s.members)
 			s.trace.Record("tx", kk, buf[:m])
 			if kk != k {
 				// 不同槽的包放回没有手段（Device 是单读接口），直接单发处理完再收
