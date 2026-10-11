@@ -62,15 +62,37 @@ func TestSlotStability(t *testing.T) {
 }
 
 func TestSlotDifferentFlowsSpread(t *testing.T) {
-	// 大样本下 4 槽都应被命中（分布性烟雾测试，不卡方）
+	// 大样本下成员槽（1..n-1）都应被命中（分布性烟雾测试，不卡方）
 	seen := map[int]bool{}
 	for i := 0; i < 4000; i++ {
 		sport := uint16(rand.Intn(65536))
 		b := mkIPv4([4]byte{10, 0, 0, 2}, [4]byte{93, 184, 216, 34}, 6, sport, 443, 0, false)
 		seen[Slot(b, 4)] = true
 	}
-	if len(seen) != 4 {
-		t.Fatalf("4000 个流只覆盖 %d/4 槽", len(seen))
+	if len(seen) != 3 {
+		t.Fatalf("4000 个流覆盖 %d 个槽，期望 3（成员槽 1..3）", len(seen))
+	}
+	if seen[0] {
+		t.Fatal("数据不该落在槽 0（控制连接）")
+	}
+}
+
+// 数据必须落在成员槽：槽 0 是控制连接，数据挤进去会把心跳的写排在大批数据后面，
+// 撞上写超时就是整个会话重连。这条契约是「控制连接不被数据堵住」的唯一保证。
+func TestSlotNeverUsesControlSlot(t *testing.T) {
+	for n := 2; n <= 4; n++ {
+		for i := 0; i < 2000; i++ {
+			sport := uint16(rand.Intn(65536))
+			b := mkIPv4([4]byte{10, 0, 0, 2}, [4]byte{93, 184, 216, 34}, 6, sport, 443, 0, false)
+			if got := Slot(b, n); got < 1 || got >= n {
+				t.Fatalf("n=%d 时槽位 %d 越界（应在 1..%d）", n, got, n-1)
+			}
+		}
+	}
+	// 单连接模式没有成员槽可用，只能走 0
+	valid := mkIPv4([4]byte{1, 2, 3, 4}, [4]byte{5, 6, 7, 8}, 6, 1, 2, 0, false)
+	if Slot(valid, 1) != 0 {
+		t.Fatal("n=1 必须返 0")
 	}
 }
 
