@@ -13,6 +13,24 @@ import (
 	"testing"
 )
 
+// 更新源不能再被环境变量改掉：客户端是提权运行的，HKCU\Environment 普通进程就能写。
+func TestNewCheckerIgnoresEnvOverride(t *testing.T) {
+	t.Setenv("ANTAPP_UPDATE_SOURCES", "http://evil.example/latest.json")
+
+	c := NewChecker("0.1.0")
+	if len(c.Sources) != len(DefaultSources) {
+		t.Fatalf("更新源数量 = %d, want %d", len(c.Sources), len(DefaultSources))
+	}
+	for i, src := range c.Sources {
+		if src != DefaultSources[i] {
+			t.Errorf("源 %d = %+v, want %+v", i, src, DefaultSources[i])
+		}
+	}
+	if c.Current != "0.1.0" {
+		t.Errorf("Current = %q, want \"0.1.0\"", c.Current)
+	}
+}
+
 func TestCompareVersions(t *testing.T) {
 	cases := []struct {
 		a, b string

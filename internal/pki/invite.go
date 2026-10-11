@@ -189,9 +189,17 @@ func (inv Invite) Encode() (string, error) {
 	return Scheme + base64.StdEncoding.EncodeToString(raw), nil
 }
 
+// maxCodeLen 是连接码的长度上限。连接码本体只有几 KB（三段 PEM + 隧道参数），
+// 1 MiB 已有三个数量级余量；上游可能把整个文件或一大段剪贴板喂进来，
+// 而去空白那一步会先把输入整份复制，所以必须在它之前卡住。
+const maxCodeLen = 1 << 20
+
 // Decode 解析连接码。带不带 antapp:// 前缀都接受，并容忍从聊天窗口粘来的空白。
 func Decode(code string) (Invite, error) {
 	s := strings.TrimSpace(code)
+	if len(s) > maxCodeLen {
+		return Invite{}, fmt.Errorf("连接码过长（%d 字节，上限 %d）：多半是没复制对，或贴进来的是整个文件", len(s), maxCodeLen)
+	}
 	s = strings.TrimPrefix(s, Scheme)
 	s = strings.NewReplacer("\n", "", "\r", "", " ", "", "\t", "").Replace(s)
 

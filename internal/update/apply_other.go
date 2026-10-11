@@ -9,3 +9,5 @@ var ErrNotWindows = errors.New("update: 自动替换程序只在 Windows 上可�
 func Apply(string) error { return ErrNotWindows }
 
 func CleanupOld() {}
+
+func CleanupOldAfterHealthy() {}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"time"
 )
 
 // Apply 用下载好的新程序替换当前可执行文件，并拉起新版本。
@@ -46,9 +47,36 @@ func swapExe(self, newExe string, launch func(string) error) error {
 	return nil
 }
 
-// CleanupOld 删除上次更新留下的 .old。新版本启动时调一次即可。
+// minHealthyUptime 是判断「新版没在启动时崩掉」的观察窗口。
+//
+// 启动即崩和被杀软隔离都发生在头几分钟内，熬过去再删回滚副本才不算赌。
+const minHealthyUptime = 2 * time.Minute
+
+var (
+	// 取当前程序路径留成变量：测试要把它指到临时目录，否则删的是别处的东西
+	executablePath = os.Executable
+	processStarted = time.Now()
+)
+
+// CleanupOld 删除上次更新留下的 .old，但只在本进程已经跑够 minHealthyUptime 之后。
+//
+// 保留这个名字是给启动最早期就调它的调用点用的：那个时点新版什么都还没自检过，
+// 直接删就等于「能跑的还没证明，能退的已经没了」。要「确认新版健康后立刻清」，
+// 用 CleanupOldAfterHealthy。
 func CleanupOld() {
-	self, err := os.Executable()
+	if time.Since(processStarted) < minHealthyUptime {
+		return
+	}
+	CleanupOldAfterHealthy()
+}
+
+// CleanupOldAfterHealthy 立刻删除上次更新留下的 .old，调用方负责确认新版已经能
+// 正常工作（比如已经连上隧道、界面起来了）。
+//
+// 那个 .old 是新版崩掉或被杀软隔离时唯一能退回上一版的副本，删早了节点机上就既
+// 没有能跑的也没有可回滚的。
+func CleanupOldAfterHealthy() {
+	self, err := executablePath()
 	if err != nil {
 		return
 	}

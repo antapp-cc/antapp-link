@@ -63,8 +63,9 @@ if [[ -f $CONF ]]; then
   log "检测到这台机器已经装过 AntApp Link。继续安装会："
   log "  · 把 antapp-linkd 更新到最新版"
   log "  · 重写 dnsmasq / sysctl / systemd 的配置文件"
-  log "  · 重新签发 /root/pinode.antapp —— 客户端证书换新，旧连接码立即作废，"
-  log "    正在用它的节点机会掉线，必须重新导入新连接码"
+  log "  · 重新签发 /root/pinode.antapp —— 换一张新的客户端证书"
+  log "    注意：不重建 CA，所以之前发出去的旧连接码依然有效；"
+  log "    真要作废泄漏出去的旧码只能重建 CA，那会让所有节点掉线并重新导入"
   log "  · 不会动 CA，也不会动 $CONF（端口/网段等设置保留）"
   log "什么都不做的话，现有安装保持原样。"
   if [[ $ASSUME_YES -eq 1 ]]; then
@@ -226,7 +227,6 @@ init_args=(-c "$CONF")
 [[ -n "$TUNNEL_PORT" ]]   && init_args+=(--listen "0.0.0.0:$TUNNEL_PORT")
 [[ -n "$NETWORK" ]]       && init_args+=(--network "$NETWORK")
 
-"$BIN" down -c "$CONF" >/dev/null 2>&1 || true
 "$BIN" init "${init_args[@]}"
 
 log "启用 BBR 加速"
@@ -282,6 +282,10 @@ systemctl enable dnsmasq >/dev/null 2>&1 || true
 systemctl restart dnsmasq >/dev/null 2>&1 || log "警告: dnsmasq 未启动，隧道 DNS 中继不可用"
 
 log "配置 netfilter（幂等）"
+# down 一执行规则就空缺，而它之前还有 init / BBR / 内核调优 / systemd 这些会 die
+# 的步骤：放在那里一旦失败，正在跑的 daemon 就失去整段转发规则，而
+# antapp-link-up.service 是 RemainAfterExit，systemd 不会自动重放，只能人工 restart。
+"$BIN" down -c "$CONF" >/dev/null 2>&1 || true
 "$BIN" up -c "$CONF"
 
 log "启动隧道"
@@ -299,7 +303,8 @@ cat <<EOF
 [antapp-link] --------------------------------------------------
 [antapp-link] 安装完成。连接码文件：/root/pinode.antapp（本次已重新签发）
 [antapp-link] 把它发给节点机双击导入即可（内含私钥，等同密码，注意保管）。
-[antapp-link] 本次客户端证书已换新，之前发出去的旧连接码作废，节点机必须重新导入。
+[antapp-link] 本次只换新了客户端证书；CA 未变，之前发出去的旧连接码依然有效。
+[antapp-link] 旧码泄漏过要真正作废，只能重建 CA —— 那会让所有节点掉线并重新导入。
 [antapp-link] 只想重启服务、不换连接码时别跑本脚本，直接: systemctl restart antapp-linkd
 [antapp-link] --------------------------------------------------
 EOF

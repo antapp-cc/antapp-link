@@ -76,29 +76,15 @@ type Checker struct {
 	HTTP    *http.Client
 }
 
-// updateSourcesEnv 可以覆盖内置更新源（分号分隔的 URL）。
+// 这里刻意不留「用环境变量覆盖更新源」的口子（曾经有过 ANTAPP_UPDATE_SOURCES）。
 //
-// 留这个口子是为了内网部署和本地联调：不然想验一次更新流程，就得先真发一个
-// GitHub Release 出来。
-const updateSourcesEnv = "ANTAPP_UPDATE_SOURCES"
-
+// 客户端 manifest 是 requireAdministrator，而 HKCU\Environment 是普通进程就能写的：
+// 任何能以该用户身份跑起来的进程都能让客户端以管理员权限去下载它指定的 URL、拿它
+// 自己算的 sha256 自校验、替换自身再拉起。环境变量对提权攻击者是零成本的入口，
+// 所以更新源只能由构建期定死。内网部署要换源，改 DefaultSources。
 func NewChecker(current string) *Checker {
-	sources := DefaultSources
-	if env := strings.TrimSpace(os.Getenv(updateSourcesEnv)); env != "" {
-		var custom []Source
-		for i, u := range strings.Split(env, ";") {
-			u = strings.TrimSpace(u)
-			if u == "" {
-				continue
-			}
-			custom = append(custom, Source{Name: fmt.Sprintf("env%d", i+1), Manifest: u})
-		}
-		if len(custom) > 0 {
-			sources = custom
-		}
-	}
 	return &Checker{
-		Sources: sources,
+		Sources: DefaultSources,
 		Current: current,
 		HTTP:    &http.Client{Timeout: 25 * time.Second},
 	}

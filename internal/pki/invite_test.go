@@ -1,6 +1,7 @@
 package pki
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -78,6 +79,81 @@ func TestInitRefusesHalfCA(t *testing.T) {
 	if string(before) != string(after) {
 		t.Error("报错的同时还是覆盖了 CA")
 	}
+}
+
+// 用户照 Init 的提示删掉 CA 两者重建时，旧 server.crt 必须跟着重签：
+// 只查文件在不在会把它当成有效证书继续用，服务端出示旧 CA 签的证书，
+// 而新连接码里带的是新 CA —— 全部节点在握手阶段掉线，Init 却报成功。
+func TestInitResignsServerCertAfterCAReplaced(t *testing.T) {
+	dir := mustInit(t)
+	oldCert := mustReadFile(t, filepath.Join(dir, srvCertFile))
+
+	for _, name := range []string{caCertFile, caKeyFile} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := Init(dir); err != nil {
+		t.Fatalf("重建 CA 后 Init: %v", err)
+	}
+
+	newCert := mustReadFile(t, filepath.Join(dir, srvCertFile))
+	if bytes.Equal(oldCert, newCert) {
+		t.Fatal("CA 换了但 server.crt 没重签")
+	}
+	caCert, srvCert := parseCertPEM(mustReadFile(t, filepath.Join(dir, caCertFile))), parseCertPEM(newCert)
+	if caCert == nil || srvCert == nil {
+		t.Fatal("证书无法解析")
+	}
+	if err := srvCert.CheckSignatureFrom(caCert); err != nil {
+		t.Errorf("重签后的服务端证书不是新 CA 签的: %v", err)
+	}
+	// 私钥也要跟着换，否则这里加载不出证书对
+	if _, err := ServerTLSConfig(dir); err != nil {
+		t.Errorf("ServerTLSConfig: %v", err)
+	}
+}
+
+// 私钥坏了（文件在，但读不出或与证书不配对）同样必须重签：
+// 服务端证书能不能用不能只看文件在不在。
+func TestInitResignsServerCertWhenKeyBroken(t *testing.T) {
+	dir := mustInit(t)
+	oldCert := mustReadFile(t, filepath.Join(dir, srvCertFile))
+	other := mustInit(t)
+	if err := os.WriteFile(filepath.Join(dir, srvKeyFile), mustReadFile(t, filepath.Join(other, srvKeyFile)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Init(dir); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if bytes.Equal(oldCert, mustReadFile(t, filepath.Join(dir, srvCertFile))) {
+		t.Error("私钥与证书不配对时必须重签")
+	}
+	if _, err := ServerTLSConfig(dir); err != nil {
+		t.Errorf("ServerTLSConfig: %v", err)
+	}
+}
+
+// CA 没变时不该重签服务端证书：每次重装都换一张是无谓的抖动。
+func TestInitKeepsServerCertWhenCAUnchanged(t *testing.T) {
+	dir := mustInit(t)
+	before := mustReadFile(t, filepath.Join(dir, srvCertFile))
+	if err := Init(dir); err != nil {
+		t.Fatalf("重复 Init: %v", err)
+	}
+	if after := mustReadFile(t, filepath.Join(dir, srvCertFile)); !bytes.Equal(before, after) {
+		t.Error("CA 未变却重签了服务端证书")
+	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func TestIssueProducesVerifiableClientCert(t *testing.T) {
@@ -174,6 +250,18 @@ func TestDecodeRejectsTampered(t *testing.T) {
 			t.Error("非 base64 必须解析失败")
 		}
 	})
+}
+
+// 超长输入必须在解码/反序列化之前就被拒：否则几百 MB 的粘贴会在解析阶段
+// 把内存放大数倍（base64 + JSON 副本），客户端直接 OOM。
+func TestDecodeRejectsOversizedInput(t *testing.T) {
+	_, err := Decode(Scheme + strings.Repeat("A", maxCodeLen+1))
+	if err == nil {
+		t.Fatal("超长输入必须被拒绝")
+	}
+	if !strings.Contains(err.Error(), "过长") {
+		t.Errorf("应在长度检查处就拒绝，实际错误: %v", err)
+	}
 }
 
 func TestValidateRejectsBadParams(t *testing.T) {

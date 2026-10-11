@@ -42,7 +42,7 @@ function Build-Target {
 
 # 服务端：Linux 单二进制，不依赖任何外部程序
 Build-Target -Goos 'linux' -Goarch 'amd64' -Out 'antapp-linkd' -Pkg './cmd/antapp-linkd' `
-    -Ldflags '-s -w'
+    -Ldflags "-s -w -X github.com/antapp-cc/antapp-link/internal/server.Version=$Version"
 
 # 客户端：GUI 子系统，双击不弹控制台黑框；wintun.dll 已内嵌
 Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-link.exe' -Pkg './cmd/antapp-link' `
