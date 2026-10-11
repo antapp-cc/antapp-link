@@ -56,8 +56,11 @@ func cmdUpdate(stdout, stderr io.Writer, args []string) int {
 	fmt.Fprintf(stdout, "发现新版本 %s（当前 %s）\n", m.Version, Version)
 
 	if m.Server == nil {
-		fmt.Fprintf(stderr, "清单里没有服务端资产（server 字段）—— 这个版本只发了客户端\n")
-		return 1
+		// 不算失败：这个版本只发了客户端（或清单还是旧版发布脚本生成的）。返回 0，
+		// 否则 oneshot unit 每小时被标一次 failed，把 systemctl 状态和 journal 搅浑，
+		// 真出问题时反而看不出来。
+		fmt.Fprintf(stdout, "清单里没有服务端资产（server 字段）—— 这个版本只发了客户端，跳过\n")
+		return 0
 	}
 	if *checkOnly {
 		fmt.Fprintf(stdout, "（--check：到此为止，不下载也不重启）\n")
