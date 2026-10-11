@@ -13,11 +13,13 @@ import (
 )
 
 const (
-	binaryPath = "/usr/local/bin/antapp-linkd"
-	daemonUnit = "/etc/systemd/system/antapp-linkd.service"
-	upUnit     = "/etc/systemd/system/antapp-link-up.service"
-	sysctlFile = "/etc/sysctl.d/99-antapp-link.conf"
-	dnsConf    = "/etc/dnsmasq.d/antapp.conf"
+	binaryPath  = "/usr/local/bin/antapp-linkd"
+	daemonUnit  = "/etc/systemd/system/antapp-linkd.service"
+	upUnit      = "/etc/systemd/system/antapp-link-up.service"
+	updateUnit  = "/etc/systemd/system/antapp-link-update.service"
+	updateTimer = "/etc/systemd/system/antapp-link-update.timer"
+	sysctlFile  = "/etc/sysctl.d/99-antapp-link.conf"
+	dnsConf     = "/etc/dnsmasq.d/antapp.conf"
 )
 
 // BBR + fq：Pi 节点上传流量占比高，换成 BBR 对丢包链路改善明显。
@@ -72,9 +74,14 @@ func Install(stdout, stderr io.Writer, args []string) int {
 		{"启用 dnsmasq DNS 中继", enableDNSRelay},
 		{"写 " + daemonUnit, func() error { return os.WriteFile(daemonUnit, []byte(daemonUnitContent(*cfgPath)), 0o644) }},
 		{"写 " + upUnit, func() error { return os.WriteFile(upUnit, []byte(upUnitContent(*cfgPath)), 0o644) }},
+		{"写 " + updateUnit, func() error { return os.WriteFile(updateUnit, []byte(updateUnitContent(*cfgPath)), 0o644) }},
+		{"写 " + updateTimer, func() error { return os.WriteFile(updateTimer, []byte(updateTimerContent()), 0o644) }},
 		{"systemctl daemon-reload", func() error { return runSystemctl("daemon-reload") }},
 		{"systemctl enable", func() error {
-			return runSystemctl("enable", "antapp-link-up.service", "antapp-linkd.service")
+			return runSystemctl("enable", "antapp-link-up.service", "antapp-linkd.service", "antapp-link-update.timer")
+		}},
+		{"systemctl start antapp-link-update.timer", func() error {
+			return runSystemctl("start", "antapp-link-update.timer")
 		}},
 	}
 	for _, s := range steps {
@@ -147,6 +154,39 @@ ExecStop=%s down -c %s
 [Install]
 WantedBy=multi-user.target
 `, binaryPath, cfgPath, binaryPath, cfgPath)
+}
+
+// updateUnitContent 是自动更新的一次性任务：跑一次 update，查到新版本就换掉自己并
+// 由 systemd 拉起新版。它由 timer 触发，不是常驻服务。
+func updateUnitContent(cfgPath string) string {
+	return fmt.Sprintf(`[Unit]
+Description=AntApp Link self-update (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%s update -c %s
+`, binaryPath, cfgPath)
+}
+
+// updateTimerContent 每小时检查一次更新。
+//
+// 刻意不做「只在凌晨动手」的时间窗口：发版频率本来就低，早一小时晚一小时没差别，
+// 而窗口反而会让「今天没更上」变成常态。Persistent=true 让错过的运行（机器关着、
+// 时间没对上）在开机后补跑。
+func updateTimerContent() string {
+	return `[Unit]
+Description=AntApp Link hourly update check
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+`
 }
 
 func runSystemctl(args ...string) error {

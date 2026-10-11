@@ -172,17 +172,26 @@ func (m *Manifest) Validate() error {
 	return nil
 }
 
-// Download 下载更新包、校验 sha256，返回落地路径。
+// Download 下载客户端更新包、校验 sha256，返回落地路径。
 //
 // 边下边算摘要：不用把文件读两遍，而且校验不过时直接删掉，
 // 不会留下一个「看起来能用」的半成品。
 func (c *Checker) Download(ctx context.Context, m *Manifest, dir string,
 	progress func(done, total int64)) (string, error) {
+	return c.DownloadAsset(ctx, m.Client, dir, "antapp-link.exe.new", progress)
+}
+
+// DownloadAsset 下载清单里的任意一个资产并校验 sha256。
+//
+// 服务端更新用它下 antapp-linkd —— 契约和客户端那条完全一样：边下边算摘要，
+// 校验不过就删掉半成品。name 是落地文件名，由调用方决定（两端的产物名不同）。
+func (c *Checker) DownloadAsset(ctx context.Context, a Asset, dir, name string,
+	progress func(done, total int64)) (string, error) {
 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.Client.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -197,7 +206,7 @@ func (c *Checker) Download(ctx context.Context, m *Manifest, dir string,
 		return "", fmt.Errorf("下载更新包: HTTP %d", resp.StatusCode)
 	}
 
-	target := filepath.Join(dir, "antapp-link.exe.new")
+	target := filepath.Join(dir, name)
 	f, err := os.Create(target)
 	if err != nil {
 		return "", err
@@ -213,7 +222,7 @@ func (c *Checker) Download(ctx context.Context, m *Manifest, dir string,
 
 	total := resp.ContentLength
 	if total <= 0 {
-		total = m.Client.Size
+		total = a.Size
 	}
 
 	digest := sha256.New()
@@ -246,9 +255,9 @@ func (c *Checker) Download(ctx context.Context, m *Manifest, dir string,
 	}
 
 	got := hex.EncodeToString(digest.Sum(nil))
-	if !strings.EqualFold(got, m.Client.SHA256) {
+	if !strings.EqualFold(got, a.SHA256) {
 		return "", fmt.Errorf("sha256 不匹配（清单 %s…，实际 %s…），更新包损坏或被替换过",
-			m.Client.SHA256[:12], got[:12])
+			a.SHA256[:12], got[:12])
 	}
 	ok = true
 	return target, nil

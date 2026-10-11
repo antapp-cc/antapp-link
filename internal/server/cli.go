@@ -45,6 +45,8 @@ func RunCLI(args []string, stdout, stderr io.Writer) int {
 		return Install(stdout, stderr, args[1:])
 	case "status":
 		return cmdStatus(stdout, stderr, args[1:])
+	case "update":
+		return cmdUpdate(stdout, stderr, args[1:])
 	case "version", "-v", "--version":
 		fmt.Fprintf(stdout, "antapp-linkd %s\n", Version)
 		return 0
@@ -71,6 +73,7 @@ func usage(w io.Writer) {
   down                  清理 netfilter 规则（需要 root）
   run                   前台运行隧道（systemd 调用）
   status                显示隧道与端口转发状态
+  update                检查更新并自动升级（--check 只检查；由 systemd timer 定时调用）
   version               显示版本
 
 通用选项:
