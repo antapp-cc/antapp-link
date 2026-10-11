@@ -237,24 +237,28 @@ func (u *UI) build() error {
 		name := files[0]
 		if u.adoptByName(name) {
 			u.app.Log().Info(fmt.Sprintf("已自动连接配置 %s", name))
-		} else {
-			go func() {
-				for attempt := 0; attempt < 6; attempt++ {
-					select {
-					case <-u.done:
-						return
-					case <-time.After(time.Duration(attempt+1) * 10 * time.Second):
-					}
-					if u.app.Status().Online {
-						return
-					}
-					u.app.Log().Info(fmt.Sprintf("开机网络未就绪，自动重试连接 %s（第 %d 次）……", name, attempt+1))
-					if u.adoptByName(name) {
-						return
-					}
-				}
-			}()
 		}
+		// 重试不能拿 adoptByName 的返回值当判据：它只表示「配置读到了、连接已发起」，
+		// 内部那条 Connect 跑在别的协程、错误被丢弃，返回值与是否真的连上没有关系。
+		// 早先只在它为 false 时才重试，于是「开机第一次 dial i/o timeout」就永久停在
+		// 未连接，只能人工点「重新连接」。这里无条件兜一层退避，直到 Connect 不报错。
+		go func() {
+			for attempt := 0; attempt < 8; attempt++ {
+				select {
+				case <-u.done:
+					return
+				case <-time.After(time.Duration(attempt+1) * 15 * time.Second):
+				}
+				if u.app.Status().Online {
+					return
+				}
+				u.app.Log().Info(fmt.Sprintf("还没连上，自动重试 %s（第 %d 次）……", name, attempt+1))
+				if err := u.app.Connect(); err == nil {
+					return
+				}
+			}
+			u.app.Log().Warn(fmt.Sprintf("自动重连 %s 多次仍未成功，请手动点「重新连接」", name))
+		}()
 	} else if len(files) > 1 {
 		u.app.Log().Info(fmt.Sprintf("config 里有 %d 个连接码文件：连接哪个请从托盘菜单选择", len(files)))
 	}

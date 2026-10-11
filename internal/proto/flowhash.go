@@ -46,6 +46,14 @@ func AppendHeader(dst []byte, t Type, n int) []byte {
 //   - 其他协议 → 以 (src, dst, protocol) 哈希。
 //
 // 哈希：FNV-1a 32 位；结果对 n-1 取模后加 1。
+//
+// 已知代价：纯哈希不感知负载，一条大流（比如节点机同步区块）会独占一个槽，把那条
+// 成员连接的写队列塞满，直到 slotWriteTimeout 超时被摘掉重拨；而小流所在的槽闲着。
+// 实测 4 条连接下出现过 1.4MB / 1.4MB / 58KB / 0 这样的分布。
+//
+// 要按负载调度，就得让帧头带上槽号（发送端可自由选槽、接收端按帧头路由），那是
+// 协议 v2 的事 —— 必须等旧客户端都升上来才能动，现在不能改这套「两端各自算出同一个
+// 结果」的哈希。
 func Slot(payload []byte, n int) int {
 	if n <= 1 || len(payload) < 20 || payload[0]>>4 != 4 {
 		return 0
