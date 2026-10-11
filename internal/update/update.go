@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -86,7 +87,22 @@ func NewChecker(current string) *Checker {
 	return &Checker{
 		Sources: DefaultSources,
 		Current: current,
-		HTTP:    &http.Client{Timeout: 25 * time.Second},
+		// 不用 Client.Timeout：它是整个请求（含读 body）的上限，25 秒对 11 MB 的安装包
+		// 太紧 —— 国内经隧道下 GitHub 附件实测下到 28% 就超时。改成分段设限：连接、
+		// TLS 握手、响应头各有上限，body 阶段交给调用方的 ctx（服务端那条是 10 分钟）。
+		HTTP: &http.Client{
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   20 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				TLSHandshakeTimeout:   20 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				IdleConnTimeout:       60 * time.Second,
+				ExpectContinueTimeout: 5 * time.Second,
+			},
+		},
 	}
 }
 
