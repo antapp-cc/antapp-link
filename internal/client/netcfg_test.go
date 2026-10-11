@@ -107,3 +107,25 @@ func TestLoadSnapshotTreatsCorruptFileAsExisting(t *testing.T) {
 		t.Errorf("损坏的快照应返回 exists=true 且带错误，实际 exists=%v err=%v", exists, err)
 	}
 }
+
+// 快照必须带上隧道网关与云服地址：自愈跑在连接码加载之前（那时 App 手里是零值
+// Invite），只有快照里存着这两个值。JSON 字段名写错不会报错，只会让自愈静默
+// 退化成「撤不掉 /1 接管路由」—— 用户表现为重启后依然断网，所以这里钉住往返。
+func TestSnapshotRoundTripKeepsTunnelInfo(t *testing.T) {
+	path := StatePath(t.TempDir())
+	want := newSnapshot("192.168.1.1", 12, "192.168.1.1", nil,
+		NetConfig{Gateway: "10.10.0.1", ServerIP: "103.143.11.34"})
+	if err := SaveSnapshot(path, want); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	got, exists, err := LoadSnapshot(path)
+	if err != nil || !exists {
+		t.Fatalf("LoadSnapshot: exists=%v err=%v", exists, err)
+	}
+	if got.TunnelGateway != "10.10.0.1" || got.ServerIP != "103.143.11.34" {
+		t.Errorf("往返后隧道信息丢失：gateway=%q server=%q", got.TunnelGateway, got.ServerIP)
+	}
+	if got.DefaultGateway != "192.168.1.1" || got.DefaultIfIndex != 12 {
+		t.Errorf("往返后默认出口信息丢失：gw=%q idx=%d", got.DefaultGateway, got.DefaultIfIndex)
+	}
+}

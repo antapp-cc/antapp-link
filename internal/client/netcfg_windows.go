@@ -91,8 +91,10 @@ func refreshSplitRoutesFor(gw string, ifIndex int, table []string) {
 // 只抓承载默认路由的那张网卡：其它网卡（拔掉的以太网、Hyper-V 虚拟网卡、
 // 没连的无线）改不了也不该改 —— netsh 时代在断开的网卡上设 DNS 会直接失败
 // 并中止整个接管流程；现在原生调用虽不会失败，但改它们依旧没有意义。
-func Capture(serverIP string) (Snapshot, error) {
-	srv, err := resolveIPv4(serverIP)
+//
+// cfg 同时提供云服地址（算绕行路由用）和隧道网关（要一并记进快照，供自愈用）。
+func Capture(cfg NetConfig) (Snapshot, error) {
+	srv, err := resolveIPv4(cfg.ServerIP)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -132,7 +134,7 @@ func Capture(serverIP string) (Snapshot, error) {
 	}
 
 	return newSnapshot(gw.Unmap().String(), int(gwIfIndex), serverNextHop,
-		[]IfaceDNS{{Name: def.Name, Index: int(def.Index), DNS: dnsStrings}}), nil
+		[]IfaceDNS{{Name: def.Name, Index: int(def.Index), DNS: dnsStrings}}, cfg), nil
 }
 
 // resolveIPv4 把 host:port 里拆出来的主机部分变成 IPv4 地址。
@@ -401,6 +403,33 @@ func (s Snapshot) Restore(cfg NetConfig) error {
 		}
 	}
 
+	// 隧道网关与云服地址优先取快照：自愈路径上 cfg 是零值（那时连接码还没加载），
+	// 只有快照里记着本次接管用的是什么。
+	tunnelGw := s.TunnelGateway
+	if tunnelGw == "" {
+		tunnelGw = cfg.Gateway
+	}
+	serverIP := s.ServerIP
+	if serverIP == "" {
+		serverIP = cfg.ServerIP
+	}
+
+	// 隧道网卡上的接管痕迹（/1 路由、隧道 DNS）不依赖快照，所以放在 haveDef 之外：
+	// 快照损坏时拿不到默认网卡索引，而这两样恰恰是「全部流量灌进一张没人读的
+	// 网卡」的元凶，必须无条件撤掉。
+	if tun, ok, _ := adapterByName(AdapterName); ok {
+		if gw, err := netip.ParseAddr(tunnelGw); err == nil {
+			_ = tun.LUID.DeleteRoute(netip.MustParsePrefix("0.0.0.0/1"), gw)
+			_ = tun.LUID.DeleteRoute(netip.MustParsePrefix("128.0.0.0/1"), gw)
+		} else {
+			// 连网关都拿不到（快照损坏，或来自还没记录它的旧版本）：按前缀整批扫，
+			// 隧道网卡上的 /1 只可能是我们铺的。
+			sweepTunnelHalfRoutes(tun.LUID)
+		}
+		// 它身上挂的隧道 DNS 也一并撤掉，别留一个指向死网关的解析器
+		_ = tun.LUID.FlushDNS(windows.AF_INET)
+	}
+
 	def, haveDef, err := adapterByIndex(uint32(s.DefaultIfIndex))
 	if err != nil {
 		fail(err)
@@ -415,33 +444,25 @@ func (s Snapshot) Restore(cfg NetConfig) error {
 
 		// 替旧版本擦屁股：早期版本改写过 0.0.0.0/0。只匹配下一跳等于隧道网关的，
 		// 不会误伤用户的默认路由。
-		if gw, err := netip.ParseAddr(cfg.Gateway); err == nil {
+		if gw, err := netip.ParseAddr(tunnelGw); err == nil {
 			_ = def.LUID.DeleteRoute(netip.MustParsePrefix("0.0.0.0/0"), gw)
 		}
 
 		// 绕行路由：快照里记着下一跳才加过它，按同样的下一跳精确删除。
-		if s.ServerNextHop != "" && cfg.ServerIP != "" {
-			if srv, err := netip.ParseAddr(cfg.ServerIP); err == nil {
+		if s.ServerNextHop != "" && serverIP != "" {
+			if srv, err := netip.ParseAddr(serverIP); err == nil {
 				if hop, err := netip.ParseAddr(s.ServerNextHop); err == nil {
 					_ = def.LUID.DeleteRoute(netip.PrefixFrom(srv, 32), hop)
 				}
 			}
 		}
 
-		// 隧道网卡还在（异常路径下没关干净）时兜底撤 /1 路由；正常断开时
-		// 适配器已随 dev.Close 消失，这些路由自动没了。
-		if tun, ok, _ := adapterByName(AdapterName); ok {
-			if gw, err := netip.ParseAddr(cfg.Gateway); err == nil {
-				_ = tun.LUID.DeleteRoute(netip.MustParsePrefix("0.0.0.0/1"), gw)
-				_ = tun.LUID.DeleteRoute(netip.MustParsePrefix("128.0.0.0/1"), gw)
-			}
-			// 它身上挂的隧道 DNS 也一并撤掉，别留一个指向死网关的解析器
-			_ = tun.LUID.FlushDNS(windows.AF_INET)
-		}
-
 		// 旧版「给所有网卡设 DNS」留下的隧道网关地址，逐网卡扫描清除。
 		// 只清 IPv4 的设置，v6 侧不受影响。
-		if gw, err := netip.ParseAddr(s.DefaultGateway); err == nil {
+		//
+		// 判据必须是**隧道网关**：用物理默认网关当判据会误清用户手工配置的 DNS
+		// （手工 DNS 常常正好填的是路由器地址，也就是原默认网关）。
+		if gw, err := netip.ParseAddr(tunnelGw); err == nil {
 			aas, err := adapters()
 			if err == nil {
 				for _, a := range aas {
