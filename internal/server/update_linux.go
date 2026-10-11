@@ -3,6 +3,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,9 +19,18 @@ import (
 // 备份不是可选项：新版启动即崩时，磁盘上那份跑不起来的就是唯一在场的版本，没有
 // .bak 就只能人工上传旧二进制救场。
 func applyUpdate(newBinary string, out io.Writer) error {
+	if os.Geteuid() != 0 {
+		return errors.New("需要 root：要替换二进制并重启 systemd 服务")
+	}
 	self, err := selfPath()
 	if err != nil {
 		return err
+	}
+	// 记下更新前那一份状态文件的时间戳：健康检查要靠它变化来确认新进程真的在写。
+	// 读不到（首次启动、文件被清）就留空，任何时间戳都算变化。
+	before := ""
+	if st, err := ReadStatus(); err == nil {
+		before = st.UpdatedAt
 	}
 	backup := self + ".bak"
 	if err := copyBinary(self, backup); err != nil {
@@ -36,7 +46,7 @@ func applyUpdate(newBinary string, out io.Writer) error {
 	if err := runSystemctl("restart", "antapp-linkd"); err != nil {
 		return rollback(self, backup, fmt.Errorf("重启失败: %w", err))
 	}
-	if err := waitHealthy(60 * time.Second); err != nil {
+	if err := waitHealthy(60*time.Second, before); err != nil {
 		return rollback(self, backup, err)
 	}
 	return nil
@@ -59,7 +69,7 @@ func rollback(self, backup string, cause error) error {
 // 光看 is-active 会误判：Restart=always 下启动即崩的进程在 activating 和
 // auto-restart 之间循环，systemd 照样能报 active。状态文件每 5 秒刷一次，
 // 它新鲜才说明真有个进程在跑隧道。
-func waitHealthy(timeout time.Duration) error {
+func waitHealthy(timeout time.Duration, before string) error {
 	deadline := time.Now().Add(timeout)
 	last := "（还没有一次检查完成）"
 	for time.Now().Before(deadline) {
@@ -71,6 +81,12 @@ func waitHealthy(timeout time.Duration) error {
 		st, err := ReadStatus()
 		if err != nil {
 			last = fmt.Sprintf("读状态文件失败: %v", err)
+			continue
+		}
+		// 必须等到时间戳变化：systemctl restart 只要几秒，而旧进程 5 秒前写的状态
+		// 文件在 20 秒窗口内照样算"新鲜"，只看新鲜度会把"新进程还没起来"当成健康。
+		if st.UpdatedAt == before {
+			last = "状态文件还是启动前那一份（新进程尚未写入）"
 			continue
 		}
 		if statusFresh(st) {

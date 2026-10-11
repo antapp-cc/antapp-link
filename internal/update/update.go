@@ -169,6 +169,19 @@ func (m *Manifest) Validate() error {
 	if _, err := hex.DecodeString(m.Client.SHA256); err != nil {
 		return fmt.Errorf("client.sha256 不是合法十六进制: %w", err)
 	}
+	// Server 段可选（老清单没有），但一旦出现就必须自洽：比摘要失败时日志要截取
+	// sha256 前 12 位，字段残缺会在那条错误路径上直接切片越界 panic。
+	if m.Server != nil {
+		if strings.TrimSpace(m.Server.URL) == "" {
+			return errors.New("清单的 server 段缺少 url")
+		}
+		if len(m.Server.SHA256) != 64 {
+			return fmt.Errorf("server.sha256 应该是 64 位十六进制，实际 %d 位", len(m.Server.SHA256))
+		}
+		if _, err := hex.DecodeString(m.Server.SHA256); err != nil {
+			return fmt.Errorf("server.sha256 不是合法十六进制: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -256,11 +269,20 @@ func (c *Checker) DownloadAsset(ctx context.Context, a Asset, dir, name string,
 
 	got := hex.EncodeToString(digest.Sum(nil))
 	if !strings.EqualFold(got, a.SHA256) {
-		return "", fmt.Errorf("sha256 不匹配（清单 %s…，实际 %s…），更新包损坏或被替换过",
-			a.SHA256[:12], got[:12])
+		return "", fmt.Errorf("sha256 不匹配（清单 %s，实际 %s…），更新包损坏或被替换过",
+			shortHash(a.SHA256), got[:12])
 	}
 	ok = true
 	return target, nil
+}
+
+// shortHash 截前 12 位给日志用。清单字段可能残缺（Validate 已经挡了一道，这里是最后
+// 一道），截断必须自己判长度 —— 否则这条报错路径本身就是个切片越界 panic。
+func shortHash(s string) string {
+	if len(s) <= 12 {
+		return s
+	}
+	return s[:12] + "…"
 }
 
 // CompareVersions 比较两个版本号，返回 -1 / 0 / 1。
