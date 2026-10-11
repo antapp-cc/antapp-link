@@ -205,7 +205,7 @@ func (s *Server) pumpTun(ctx context.Context) {
 		if sess == nil {
 			continue
 		}
-		k := proto.Slot(buf[:n], sess.membersN())
+		k := sess.flow.Slot(buf[:n], sess.membersN())
 
 		batch = proto.AppendHeader(batch[:0], proto.TypeIP, n)
 		batch = append(batch, buf[:n]...)
@@ -219,7 +219,7 @@ func (s *Server) pumpTun(ctx context.Context) {
 				s.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", m, "max", proto.MaxPayload)
 				break
 			}
-			kk := proto.Slot(buf[:m], sess.membersN())
+			kk := sess.flow.Slot(buf[:m], sess.membersN())
 			if kk != k {
 				if err := sess.flushBatch(k, batch); err != nil {
 					s.log.Debug("转发给客户端失败", connLogAttrs(err, nil, "client", sess.name)...)
@@ -542,6 +542,7 @@ func (s *Server) handleControl(ctx context.Context, tlsConn *tls.Conn, name stri
 		members:     approved,
 		closed:      make(chan struct{}),
 		connectedAt: time.Now(),
+		flow:        proto.NewFlowTable(),
 	}
 	sess.slots = make([]*slotConn, approved)
 	sess.slots[0] = &slotConn{conn: tlsConn}
@@ -700,6 +701,9 @@ type session struct {
 
 	mu    sync.Mutex
 	slots []*slotConn // slots[0] 恒为控制连接；成员槽位从 1 开始
+	// flow 决定下行包走哪个槽：已有流固定不变（保序），新流分给当前承载流数最少的槽。
+	// 纯哈希做不到均衡 —— 一条大流会把某条成员连接塞到写超时被摘掉，别的槽却闲着。
+	flow *proto.FlowTable
 }
 
 // slotConn 是逻辑会话里的一条物理连接。
