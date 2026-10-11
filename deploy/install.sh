@@ -226,7 +226,6 @@ init_args=(-c "$CONF")
 [[ -n "$TUNNEL_PORT" ]]   && init_args+=(--listen "0.0.0.0:$TUNNEL_PORT")
 [[ -n "$NETWORK" ]]       && init_args+=(--network "$NETWORK")
 
-"$BIN" down -c "$CONF" >/dev/null 2>&1 || true
 "$BIN" init "${init_args[@]}"
 
 log "启用 BBR 加速"
@@ -282,6 +281,10 @@ systemctl enable dnsmasq >/dev/null 2>&1 || true
 systemctl restart dnsmasq >/dev/null 2>&1 || log "警告: dnsmasq 未启动，隧道 DNS 中继不可用"
 
 log "配置 netfilter（幂等）"
+# down 必须紧邻 up：它一执行转发规则就整段空缺，而后面还有会 die 的步骤。
+# antapp-link-up.service 是 RemainAfterExit，systemd 不会自动重放，一旦中途失败
+# 只能人工 restart —— 正在跑的 daemon 会一直缺着整段转发规则。
+"$BIN" down -c "$CONF" >/dev/null 2>&1 || true
 "$BIN" up -c "$CONF"
 
 log "启动隧道"
@@ -299,7 +302,7 @@ cat <<EOF
 [antapp-link] --------------------------------------------------
 [antapp-link] 安装完成。连接码文件：/root/pinode.antapp（本次已重新签发）
 [antapp-link] 把它发给节点机双击导入即可（内含私钥，等同密码，注意保管）。
-[antapp-link] 本次客户端证书已换新，之前发出去的旧连接码作废，节点机必须重新导入。
+[antapp-link] 本次只换新了客户端证书；CA 未变，之前发出去的旧连接码依然有效。
 [antapp-link] 只想重启服务、不换连接码时别跑本脚本，直接: systemctl restart antapp-linkd
 [antapp-link] --------------------------------------------------
 EOF

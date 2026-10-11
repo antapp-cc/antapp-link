@@ -4,13 +4,14 @@
 #
 # 产出在 dist/release-<版本>/：
 #   antapp-link.exe        客户端更新包
-#   latest.json            更新清单（客户端按它判断版本、校验 sha256）
+#   antapp-linkd           服务端更新包（Linux amd64；服务端按 latest.json 自动升级）
+#   latest.json            更新清单（客户端和服务端都按它判断版本、校验 sha256）
 #   README.md
 #   上传指引.txt
 #
-# 然后到 GitHub 建一个 tag 为 v<版本> 的 Release，把前三个文件传上去。
+# 然后到 GitHub 建一个 tag 为 v<版本> 的 Release，把前四个文件传上去。
 #
-# ⚠ 资产名必须固定为 antapp-link.exe / latest.json —— 客户端访问的是
+# ⚠ 资产名必须固定为 antapp-link.exe / antapp-linkd / latest.json —— 两端访问的都是
 #   releases/latest/download/latest.json 这种固定链接，靠的就是文件名不变。
 
 [CmdletBinding()]
@@ -29,18 +30,24 @@ if ($LASTEXITCODE -ne 0) { throw '构建失败' }
 
 $exe = Join-Path $root 'dist\antapp-link.exe'
 if (-not (Test-Path $exe)) { throw "找不到 $exe" }
+$linkd = Join-Path $root 'dist\antapp-linkd'
+if (-not (Test-Path $linkd)) { throw "找不到 $linkd" }
 
 $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
 $size = (Get-Item $exe).Length
+$linkdHash = (Get-FileHash $linkd -Algorithm SHA256).Hash.ToLower()
+$linkdSize = (Get-Item $linkd).Length
 
 $out = Join-Path $root "dist\release-$Version"
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 New-Item -ItemType Directory -Force $out | Out-Null
 
 Copy-Item $exe (Join-Path $out 'antapp-link.exe') -Force
+Copy-Item $linkd (Join-Path $out 'antapp-linkd') -Force
 Copy-Item (Join-Path $root 'README.md') $out -Force
 
 # 更新清单。字段名要和 internal/update 里的结构体对齐。
+# server 段是服务端自动更新（antapp-linkd update）读的：没有它服务端会跳过这个版本。
 $tag = "v$Version"
 $manifest = [ordered]@{
     version      = $Version
@@ -50,6 +57,11 @@ $manifest = [ordered]@{
         url    = "https://github.com/$Repo/releases/download/$tag/antapp-link.exe"
         sha256 = $hash
         size   = $size
+    }
+    server       = [ordered]@{
+        url    = "https://github.com/$Repo/releases/download/$tag/antapp-linkd"
+        sha256 = $linkdHash
+        size   = $linkdSize
     }
 }
 
@@ -69,19 +81,24 @@ $guide = @"
   1. 到 https://github.com/$Repo/releases/new 新建 Release
   2. Tag 填：$tag      （必须和 latest.json 里的 url 一致）
   3. 标题随便写，比如：AntApp Link $Version
-  4. 把下面三个文件作为附件传上去（文件名不要改）：
+  4. 把下面四个文件作为附件传上去（文件名不要改）：
        antapp-link.exe
+       antapp-linkd
        latest.json
        README.md
-  5. 发布。客户端下次检查更新时会读到 latest.json，比对版本后自行下载。
+  5. 发布。客户端和服务端下次检查更新时会读到 latest.json，比对版本后各自下载。
 
 校验值
   antapp-link.exe  sha256 = $hash
   大小                     = $size 字节
+  antapp-linkd     sha256 = $linkdHash
+  大小                     = $linkdSize 字节
 
 注意
   * 一定要勾选 "Set as the latest release"，否则 releases/latest 还是指向旧版。
-  * 想撤回某个版本就把它标记成 pre-release，客户端不会取到。
+  * 想撤回某个版本就把它标记成 pre-release，两端都不会取到。
+  * 改了协议版本号（internal/proto 的 protoVersion）时，必须等客户端先更新到位再
+    更新服务端，否则老客户端会因为版本不符连不上新服务端。
   * 只上传本目录（$out）里的文件。dist 下还有别的同名文件（联调用的假程序），
     拿错了会让客户端「发现新版本但下载失败」—— 因为清单里的地址指向本机端口。
 "@
@@ -95,5 +112,6 @@ Get-ChildItem $out | Sort-Object Name | ForEach-Object {
 }
 Write-Host ''
 Write-Host "  client.sha256 = $hash"
+Write-Host "  server.sha256 = $linkdHash"
 Write-Host ''
 Write-Host "下一步：按 $out\上传指引.txt 传到 GitHub Release（tag $tag）。" -ForegroundColor Yellow

@@ -76,29 +76,15 @@ type Checker struct {
 	HTTP    *http.Client
 }
 
-// updateSourcesEnv 可以覆盖内置更新源（分号分隔的 URL）。
+// 这里刻意不留「用环境变量覆盖更新源」的口子（曾经有过 ANTAPP_UPDATE_SOURCES）。
 //
-// 留这个口子是为了内网部署和本地联调：不然想验一次更新流程，就得先真发一个
-// GitHub Release 出来。
-const updateSourcesEnv = "ANTAPP_UPDATE_SOURCES"
-
+// 客户端的 manifest 是 requireAdministrator，而 HKCU\Environment 是普通进程就能写的：
+// 任何能以该用户身份跑起来的进程都能让客户端以管理员权限去下载它指定的 URL、拿它
+// 自己算的 sha256 自校验、替换自身再拉起。环境变量对提权攻击者是零成本的入口，
+// 所以更新源只能由构建期定死。内网部署要换源，改 DefaultSources。
 func NewChecker(current string) *Checker {
-	sources := DefaultSources
-	if env := strings.TrimSpace(os.Getenv(updateSourcesEnv)); env != "" {
-		var custom []Source
-		for i, u := range strings.Split(env, ";") {
-			u = strings.TrimSpace(u)
-			if u == "" {
-				continue
-			}
-			custom = append(custom, Source{Name: fmt.Sprintf("env%d", i+1), Manifest: u})
-		}
-		if len(custom) > 0 {
-			sources = custom
-		}
-	}
 	return &Checker{
-		Sources: sources,
+		Sources: DefaultSources,
 		Current: current,
 		HTTP:    &http.Client{Timeout: 25 * time.Second},
 	}
@@ -169,20 +155,42 @@ func (m *Manifest) Validate() error {
 	if _, err := hex.DecodeString(m.Client.SHA256); err != nil {
 		return fmt.Errorf("client.sha256 不是合法十六进制: %w", err)
 	}
+	// Server 段可选（老清单没有），但一旦出现就必须自洽：比摘要失败时日志要截取
+	// sha256 前 12 位，字段残缺会在那条错误路径上直接切片越界 panic。
+	if m.Server != nil {
+		if strings.TrimSpace(m.Server.URL) == "" {
+			return errors.New("清单的 server 段缺少 url")
+		}
+		if len(m.Server.SHA256) != 64 {
+			return fmt.Errorf("server.sha256 应该是 64 位十六进制，实际 %d 位", len(m.Server.SHA256))
+		}
+		if _, err := hex.DecodeString(m.Server.SHA256); err != nil {
+			return fmt.Errorf("server.sha256 不是合法十六进制: %w", err)
+		}
+	}
 	return nil
 }
 
-// Download 下载更新包、校验 sha256，返回落地路径。
+// Download 下载客户端更新包、校验 sha256，返回落地路径。
 //
 // 边下边算摘要：不用把文件读两遍，而且校验不过时直接删掉，
 // 不会留下一个「看起来能用」的半成品。
 func (c *Checker) Download(ctx context.Context, m *Manifest, dir string,
 	progress func(done, total int64)) (string, error) {
+	return c.DownloadAsset(ctx, m.Client, dir, "antapp-link.exe.new", progress)
+}
+
+// DownloadAsset 下载清单里的任意一个资产并校验 sha256。
+//
+// 服务端更新用它下 antapp-linkd —— 契约和客户端那条完全一样：边下边算摘要，
+// 校验不过就删掉半成品。name 是落地文件名，由调用方决定（两端的产物名不同）。
+func (c *Checker) DownloadAsset(ctx context.Context, a Asset, dir, name string,
+	progress func(done, total int64)) (string, error) {
 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.Client.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -197,7 +205,7 @@ func (c *Checker) Download(ctx context.Context, m *Manifest, dir string,
 		return "", fmt.Errorf("下载更新包: HTTP %d", resp.StatusCode)
 	}
 
-	target := filepath.Join(dir, "antapp-link.exe.new")
+	target := filepath.Join(dir, name)
 	f, err := os.Create(target)
 	if err != nil {
 		return "", err
@@ -213,7 +221,7 @@ func (c *Checker) Download(ctx context.Context, m *Manifest, dir string,
 
 	total := resp.ContentLength
 	if total <= 0 {
-		total = m.Client.Size
+		total = a.Size
 	}
 
 	digest := sha256.New()
@@ -246,12 +254,21 @@ func (c *Checker) Download(ctx context.Context, m *Manifest, dir string,
 	}
 
 	got := hex.EncodeToString(digest.Sum(nil))
-	if !strings.EqualFold(got, m.Client.SHA256) {
-		return "", fmt.Errorf("sha256 不匹配（清单 %s…，实际 %s…），更新包损坏或被替换过",
-			m.Client.SHA256[:12], got[:12])
+	if !strings.EqualFold(got, a.SHA256) {
+		return "", fmt.Errorf("sha256 不匹配（清单 %s，实际 %s…），更新包损坏或被替换过",
+			shortHash(a.SHA256), got[:12])
 	}
 	ok = true
 	return target, nil
+}
+
+// shortHash 截前 12 位给日志用。清单字段可能残缺（Validate 已经挡了一道，这里是最后
+// 一道），截断必须自己判长度 —— 否则这条报错路径本身就是个切片越界 panic。
+func shortHash(s string) string {
+	if len(s) <= 12 {
+		return s
+	}
+	return s[:12] + "…"
 }
 
 // CompareVersions 比较两个版本号，返回 -1 / 0 / 1。

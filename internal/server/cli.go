@@ -19,10 +19,12 @@ import (
 	"github.com/antapp-cc/antapp-link/internal/pki"
 )
 
-const (
-	DefaultConfigPath = "/etc/antapp-link/server.json"
-	Version           = "0.1.0"
-)
+const DefaultConfigPath = "/etc/antapp-link/server.json"
+
+// Version 是 var 而不是 const：发布构建用 -ldflags -X 注入版本号，而 const 无法在
+// 链接期覆盖 —— 更糟的是 -X 指向 const 时既不报错也不生效，服务端会永远自认 0.1.0，
+// 于是自动更新每小时都判定「有新版本」、下载替换重启一遍，节点机跟着每小时断一次。
+var Version = "0.1.0"
 
 // RunCLI 是 antapp-linkd 的入口，返回进程退出码。
 func RunCLI(args []string, stdout, stderr io.Writer) int {
@@ -45,6 +47,8 @@ func RunCLI(args []string, stdout, stderr io.Writer) int {
 		return Install(stdout, stderr, args[1:])
 	case "status":
 		return cmdStatus(stdout, stderr, args[1:])
+	case "update":
+		return cmdUpdate(stdout, stderr, args[1:])
 	case "version", "-v", "--version":
 		fmt.Fprintf(stdout, "antapp-linkd %s\n", Version)
 		return 0
@@ -71,6 +75,7 @@ func usage(w io.Writer) {
   down                  清理 netfilter 规则（需要 root）
   run                   前台运行隧道（systemd 调用）
   status                显示隧道与端口转发状态
+  update                检查更新并自动升级（--check 只检查；由 systemd timer 定时调用）
   version               显示版本
 
 通用选项:
@@ -412,5 +417,8 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 	fmt.Fprintf(stdout, "\n端口转发（服务端应答，经隧道转给节点机）:\n")
 	fmt.Fprintf(stdout, "  %d-%d/TCP → %s（同端口）\n",
 		cfg.ForwardPorts.Start, cfg.ForwardPorts.End, cfg.Tunnel.ClientIP)
+	// 「端口在监听」不等于「转发能用」：节点机没接入时转发器会立刻关掉外部连接，
+	// 而不是让它挂到拨号超时。不写这一句，运维看到端口开着会以为转发是好的。
+	fmt.Fprintln(stdout, "  注意：节点机未接入时，外部连接会被立即关闭（不挂超时）")
 	return 0
 }
