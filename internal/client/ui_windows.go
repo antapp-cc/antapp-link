@@ -243,16 +243,25 @@ func (u *UI) build() error {
 		// 早先只在它为 false 时才重试，于是「开机第一次 dial i/o timeout」就永久停在
 		// 未连接，只能人工点「重新连接」。这里无条件兜一层退避，直到 Connect 不报错。
 		go func() {
-			for attempt := 0; attempt < 8; attempt++ {
+			for attempt := 0; attempt < 8; {
 				select {
 				case <-u.done:
 					return
 				case <-time.After(time.Duration(attempt+1) * 15 * time.Second):
 				}
-				if u.app.Status().Online {
+				st := u.app.Status()
+				if st.Online {
 					return
 				}
-				u.app.Log().Info(fmt.Sprintf("还没连上，自动重试 %s（第 %d 次）……", name, attempt+1))
+				// 上一次连接或断开还没结束。这不是一次失败：Connect() 会立刻返回
+				// 「正在连接/正在断开，请稍候」，日志看着像在重试、实际什么都没做，
+				// 还白扣一次机会。等它结束再来，本次不计入次数（所以 attempt 不自增）。
+				if st.Connecting || st.Disconnecting {
+					u.app.Log().Info("上一次连接或断开还没结束，稍后再试")
+					continue
+				}
+				attempt++
+				u.app.Log().Info(fmt.Sprintf("还没连上，自动重试 %s（第 %d 次）……", name, attempt))
 				if err := u.app.Connect(); err == nil {
 					return
 				}
