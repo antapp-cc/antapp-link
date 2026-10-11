@@ -16,4 +16,4 @@ func applyUpdate(string, io.Writer) error {
 func updateSupported() bool { return false }
 
 // 非 Linux 走不到加锁那步（updateSupported 已经拦住），给个空实现即可。
-func tryUpdateLock() (func(), bool) { return func() {}, true }
+func tryUpdateLock() (func(), bool, error) { return func() {}, true, nil }

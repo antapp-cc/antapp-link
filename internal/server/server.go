@@ -103,7 +103,11 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	// tunnelUp 传进去：节点机不在线时转发器直接关连接，不去拨一个没人接的地址
 	stopRelay, err := startPortRelay(ctx, cfg, logger, func() bool { return s.currentSession() != nil })
 	if err != nil {
-		logger.Warn("端口转发监听启动失败", connLogAttrs(err, nil, "listen", cfg.Listen)...)
+		// 不走 connLogAttrs：它把 "address already in use" 翻成人话后会把原始 err
+		// 吞掉，而这里的 err 带着失败的转发端口号，正是排障要看的东西。listen 字段
+		// 要填转发端口段，别填隧道 TLS 端口。
+		logger.Warn("端口转发监听启动失败，外部流量进不了隧道", "err", err,
+			"forward_ports", fmt.Sprintf("%d-%d", cfg.ForwardPorts.Start, cfg.ForwardPorts.End))
 	} else {
 		defer stopRelay()
 	}
@@ -131,6 +135,11 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 
 	select {
 	case err := <-s.fatal:
+		// 与 ctx 取消同时发生时按正常停止处理：pumpTun 投递前判了 ctx.Err()，但两个
+		// case 同时就绪时 select 是随机选的，不判这一下会把正常关闭报成非 0 退出。
+		if ctx.Err() != nil {
+			return nil
+		}
 		// 搬运停了、进程却"健康"时 systemd 不会重启，运维只会看到字节不涨；明确退出，
 		// 让 systemd 拉起一个干净的进程（也顺带结束"往没人读的网卡拨号"那种空转）
 		return err
@@ -166,6 +175,13 @@ func (s *Server) pumpTun(ctx context.Context) {
 		if n <= 0 {
 			continue
 		}
+		if n > proto.MaxPayload {
+			// 帧头装不下：AppendHeader 在超限时什么都不追加，而下面照样把包塞进批里，
+			// 对端会把裸 IP 数据当帧头解析、整条流从此错位。当前 MTU 被配置锁在
+			// 576–1500、读不到这么大的包，这是给将来放宽 MTU 兜的底。
+			s.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", n, "max", proto.MaxPayload)
+			continue
+		}
 		sess := s.currentSession()
 		if sess == nil {
 			continue
@@ -178,6 +194,10 @@ func (s *Server) pumpTun(ctx context.Context) {
 		for len(batch) < proto.MaxBatchBytes-proto.HeaderSize-proto.MaxPayload {
 			m, rerr := s.tun.TryRead(buf)
 			if rerr != nil || m <= 0 {
+				break
+			}
+			if m > proto.MaxPayload {
+				s.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", m, "max", proto.MaxPayload)
 				break
 			}
 			kk := proto.Slot(buf[:m], sess.membersN())

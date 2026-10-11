@@ -1,9 +1,16 @@
 package update
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 )
+
+// ErrNotApplied 表示替换还没落到目标文件上就失败了：磁盘上仍是原来那个程序。
+// 服务端 update 据此判断「不需要回滚，也不该把这一版记成失败永久跳过」。
+//
+// installBinary 的每条失败路径都在 rename 之前，所以它天然满足这个语义。
+var ErrNotApplied = errors.New("update: 未改动目标文件")
 
 // installBinary 把 newBinary 装到 self 的位置：先写同目录的临时文件，再 rename 覆盖。
 //

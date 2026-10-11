@@ -18,10 +18,12 @@ import (
 func Apply(newBinary string) error {
 	self, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("取当前程序路径: %w", err)
+		return fmt.Errorf("%w: 取当前程序路径: %v", ErrNotApplied, err)
 	}
 	if err := installBinary(self, newBinary); err != nil {
-		return fmt.Errorf("替换 %s 失败: %w", self, err)
+		// installBinary 的失败都在 rename 之前，目标文件没动过 —— 带上 ErrNotApplied，
+		// 让调用方别把这一版锁掉
+		return fmt.Errorf("%w: 替换 %s 失败: %v", ErrNotApplied, self, err)
 	}
 	return nil
 }
