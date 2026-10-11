@@ -57,8 +57,13 @@ func ImportInviteBytes(root, name string, raw []byte) (string, error) {
 		return "", err
 	}
 	dst := filepath.Join(ConfigDir(root), name)
-	// 内含私钥，权限收紧
-	if err := os.WriteFile(dst, raw, 0o600); err != nil {
+	// 内含私钥，权限收紧。先写 tmp 再改名：同名覆盖时若掉电或磁盘满，
+	// 只会留下半截 tmp，不会把原本能用的连接码截断 —— 那是客户端唯一的连接信息载体。
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
 		return "", err
 	}
 	return name, nil
