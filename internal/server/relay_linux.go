@@ -18,7 +18,11 @@ import (
 // 在本机监听并立即应答：外部连接的握手在云服完成，延迟只算到云服为止；
 // 之后连接经隧道转给节点机。代价：节点机看到的连接来源是服务端隧道地址
 // （10.10.0.1）。节点机离线 / 对应端口无服务时，拨号失败、连接立即关闭。
-func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger) (func(), error) {
+//
+// tunnelUp 报告隧道链路是否还在。节点机不在线时不拨号：拨号的目标地址在 tun 上，
+// 没人读网卡就是空转 SYN 重传，外部连接还要挂在云服等满拨号超时（实测节点机离线
+// 期间云服堆着 84 条 SYN-SENT、每秒几十个白跑的包）。
+func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp func() bool) (func(), error) {
 	var (
 		listeners []net.Listener
 		mu        sync.Mutex
@@ -56,6 +60,11 @@ func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger) (func(), 
 				conn, err := ln.Accept()
 				if err != nil {
 					return // 监听已关闭
+				}
+				if tunnelUp != nil && !tunnelUp() {
+					// 隧道不可用就别拨号：外部立刻拿到连接关闭，不必挂到超时
+					_ = conn.Close()
+					continue
 				}
 				target := net.JoinHostPort(clientAddr, fmt.Sprint(port))
 				go handleRelayConn(conn, target, log)

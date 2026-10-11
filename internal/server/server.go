@@ -94,7 +94,8 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 
 	// 端口转发：本机应答式转发器（握手在云服完成，延迟只算到云服为止；
 	// 连接再经隧道转给节点机）。
-	stopRelay, err := startPortRelay(ctx, cfg, logger)
+	// tunnelUp 传进去：节点机不在线时转发器直接关连接，不去拨一个没人接的地址
+	stopRelay, err := startPortRelay(ctx, cfg, logger, func() bool { return s.currentSession() != nil })
 	if err != nil {
 		logger.Warn("端口转发监听启动失败", connLogAttrs(err, nil, "listen", cfg.Listen)...)
 	} else {
