@@ -243,10 +243,15 @@ func (u *UI) build() error {
 		if u.adoptByName(name) {
 			u.app.Log().Info(fmt.Sprintf("已自动连接配置 %s", name))
 		}
-		go u.keepConnected(name)
 	} else if len(files) > 1 {
 		u.app.Log().Info(fmt.Sprintf("config 里有 %d 个连接码文件：连接哪个请从托盘菜单选择", len(files)))
 	}
+
+	// 自动重连守护必须常驻，与此刻有几个配置文件无关：它每轮都看 wantConnected，
+	// 没配置或用户主动断开时什么都不做。早先只在「恰好一个文件」时启动，于是
+	// 「先导入连接码再连」或「多个文件里挑一个连」的用户，一旦遇到出网自检失败
+	// （那会主动 Disconnect，Running 归 false）就再也没人重连了。
+	go u.keepConnected()
 
 	go u.refreshLoop()
 	go u.autoCheckUpdate()
@@ -790,7 +795,7 @@ func (u *UI) onReconnect() {
 // 为止，那之后就再也没人重连 —— 表现就是「触发过重连，却没有任何动作、一直不连接」。
 //
 // 用户点「断开连接」会把 wantConnected 置 false，这里随即收手。
-func (u *UI) keepConnected(name string) {
+func (u *UI) keepConnected() {
 	delay := 30 * time.Second
 	for {
 		select {
@@ -811,7 +816,7 @@ func (u *UI) keepConnected(name string) {
 		if st.Connecting || st.Disconnecting {
 			continue
 		}
-		u.app.Log().Info(fmt.Sprintf("隧道不在线，自动重连 %s……", name))
+		u.app.Log().Info(fmt.Sprintf("隧道不在线，自动重连 %s……", u.app.CurrentSource()))
 		if err := u.app.Connect(); err != nil {
 			// 连不上就退避，最多 5 分钟一次；连上后由上面的 Online 分支清零
 			if delay < 5*time.Minute {
