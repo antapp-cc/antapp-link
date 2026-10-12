@@ -569,10 +569,6 @@ func (u *UI) pickConfig(currentSource string, names []string) (string, bool) {
 func (u *UI) refresh() {
 	st := u.app.Status()
 	configured := u.app.Configured()
-	// 有连接码文件、但还没选定（多文件时按设计不自动连）—— 这和「一个都没有、需要导入」
-	// 是两回事。界面不分开表达的话，用户看到「未配置连接码」就会去点「导入连接码」，
-	// 而其实他只需要从已有的那几个里挑一个。
-	inviteFiles := ListInviteFiles(u.app.RootDir())
 
 	// 操作进行中的渲染优先：按钮和状态行立刻给出过渡态，
 	// 绝不能让用户对着一个没变化的界面猜程序死活。
@@ -586,8 +582,6 @@ func (u *UI) refresh() {
 
 	var state string
 	switch {
-	case !configured && len(inviteFiles) > 0:
-		state = fmt.Sprintf("当前状态: 请选择配置文件（%d 个）", len(inviteFiles))
 	case !configured:
 		state = "当前状态: 未配置连接码"
 	case busyOp == "disconnect":
@@ -652,9 +646,6 @@ func (u *UI) refresh() {
 	case busyOp == "porttest":
 		u.btnPrimary.SetText("断开连接")
 		u.btnPrimary.SetEnabled(false)
-	case !configured && len(inviteFiles) > 0:
-		u.btnPrimary.SetText("选择配置文件")
-		u.btnPrimary.SetEnabled(true)
 	case !configured:
 		// 放在 autoRetry 之前：坏连接码会让 configured=false 而 wantConnected=true
 		// （启动时置的），那种情况要显示「导入连接码」让人能重新导入
@@ -695,8 +686,6 @@ func (u *UI) refresh() {
 			u.ni.SetToolTip("AntApp Link · 正在断开…")
 		case busyOp != "" || st.Connecting || (st.Running && !st.Online):
 			u.ni.SetToolTip("AntApp Link · 连接中…")
-		case !configured && len(inviteFiles) > 0:
-			u.ni.SetToolTip("AntApp Link · 请选择配置文件")
 		case !configured:
 			u.ni.SetToolTip("AntApp Link · 未配置连接码")
 		case !st.Running:
@@ -754,16 +743,13 @@ func (u *UI) onPrimary() {
 		return
 	}
 	if !u.app.Configured() {
-		switch files := ListInviteFiles(u.app.RootDir()); {
-		case len(files) == 1:
+		if files := ListInviteFiles(u.app.RootDir()); len(files) == 1 {
 			if u.adoptByName(files[0]) {
 				u.app.Log().Info(fmt.Sprintf("已选用配置 %s", files[0]))
 			}
-		case len(files) > 1:
-			u.onPickConfig(files)
-		default:
-			u.onImport()
+			return
 		}
+		u.onImport()
 		return
 	}
 	op := "connect"
@@ -1269,64 +1255,6 @@ func (u *UI) onImport() {
 				walk.MsgBoxIconInformation)
 		})
 	}()
-}
-
-// onPickConfig 弹出配置列表让用户挑一个。
-//
-// 多文件时按设计不自动连（客户端不记上次连的是哪个），托盘菜单能选，但主界面只写
-// 「导入连接码」会把人往错误方向引 —— 已经有连接码的人不需要再导入一次。
-func (u *UI) onPickConfig(files []string) {
-	var dlg *walk.Dialog
-	var lb *walk.ListBox
-	if err := (Dialog{
-		AssignTo: &dlg,
-		Title:    "选择配置文件",
-		Icon:     u.icon,
-		Size:     Size{Width: 420, Height: 320},
-		MinSize:  Size{Width: 360, Height: 260},
-		Layout:   VBox{Margins: Margins{Left: 16, Top: 16, Right: 16, Bottom: 16}, Spacing: 10},
-		Children: []Widget{
-			Label{Text: fmt.Sprintf("config 里有 %d 个连接码，选一个连接：", len(files))},
-			ListBox{
-				AssignTo:        &lb,
-				Model:           files,
-				OnItemActivated: func() { dlg.Accept() },
-			},
-			Composite{
-				Layout: HBox{MarginsZero: true, Spacing: 8},
-				Children: []Widget{
-					HSpacer{},
-					PushButton{
-						Text: "连接", MinSize: Size{Width: 90}, MaxSize: Size{Width: 90},
-						OnClicked: func() {
-							if lb.CurrentIndex() < 0 {
-								return // 没选中就别关窗口
-							}
-							dlg.Accept()
-						},
-					},
-					PushButton{
-						Text: "取消", MinSize: Size{Width: 80}, MaxSize: Size{Width: 80},
-						OnClicked: func() { dlg.Cancel() },
-					},
-				},
-			},
-		},
-	}).Create(u.mw); err != nil {
-		u.alert("打开选择窗口失败", err.Error())
-		return
-	}
-	lb.SetCurrentIndex(0) // 默认选中第一个，回车即可连接
-	if dlg.Run() != walk.DlgCmdOK {
-		return
-	}
-	idx := lb.CurrentIndex()
-	if idx < 0 || idx >= len(files) {
-		return
-	}
-	if u.adoptByName(files[idx]) {
-		u.app.Log().Info(fmt.Sprintf("已选用配置 %s", files[idx]))
-	}
 }
 
 // askImportSource 问连接码从哪来。ok=false 表示用户取消。
