@@ -42,9 +42,13 @@ func NewFlowTable() *FlowTable {
 
 // Slot 返回该包应走的槽位（1..n-1）。
 //
-// 已有映射直接复用；新流分给当前承载流数最少的槽 —— 比单纯轮询更能适应成员增减，
-// 代价是 O(表大小)，而只有新流会走到这里。
-func (t *FlowTable) Slot(payload []byte, n int) int {
+// 已有映射直接复用；新流分给「活着且承载流数最少」的槽。alive 报告某槽此刻是否真的
+// 可用（成员连接在、能写），传 nil 视为全部可用。
+//
+// alive 不能省：把新流分给一个已经断开的空槽，那条流的下行会被 flushBatch 整批丢掉
+// （槽空即丢，这是为了让数据不倒进心跳通道），表现为「部分新连接完全不通」，而且流表
+// 不会自我纠正 —— 只要那条流还在，它就一直往死槽发。
+func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 	if n <= 1 {
 		return 0
 	}
@@ -83,11 +87,18 @@ func (t *FlowTable) Slot(payload []byte, n int) int {
 			counts[s]++
 		}
 	}
-	best := 1
-	for i := 2; i < n; i++ {
-		if counts[i] < counts[best] {
+	best := 0
+	for i := 1; i < n; i++ {
+		if alive != nil && !alive(i) {
+			continue
+		}
+		if best == 0 || counts[i] < counts[best] {
 			best = i
 		}
+	}
+	if best == 0 {
+		// 一个活槽都没有（成员全断了）。退回纯哈希，别把这条流钉死在某个空槽上。
+		return Slot(payload, n)
 	}
 	t.m[key] = best
 	return best

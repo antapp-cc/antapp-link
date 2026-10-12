@@ -113,10 +113,10 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	defer cancel()
 
 	go s.pumpTun(runCtx)
-	go s.reportStatus(runCtx)
 
-	// 端口转发：本机应答式转发器（握手在云服完成，延迟只算到云服为止；
-	// 连接再经隧道转给节点机）。
+	// 端口转发必须先于 reportStatus 就位：reportStatus 第一轮就会写状态文件，那时
+	// relay 若还是 nil，ForwardKnown 就是 false —— status 子命令会把这当成「状态文件
+	// 来自旧版本」，而其实只是刚启动。
 	// tunnelUp 传进去：节点机不在线时转发器直接关连接，不去拨一个没人接的地址
 	stopRelay, err := startPortRelay(runCtx, cfg, logger, func() bool { return s.currentSession() != nil })
 	if err != nil {
@@ -130,6 +130,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		s.relay.Store(&relayState{ready: true})
 		defer stopRelay()
 	}
+	go s.reportStatus(runCtx)
 	go func() {
 		<-runCtx.Done()
 		_ = ln.Close()
@@ -205,7 +206,7 @@ func (s *Server) pumpTun(ctx context.Context) {
 		if sess == nil {
 			continue
 		}
-		k := sess.flow.Slot(buf[:n], sess.membersN())
+		k := sess.flow.Slot(buf[:n], sess.membersN(), sess.slotAlive)
 
 		batch = proto.AppendHeader(batch[:0], proto.TypeIP, n)
 		batch = append(batch, buf[:n]...)
@@ -219,7 +220,7 @@ func (s *Server) pumpTun(ctx context.Context) {
 				s.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", m, "max", proto.MaxPayload)
 				break
 			}
-			kk := sess.flow.Slot(buf[:m], sess.membersN())
+			kk := sess.flow.Slot(buf[:m], sess.membersN(), sess.slotAlive)
 			if kk != k {
 				if err := sess.flushBatch(k, batch); err != nil {
 					s.log.Debug("转发给客户端失败", connLogAttrs(err, nil, "client", sess.name)...)
@@ -633,7 +634,10 @@ func (s *Server) attach(sess *session) {
 
 	if old != nil {
 		s.log.Info("新连接取代旧连接", "new", sess.name, "old", old.name)
-		_ = old.write(proto.TypeBye, []byte("已被新的连接取代"))
+		// BYE 丢到后台尽力发，主线程立刻 close：write 受 20 秒写超时约束，旧控制连接
+		// 写缓冲满时会把「新会话接管」拖住最长 20 秒。close 会让那次 write 立即失败，
+		// 所以实际语义是「能发就发，发不出去拉倒」—— 旧客户端看不到原因也会自己重连。
+		go func() { _ = old.write(proto.TypeBye, []byte("已被新的连接取代")) }()
 		old.close()
 	}
 }
@@ -776,6 +780,12 @@ func (s *session) slotEntry(k int) *slotConn {
 		return nil
 	}
 	return s.slots[k]
+}
+
+// slotAlive 报告槽位 k 此刻是否真的可用。FlowTable 靠它避开已断开的空槽 —— 分给空槽
+// 的新流下行会被 flushBatch 整批丢掉，那条流就再也不通了，而且流表不会自我纠正。
+func (s *session) slotAlive(k int) bool {
+	return s.slotEntry(k) != nil
 }
 
 // slotStats 快照各槽的收发字节（status 展示用）。

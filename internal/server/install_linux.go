@@ -217,12 +217,19 @@ cache-size=1000
 `, cfg.Tunnel.ServerIP)
 }
 
-// enableDNSRelay 启动并自启 dnsmasq。包不存在时不报错（install.sh 负责
-// 安装；个别精简系统有自己的 DNS 方案），只打印提示。
+// enableDNSRelay 启动并自启 dnsmasq，然后无条件 restart。
+//
+// restart 不能省：Debian/Ubuntu 上 apt install dnsmasq 会立即自启，那时 antapp.conf
+// 还没写进去；而 start 对已 active 的 unit 是 no-op、不会重载配置。于是新写的
+// listen-address + filter-AAAA 不生效，install 却报成功 —— 浏览器随后会拿到 AAAA
+// 绕开隧道直连（实测内嵌页面白屏）。deploy/install.sh 早就补了这一步，Go 侧漏了。
 func enableDNSRelay() error {
 	if _, err := exec.LookPath("dnsmasq"); err != nil {
 		fmt.Println("提示: 未安装 dnsmasq，隧道 DNS 中继未启用（deploy/install.sh 会自动安装）")
 		return nil
 	}
-	return runSystemctl("enable", "--now", "dnsmasq")
+	if err := runSystemctl("enable", "dnsmasq"); err != nil {
+		return err
+	}
+	return runSystemctl("restart", "dnsmasq")
 }

@@ -476,6 +476,14 @@ func (s *clientSession) writeSlotData(k int) (int, net.Conn, *sync.Mutex) {
 	return k, s.slots[k], &s.writes[k]
 }
 
+// slotAlive 报告槽位 k 此刻是否有连接。FlowTable 靠它避开空槽 —— 分给空槽的新流下行
+// 会被 flushBatch 整批丢掉，那条流就再也不通了，而且流表不会自我纠正。
+func (s *clientSession) slotAlive(k int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return k > 0 && k < len(s.slots) && s.slots[k] != nil
+}
+
 // write 串行化对控制连接的写：搬包和心跳来自不同 goroutine。
 func (s *clientSession) write(t proto.Type, payload []byte) error {
 	_, conn, mu := s.writeSlot(0)
@@ -841,7 +849,7 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 			continue
 		}
 		pktLen := n
-		k := s.flow.Slot(buf[:n], s.members)
+		k := s.flow.Slot(buf[:n], s.members, s.slotAlive)
 		s.trace.Record("tx", k, buf[:pktLen])
 		s.stats.TxBytes.Add(uint64(pktLen))
 
@@ -858,7 +866,7 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 				s.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", m, "max", proto.MaxPayload)
 				break
 			}
-			kk := s.flow.Slot(buf[:m], s.members)
+			kk := s.flow.Slot(buf[:m], s.members, s.slotAlive)
 			s.trace.Record("tx", kk, buf[:m])
 			if kk != k {
 				// 不同槽的包放回没有手段（Device 是单读接口），直接单发处理完再收
