@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/lxn/walk"
@@ -73,6 +74,9 @@ type UI struct {
 	hideAt        time.Time
 	logSeq        uint64
 	done          chan struct{}
+	// wantConnected 记录用户是否期望连接。点「断开连接」后置 false，自动重连守护据此
+	// 收手 —— 否则修好「连上又掉没人管」之后会变成「用户点了断开它又自己连回来」。
+	wantConnected atomic.Bool
 	pending       *update.Manifest
 
 	// adoptBusy 防止切换配置的弹窗重入。
@@ -235,39 +239,11 @@ func (u *UI) build() error {
 	// 失败后自动退避重试，而不是把「开机自动连」变成「开机必然失败」。
 	if files := ListInviteFiles(u.app.RootDir()); len(files) == 1 {
 		name := files[0]
+		u.wantConnected.Store(true)
 		if u.adoptByName(name) {
 			u.app.Log().Info(fmt.Sprintf("已自动连接配置 %s", name))
 		}
-		// 重试不能拿 adoptByName 的返回值当判据：它只表示「配置读到了、连接已发起」，
-		// 内部那条 Connect 跑在别的协程、错误被丢弃，返回值与是否真的连上没有关系。
-		// 早先只在它为 false 时才重试，于是「开机第一次 dial i/o timeout」就永久停在
-		// 未连接，只能人工点「重新连接」。这里无条件兜一层退避，直到 Connect 不报错。
-		go func() {
-			for attempt := 0; attempt < 8; {
-				select {
-				case <-u.done:
-					return
-				case <-time.After(time.Duration(attempt+1) * 15 * time.Second):
-				}
-				st := u.app.Status()
-				if st.Online {
-					return
-				}
-				// 上一次连接或断开还没结束。这不是一次失败：Connect() 会立刻返回
-				// 「正在连接/正在断开，请稍候」，日志看着像在重试、实际什么都没做，
-				// 还白扣一次机会。等它结束再来，本次不计入次数（所以 attempt 不自增）。
-				if st.Connecting || st.Disconnecting {
-					u.app.Log().Info("上一次连接或断开还没结束，稍后再试")
-					continue
-				}
-				attempt++
-				u.app.Log().Info(fmt.Sprintf("还没连上，自动重试 %s（第 %d 次）……", name, attempt))
-				if err := u.app.Connect(); err == nil {
-					return
-				}
-			}
-			u.app.Log().Warn(fmt.Sprintf("自动重连 %s 多次仍未成功，请手动点「重新连接」", name))
-		}()
+		go u.keepConnected(name)
 	} else if len(files) > 1 {
 		u.app.Log().Info(fmt.Sprintf("config 里有 %d 个连接码文件：连接哪个请从托盘菜单选择", len(files)))
 	}
@@ -760,6 +736,8 @@ func (u *UI) onPrimary() {
 	if u.app.Status().Running {
 		op = "disconnect"
 	}
+	// 记下用户意图：断开之后不能让自动重连守护把隧道又连回来
+	u.wantConnected.Store(op != "disconnect")
 	u.busyOp = op
 	u.refresh() // 立刻渲染过渡态，不等下一秒的定时刷新
 	go func() {
@@ -779,6 +757,7 @@ func (u *UI) onReconnect() {
 	if u.busyOp != "" {
 		return
 	}
+	u.wantConnected.Store(true)
 	u.busyOp = "reconnect"
 	u.refresh()
 	go func() {
@@ -789,6 +768,45 @@ func (u *UI) onReconnect() {
 			u.refresh()
 		})
 	}()
+}
+
+// keepConnected 是常驻的自动重连守护：只要用户还期望连接、而隧道没在线，就按退避重试。
+//
+// 判据必须是 Status().Online，而不是 Connect() 的返回值：后者返回 nil 只代表隧道建立，
+// 而出网自检是在它之后才跑的，失败会立刻自动断开并还原网络（日志里「已连接」8 秒后
+// 紧跟「出网自检失败，自动断开」就是这种）。早先的写法只重试到第一次 Connect 成功
+// 为止，那之后就再也没人重连 —— 表现就是「触发过重连，却没有任何动作、一直不连接」。
+//
+// 用户点「断开连接」会把 wantConnected 置 false，这里随即收手。
+func (u *UI) keepConnected(name string) {
+	delay := 15 * time.Second
+	for {
+		select {
+		case <-u.done:
+			return
+		case <-time.After(delay):
+		}
+		if !u.wantConnected.Load() {
+			return
+		}
+		st := u.app.Status()
+		if st.Online {
+			delay = 15 * time.Second // 在线：退避清零，继续盯着
+			continue
+		}
+		// 上一次连接或断开还没结束：Connect() 会立刻返回「正在连接/正在断开，请稍候」，
+		// 那不是一次失败，等它结束再来。
+		if st.Connecting || st.Disconnecting {
+			continue
+		}
+		u.app.Log().Info(fmt.Sprintf("隧道不在线，自动重连 %s……", name))
+		if err := u.app.Connect(); err != nil {
+			// 连不上就退避，最多 3 分钟一次；连上后由上面的 Online 分支清零
+			if delay < 3*time.Minute {
+				delay *= 2
+			}
+		}
+	}
 }
 
 func (u *UI) onHide() {
