@@ -22,8 +22,11 @@ import (
 )
 
 const (
-	pingInterval     = 10 * time.Second
-	deadAfter        = 30 * time.Second
+	pingInterval = 10 * time.Second
+	// deadAfter 必须显著大于 slotWriteTimeout：单连接模式（members=1）下数据也走槽 0，
+	// 一个数据批最长能占住那条连接的写锁 20 秒，心跳只能排在它后面。30 秒的判死线只留
+	// 10 秒余量，连续两个慢批就会把好好的会话自己判死重连。
+	deadAfter        = 60 * time.Second
 	handshakeTimeout = 15 * time.Second
 	readBufferSize   = 65535
 	protoVersion     = 1
@@ -110,7 +113,7 @@ type Tunnel struct {
 	// 它会 cancel 本循环，所以调用后循环直接退出；nil 则退回普通退避重试。
 	RebuildDevice func()
 
-	// wake 在网络出口迁移时被 watcher 触发：把重连从「最长 30s 退避」变成
+	// wake 在网络出口迁移时被 watcher 触发：把重连从「最长 3 分钟退避」变成
 	// 「网络一恢复立刻试」。带缓冲，连续多次通知合并成一次。
 	wake chan struct{}
 
@@ -231,7 +234,7 @@ func (t *Tunnel) Run(ctx context.Context) error {
 			return nil
 		}
 		if connected {
-			// 成功握手过就重置退避，避免一次偶发断线让后续重连一直等 30 秒
+			// 成功握手过就重置退避，避免一次偶发断线让后续重连一直等 3 分钟
 			attempt = 0
 		}
 		if err != nil {

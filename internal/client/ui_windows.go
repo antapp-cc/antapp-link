@@ -391,6 +391,9 @@ func (u *UI) rebuildTrayMenu() {
 			name := name
 			if name == current {
 				add("断开 "+name, func() {
+					// 和主按钮一样要记下意图，否则守护 30 秒后看到「不在线但期望连接」
+					// 又把它连回来 —— 用户明确点了断开，隧道自己回来是不能接受的。
+					u.wantConnected.Store(false)
 					go func() {
 						_ = u.app.Disconnect()
 						u.mw.Synchronize(u.refresh)
@@ -632,12 +635,10 @@ func (u *UI) refresh() {
 		u.lblTraffic.SetText("发送 — / 接收 —")
 	}
 
-	// 按钮文字跟着状态走；操作进行中一律禁用，防重入。
-	//
-	// autoRetry 覆盖后台的自动重连：keepConnected 不经过按钮、也不置 busyOp，而
-	// Connect() 失败时 st.Running 一直是 false —— 不额外认这一条，界面就停在
-	// 「连接」上，用户看到日志在刷重连、按钮却毫无反应，以为程序卡死了。
-	autoRetry := busyOp == "" && !st.Online && u.wantConnected.Load()
+	// 后台自动重连也要显示成「连接中…」，否则日志在刷、按钮却停在「连接」，用户会
+	// 以为程序卡死了。但只在「还没连上」时算：隧道已连上（Running=true）而暂时
+	// !Online（自检的三秒窗口、或会话级重连中）时要留出「断开连接」这个出口。
+	autoRetry := busyOp == "" && !st.Online && !st.Running && u.wantConnected.Load()
 	switch {
 	case busyOp == "disconnect":
 		u.btnPrimary.SetText("断开中…")
@@ -645,12 +646,14 @@ func (u *UI) refresh() {
 	case busyOp == "porttest":
 		u.btnPrimary.SetText("断开连接")
 		u.btnPrimary.SetEnabled(false)
+	case !configured:
+		// 放在 autoRetry 之前：坏连接码会让 configured=false 而 wantConnected=true
+		// （启动时置的），那种情况要显示「导入连接码」让人能重新导入
+		u.btnPrimary.SetText("导入连接码")
+		u.btnPrimary.SetEnabled(true)
 	case busyOp == "connect" || busyOp == "reconnect" || st.Connecting || autoRetry:
 		u.btnPrimary.SetText("连接中…")
 		u.btnPrimary.SetEnabled(false)
-	case !configured:
-		u.btnPrimary.SetText("导入连接码")
-		u.btnPrimary.SetEnabled(true)
 	case st.Running:
 		u.btnPrimary.SetText("断开连接")
 		u.btnPrimary.SetEnabled(true)
@@ -797,6 +800,11 @@ func (u *UI) onReconnect() {
 // 用户点「断开连接」会把 wantConnected 置 false，这里随即收手。
 func (u *UI) keepConnected() {
 	delay := 30 * time.Second
+	// 上一轮尝试之后有没有真正稳定在线过。Connect() 返回 nil 只代表隧道建立，出网自检
+	// 是 3 秒后的异步 goroutine、失败会立刻自己 Disconnect —— 只看返回值判断成败，
+	// 这条循环就永远不会退避，服务端出口真出不去时变成每 30 秒「接管用户网络 → 3 秒
+	// → 自检失败 → 还原」无限刷。
+	lastFailed := false
 	for {
 		select {
 		case <-u.done:
@@ -804,11 +812,16 @@ func (u *UI) keepConnected() {
 		case <-time.After(delay):
 		}
 		if !u.wantConnected.Load() {
-			return
+			// 绝不能 return：用户点「断开连接」只表示现在不想连着，之后再点「连接」
+			// 时守护必须还在。同时把退避重置，否则断开很久后再点连接要等很久才试。
+			delay = 30 * time.Second
+			lastFailed = false
+			continue
 		}
 		st := u.app.Status()
 		if st.Online {
-			delay = 30 * time.Second // 在线：退避清零，继续盯着
+			delay = 30 * time.Second // 真的在线了：退避清零，继续盯着
+			lastFailed = false
 			continue
 		}
 		// 上一次连接或断开还没结束：Connect() 会立刻返回「正在连接/正在断开，请稍候」，
@@ -816,13 +829,12 @@ func (u *UI) keepConnected() {
 		if st.Connecting || st.Disconnecting {
 			continue
 		}
-		u.app.Log().Info(fmt.Sprintf("隧道不在线，自动重连 %s……", u.app.CurrentSource()))
-		if err := u.app.Connect(); err != nil {
-			// 连不上就退避，最多 5 分钟一次；连上后由上面的 Online 分支清零
-			if delay < 5*time.Minute {
-				delay *= 2
-			}
+		if lastFailed && delay < 5*time.Minute {
+			delay *= 2
 		}
+		u.app.Log().Info(fmt.Sprintf("隧道不在线，自动重连 %s……", u.app.CurrentSource()))
+		_ = u.app.Connect()
+		lastFailed = true // 下一轮若已 Online 会清零，否则继续退避
 	}
 }
 

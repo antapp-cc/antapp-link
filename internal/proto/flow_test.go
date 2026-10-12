@@ -59,17 +59,37 @@ func TestFlowTableSpreadsNewFlows(t *testing.T) {
 	}
 }
 
-// 成员数变化后槽位含义变了，映射必须重建，且各档位都不能越界。
-func TestFlowTableResetsOnMemberCountChange(t *testing.T) {
+// 成员数变化时绝不能整表清空：那会让还在有序传输的流换槽，内层 TCP 直接乱序。
+// n 增大时旧槽全部有效，一条映射都不该动；n 减小时只重分落到被移除槽上的条目。
+func TestFlowTableKeepsMappingsWhenMemberCountChanges(t *testing.T) {
 	ft := NewFlowTable()
-	p := buildTCP([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 40000, 443)
-	if s := ft.Slot(p, 5); s < 1 || s > 4 {
-		t.Fatalf("n=5 时槽位 %d 越界", s)
+	const total = 20
+	keys := make([][]byte, total)
+	slotOf := make([]int, total)
+	for i := 0; i < total; i++ {
+		keys[i] = buildTCP([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, uint16(40000+i), 443)
+		slotOf[i] = ft.Slot(keys[i], 5)
+		if s := slotOf[i]; s < 1 || s > 4 {
+			t.Fatalf("n=5 时槽位 %d 越界", s)
+		}
 	}
-	if s := ft.Slot(p, 2); s != 1 {
-		t.Errorf("n=2 时只有槽 1 可用，实际 %d", s)
+
+	// n 增大：旧槽全都还在，任何一条流换槽都是错的
+	for i := 0; i < total; i++ {
+		if got := ft.Slot(keys[i], 8); got != slotOf[i] {
+			t.Errorf("n 增大后第 %d 条流换了槽：%d → %d（内层 TCP 会乱序）", i, slotOf[i], got)
+		}
 	}
-	if s := ft.Slot(p, 1); s != 0 {
+
+	// n 减到 2：只能落在槽 1，且不得越界
+	for i := 0; i < total; i++ {
+		if got := ft.Slot(keys[i], 2); got != 1 {
+			t.Errorf("n=2 时唯一可用的槽是 1，实际 %d", got)
+		}
+	}
+
+	// 单连接模式仍只走控制连接
+	if s := ft.Slot(keys[0], 1); s != 0 {
 		t.Errorf("单连接模式应返回 0，实际 %d", s)
 	}
 }
