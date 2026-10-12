@@ -23,6 +23,7 @@ import (
 
 const (
 	manifestLimit = 64 << 10  // 清单不该更大
+	sigLimit      = 4 << 10   // 签名只有 64 字节（base64/hex 编码后也很小），留足余量
 	exeLimit      = 200 << 20 // 更新包上限，防止被喂一个超大文件把磁盘写满
 	userAgent     = "AntAppLink-Updater"
 )
@@ -148,6 +149,15 @@ func (c *Checker) fetchManifest(ctx context.Context, src Source) (*Manifest, err
 	if err != nil {
 		return nil, err
 	}
+	// 先验签再解析：解析出来的下载 URL 与 sha256 都要以「清单没被改动」为前提，
+	// 顺序反了等于没校验（详见 verifyManifest 的说明）。
+	sig, err := c.fetchSignature(ctx, src)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyManifest(raw, sig); err != nil {
+		return nil, err
+	}
 	var m Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, fmt.Errorf("解析清单: %w", err)
@@ -156,6 +166,35 @@ func (c *Checker) fetchManifest(ctx context.Context, src Source) (*Manifest, err
 		return nil, err
 	}
 	return &m, nil
+}
+
+// fetchSignature 取清单旁边的 .sig。
+//
+// 签名放独立文件而不是清单里的字段：内嵌的话签名要覆盖一个包含它自己的文档，做不到。
+// 固定用 "清单URL + .sig"，发布侧只要把两个文件一起传上去。
+func (c *Checker) fetchSignature(ctx context.Context, src Source) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src.Manifest+".sig", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("取清单签名: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("%w（%s.sig 不存在）", ErrUnsigned, src.Manifest)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("取清单签名: HTTP %d", resp.StatusCode)
+	}
+	sig, err := io.ReadAll(io.LimitReader(resp.Body, sigLimit))
+	if err != nil {
+		return nil, err
+	}
+	return sig, nil
 }
 
 func (m *Manifest) Validate() error {

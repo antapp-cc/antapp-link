@@ -95,6 +95,22 @@ if ($signtool) {
 $setupDist = Join-Path $distDir "AntAppLink-安装-$Version.exe"
 Copy-Item (Join-Path $distDir 'antapp-setup.exe') $setupDist -Force
 
+# 更新清单签名：latest.json 必须带 .sig 一起发布，否则两端会拒绝自动更新。清单里的
+# 下载 URL 与 sha256 出自同一份文件，只校 sha256 挡不住能改 Release 的人，而更新链路
+# 以 root 运行 —— 一次投毒就是所有节点上的任意代码执行。私钥离线保管，不进仓库。
+$manifest = Join-Path $distDir 'latest.json'
+if (Test-Path $manifest) {
+    $releaseKey = Join-Path $env:USERPROFILE '.antapp-release\release.key'
+    if (-not (Test-Path $releaseKey)) {
+        throw "缺发布私钥 $releaseKey —— 没有它签不出节点会接受的清单。先跑 antapp-sign -genkey，或从离线备份恢复。"
+    }
+    Write-Host '== 更新清单签名 ==' -ForegroundColor Cyan
+    go run ./cmd/antapp-sign -key $releaseKey -in $manifest
+    if ($LASTEXITCODE -ne 0) { throw 'latest.json 签名失败' }
+} else {
+    Write-Warning 'dist 里没有 latest.json，跳过清单签名（发布自动更新时要手动补 .sig，否则新版本会拒绝更新）'
+}
+
 Write-Host ''
 Write-Host '== 产物 ==' -ForegroundColor Green
 Get-ChildItem $distDir -File | Sort-Object Name | ForEach-Object {

@@ -59,6 +59,26 @@ antapp-linkd down -c /etc/antapp-link/server.json      # 清理 netfilter
 
 **升级只替换二进制这一个文件**：不调用 `init`、不碰 `/etc/antapp-link/pki/`、不改 `server.json`、不动已签发的连接码。CA 不变，所以老连接码继续有效。
 
+### 清单签名（发布时必须做）
+
+`latest.json` 必须带签名一起发布，否则**新版本会拒绝更新、自动更新直接停摆**。
+
+原因：`latest.json` 里的下载 URL 和 sha256 出自同一份文件，只校验 sha256 挡不住能改 Release 的人 —— 他可以把两者一起换掉。而更新链路以 **root** 运行，一次投毒就是所有节点上的任意代码执行。
+
+```powershell
+# 只在第一次做：生成密钥对，私钥离线保管（默认 ~/.antapp-release/release.key）
+go run ./cmd/antapp-sign -genkey -key $env:USERPROFILE\.antapp-release\release.key
+# 把打印出来的公钥填进 internal/update/pubkey.go 的 releasePubKey，然后重新构建两端
+
+# 每次发布：给 dist/latest.json 生成 dist/latest.json.sig（build.ps1 已自动做这一步）
+go run ./cmd/antapp-sign -key $env:USERPROFILE\.antapp-release\release.key -in dist/latest.json
+```
+
+发布资产要包含 **`latest.json` 和 `latest.json.sig` 两个文件**（连同 `antapp-link.exe`、`antapp-linkd`）。
+
+> ⚠ **别弄丢私钥，也别轻易换密钥对。** 私钥丢了就再也签不出节点会接受的清单（只能全部重装）；
+> 换密钥对意味着所有已部署节点要先升级一次 —— 它们内置的是旧公钥。
+
 > ⚠ **引导步骤：已经装好的机器必须再跑一次安装，自动更新才会启动。**
 > timer 是 `install` 子命令写进去的，老二进制里既没有 `update` 子命令也没有 timer：
 >

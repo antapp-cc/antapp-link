@@ -1,0 +1,18 @@
+package update
+
+// releasePubKey 是发布清单（latest.json）的 Ed25519 公钥，编译期内置。
+//
+// 为什么需要它：服务端的自动更新以 root 运行，而清单里的下载 URL 和 sha256 出自同一份
+// 未签名文件 —— 只校 sha256 挡不住改 Release 的人，他能把两者一起换掉，于是所有节点
+// 都会以 root 装上任意二进制。验签之后，改 Release 不再等于能推代码。
+//
+// 私钥离线保管在 ~/.antapp-release/release.key（不进仓库），只在发布时用
+// cmd/antapp-sign 签一次 latest.json，不参与日常构建。
+//
+// 换密钥对意味着所有已部署节点都要先升级一次（它们内置的是旧公钥），所以别轻易换。
+var releasePubKey = [32]byte{
+	0x2d, 0xb0, 0xc1, 0x8f, 0x56, 0xc1, 0x08, 0x45,
+	0x27, 0x10, 0xa2, 0xdb, 0x35, 0x78, 0x0c, 0xe2,
+	0xfc, 0x44, 0x0e, 0xbd, 0xed, 0xf2, 0x91, 0x1c,
+	0xda, 0x8b, 0x75, 0xd6, 0xd5, 0x33, 0xda, 0x57,
+}

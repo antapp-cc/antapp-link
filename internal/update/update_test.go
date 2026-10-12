@@ -3,7 +3,10 @@ package update
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
@@ -86,29 +89,57 @@ func TestManifestValidate(t *testing.T) {
 	}
 }
 
-func writeManifest(t *testing.T, w http.ResponseWriter, version string) {
+// testSignPriv 是包级测试密钥。这些用例只关心「清单有没有被正确签名并被接受」，
+// 不关心密钥本身，所以进程内生成一次、整包共用；releasePubKey 也换成对应的公钥，
+// 免得测试依赖真实发布私钥。
+var testSignPriv ed25519.PrivateKey
+
+func init() {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	releasePubKey = [32]byte(pub)
+	testSignPriv = priv
+}
+
+// writeManifest 按请求路径写清单或它的签名。
+//
+// 发布流程就是成对上传 latest.json 与 latest.json.sig，测试也照这个形状来 ——
+// 否则严格验签会把每个用例都直接拒掉。
+func writeManifest(t *testing.T, w http.ResponseWriter, r *http.Request, version string) {
 	t.Helper()
-	w.Header().Set("Content-Type", "application/json")
-	err := json.NewEncoder(w).Encode(Manifest{Version: version, Client: validAsset()})
+	body, err := json.Marshal(Manifest{Version: version, Client: validAsset()})
 	if err != nil {
 		t.Error(err)
+		return
 	}
+	if strings.HasSuffix(r.URL.Path, ".sig") {
+		_, _ = w.Write([]byte(base64.StdEncoding.EncodeToString(ed25519.Sign(testSignPriv, body))))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
 }
 
 // 多个源按顺序试：坏源跳过、记录错误，最后挑出最新的那一版。
 func TestCheckPicksNewestAcrossSources(t *testing.T) {
+	// 用单个 handler 分发而不是给每个路径注册：ServeMux 是精确匹配，
+	// 注册了 /old.json 并不会让 /old.json.sig 也走进来（签名请求会 404）。
 	mux := http.NewServeMux()
-	mux.HandleFunc("/broken.json", func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "boom", http.StatusInternalServerError)
-	})
-	mux.HandleFunc("/old.json", func(w http.ResponseWriter, r *http.Request) {
-		writeManifest(t, w, "0.2.0")
-	})
-	mux.HandleFunc("/new.json", func(w http.ResponseWriter, r *http.Request) {
-		writeManifest(t, w, "0.5.0")
-	})
-	mux.HandleFunc("/junk.json", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("{ not json"))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		switch strings.TrimSuffix(r.URL.Path, ".sig") {
+		case "/broken.json":
+			http.Error(w, "boom", http.StatusInternalServerError)
+		case "/old.json":
+			writeManifest(t, w, r, "0.2.0")
+		case "/new.json":
+			writeManifest(t, w, r, "0.5.0")
+		case "/junk.json":
+			_, _ = w.Write([]byte("{ not json"))
+		default:
+			http.NotFound(w, r)
+		}
 	})
 
 	srv := httptest.NewServer(mux)
@@ -139,12 +170,14 @@ func TestCheckPicksNewestAcrossSources(t *testing.T) {
 
 func TestCheckReturnsNilWhenUpToDate(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeManifest(t, w, "0.2.0")
+		writeManifest(t, w, r, "0.2.0")
 	}))
 	defer srv.Close()
 
 	c := &Checker{
-		Sources: []Source{{Name: "only", Manifest: srv.URL}},
+		// 清单 URL 必须带路径：签名取的是 "<清单URL>.sig"，裸的 srv.URL 会把 .sig
+		// 拼到端口后面，变成一个非法 URL。
+		Sources: []Source{{Name: "only", Manifest: srv.URL + "/latest.json"}},
 		Current: "0.2.0",
 		HTTP:    srv.Client(),
 	}

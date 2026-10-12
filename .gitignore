@@ -20,3 +20,6 @@ cloud-server-backup-20260928/
 # CodeGraph 索引与运行期日志：都不是源码
 /.codegraph/
 /logs/
+
+# 发布签名私钥：拿到它就能签出所有节点都接受的更新清单，绝不能进仓库
+*.key
