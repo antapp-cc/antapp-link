@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -15,8 +16,9 @@ import (
 // TUN 是 Linux 上的一张 tun 网卡。直接开 /dev/net/tun 做 TUNSETIFF，
 // 不引第三方网络库；地址配置交给 iproute2（每台现代 Linux 都有）。
 type TUN struct {
-	file *os.File
-	name string
+	file   *os.File
+	name   string
+	closed atomic.Bool
 }
 
 type ifreq struct {
@@ -63,7 +65,34 @@ func runIP(args ...string) error {
 	return nil
 }
 
-func (t *TUN) Read(p []byte) (int, error) { return t.file.Read(p) }
+// Read 先 poll 等包就绪再读。
+//
+// 不能直接在阻塞 fd 上 read：/dev/net/tun 是阻塞模式，而 os.NewFile 不注册 runtime
+// poller，Close 唤不醒已经阻塞的 read —— 更糟的是 fd 关闭后会被内核释放、可能被新
+// 连接复用，那个 read 就会读到别人的数据。这里用带超时的 poll 轮询，Close 置标志后
+// 循环自己退出（Run 返回时不再留下一个永久阻塞的协程）。
+func (t *TUN) Read(p []byte) (int, error) {
+	for {
+		if t.closed.Load() {
+			return 0, os.ErrClosed
+		}
+		fds := []unix.PollFd{{Fd: int32(t.file.Fd()), Events: unix.POLLIN}}
+		n, err := unix.Poll(fds, 200)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			if t.closed.Load() {
+				return 0, os.ErrClosed
+			}
+			return 0, err
+		}
+		if n == 0 {
+			continue // 超时：回去看是否已被关闭
+		}
+		return t.file.Read(p)
+	}
+}
 
 // TryRead 非阻塞收割一个已就绪的包（写合并的收割端）：无包立即 (0, nil)。
 //
@@ -85,4 +114,8 @@ func (t *TUN) TryRead(p []byte) (int, error) {
 	return t.file.Read(p)
 }
 func (t *TUN) Write(p []byte) (int, error) { return t.file.Write(p) }
-func (t *TUN) Close() error                { return t.file.Close() }
+
+func (t *TUN) Close() error {
+	t.closed.Store(true)
+	return t.file.Close()
+}

@@ -121,13 +121,14 @@ func cmdUpdate(stdout, stderr io.Writer, args []string) int {
 		fmt.Fprintf(stdout, "  确认问题已解决后，删掉 %s 就能重新尝试\n", failedVersionPath)
 		return 0
 	}
-	// 上一轮明明把这个版本装上去了，本进程却还是别的版本 —— 说明二进制里的 Version
-	// 没被注入（-X 失效）。这种情况再装一遍也只会白重启一次，直接停下来报警。
+	// 上一轮明明把这个版本装上去了，本进程却还是别的版本。两种可能：二进制里的 Version
+	// 没被注入（-X 失效，再装也只会白重启），或者运维手动换回了旧版。进程内无从区分，
+	// 而把两者都当成错误会让 timer 每小时失败一次、自动更新彻底停摆 —— 所以跳过并提示，
+	// 判断留给运维。正常收敛（装完重启后 Version 已是目标）在上面就返回了，走不到这里。
 	if applied, _ := readUpdatedTo(); applied == m.Version {
-		fmt.Fprintf(stderr, "刚装过 %s，但本进程版本仍是 %s —— 二进制可能没注入版本号，更新无法收敛，已停止重试\n",
-			m.Version, Version)
-		fmt.Fprintf(stderr, "  修好构建（build.ps1 的 -X）后删掉 %s 即可恢复\n", updatedToPath)
-		return 1
+		fmt.Fprintf(stdout, "跳过 %s：上一轮已装过这个版本，但本进程版本仍是 %s\n", m.Version, Version)
+		fmt.Fprintf(stdout, "  若是二进制没注入版本号（build.ps1 的 -X），修好后删掉 %s 即可重试\n", updatedToPath)
+		return 0
 	}
 
 	// 随机名 + 0700：固定路径放 /tmp 会被本机普通用户预先占位，等摘要校验通过之后

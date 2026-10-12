@@ -25,6 +25,7 @@ import (
 func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp func() bool) (func(), error) {
 	var (
 		listeners []net.Listener
+		active    = map[net.Conn]struct{}{}
 		mu        sync.Mutex
 		stopped   bool
 	)
@@ -38,6 +39,25 @@ func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp 
 		for _, ln := range listeners {
 			_ = ln.Close()
 		}
+		// 在途连接的 io.Copy 不感知 ctx，只能把连接关掉让它们返回：否则 Run 退出后
+		// 这些搬运协程还挂着（把 Run 当库复用时就是每次泄漏一批）。
+		for c := range active {
+			_ = c.Close()
+		}
+	}
+	track := func(c net.Conn) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if stopped {
+			return false
+		}
+		active[c] = struct{}{}
+		return true
+	}
+	untrack := func(c net.Conn) {
+		mu.Lock()
+		delete(active, c)
+		mu.Unlock()
 	}
 	go func() {
 		<-ctx.Done()
@@ -67,7 +87,14 @@ func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp 
 					continue
 				}
 				target := net.JoinHostPort(clientAddr, fmt.Sprint(port))
-				go handleRelayConn(conn, target, log)
+				go func() {
+					if !track(conn) {
+						_ = conn.Close() // 已经在收尾了，别再搬
+						return
+					}
+					defer untrack(conn)
+					handleRelayConn(conn, target, log)
+				}()
 			}
 		}()
 	}
@@ -77,7 +104,9 @@ func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp 
 // handleRelayConn 双向搬运一条转发连接。任一方向出错即整条关闭。
 func handleRelayConn(conn net.Conn, target string, log *slog.Logger) {
 	defer conn.Close()
-	upstream, err := net.DialTimeout("tcp", target, 10*time.Second)
+	// 3 秒而不是 10 秒：节点机进程活着、那个端口却没服务时，外部连接要白挂满超时。
+	// 目标是隧道内的直连地址（跨境 RTT 两百毫秒量级），3 秒已经非常宽裕。
+	upstream, err := net.DialTimeout("tcp", target, 3*time.Second)
 	if err != nil {
 		log.Debug("转发连接拨号节点机失败", connLogAttrs(err, conn, "target", target)...)
 		return

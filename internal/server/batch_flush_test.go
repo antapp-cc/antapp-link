@@ -14,7 +14,7 @@ func pipeSession(t *testing.T) (*session, net.Conn) {
 	server, peer := net.Pipe()
 	t.Cleanup(func() { _ = server.Close(); _ = peer.Close() })
 	sess := &session{members: 1, closed: make(chan struct{})}
-	sess.slots = []*slotConn{{conn: server}}
+	sess.slots = []*slotConn{newSlotConn(server)}
 	return sess, peer
 }
 
@@ -28,13 +28,29 @@ func batchOf(pkts ...[]byte) []byte {
 	return batch
 }
 
+// waitTx 等槽位 k 的写协程把 tx 计数加到 want。写出是异步的，断言前必须等它。
+func waitTx(t *testing.T, sess *session, k int, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if sl := sess.slotEntry(k); sl != nil && sl.txBytes.Load() == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("等槽 %d 的 tx 计数到 %d 超时", k, want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // 批里已经带了每帧的帧头，flushBatch 必须整批原样写出。再包一层帧头会让对端把
 // 4 字节帧头当作 IP 包内容写进网卡（内核按 IP 版本号 0 丢弃），下行数据全丢。
 func TestFlushBatchWritesFramesVerbatim(t *testing.T) {
 	sess, peer := pipeSession(t)
 	pkt := []byte{0x45, 0x00, 0x00, 0x14, 10, 0, 0, 2, 8, 8, 8, 8}
 
-	go func() { _ = sess.flushBatch(0, batchOf(pkt)) }()
+	// flushBatch 只入队、不阻塞；真正的写出在该槽的写协程里
+	sess.flushBatch(0, batchOf(pkt))
 
 	_ = peer.SetReadDeadline(time.Now().Add(2 * time.Second))
 	typ, got, err := proto.ReadFrame(peer)
@@ -63,8 +79,7 @@ func TestFlushBatchWritesMultiFrameBatch(t *testing.T) {
 		t.Fatalf("测试前提不成立：批只有 %d 字节", len(batch))
 	}
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- sess.flushBatch(0, batch) }()
+	sess.flushBatch(0, batch)
 
 	_ = peer.SetReadDeadline(time.Now().Add(2 * time.Second))
 	for i, wantPkt := range want {
@@ -76,9 +91,6 @@ func TestFlushBatchWritesMultiFrameBatch(t *testing.T) {
 			t.Fatalf("第 %d 帧不对：type=%v 载荷 %d 字节", i+1, typ, len(got))
 		}
 	}
-	if err := <-errCh; err != nil {
-		t.Fatalf("flushBatch 返回错误: %v", err)
-	}
 }
 
 // 每槽收发字节要能被 status 看到：写出的算 tx，读入的算 rx，都按链路上的字节（含帧头）。
@@ -87,15 +99,14 @@ func TestSlotStatsCountTraffic(t *testing.T) {
 	pkt := []byte{0x45, 0x00, 0x00, 0x14, 10, 0, 0, 2, 8, 8, 8, 8}
 	batch := batchOf(pkt)
 
-	done := make(chan error, 1)
-	go func() { done <- sess.flushBatch(0, batch) }()
+	sess.flushBatch(0, batch)
 	_ = peer.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, _, err := proto.ReadFrame(peer); err != nil {
 		t.Fatalf("读回帧: %v", err)
 	}
-	if err := <-done; err != nil {
-		t.Fatalf("flushBatch: %v", err)
-	}
+	// net.Pipe 的 Write 要等对端读完才返回，所以读回帧不代表写协程已经记完 tx 计数，
+	// 这里等一下它，避免偶发失败。
+	waitTx(t, sess, 0, uint64(len(batch)))
 	if sl := sess.slotEntry(0); sl != nil {
 		sl.noteRx(len(pkt))
 	}
@@ -109,6 +120,35 @@ func TestSlotStatsCountTraffic(t *testing.T) {
 	}
 	if got, want := stats[0].RxBytes, uint64(len(pkt)+proto.HeaderSize); got != want {
 		t.Errorf("槽 0 接收字节 = %d，期望 %d", got, want)
+	}
+}
+
+// flushBatch 绝不能阻塞调用方：pumpTun 是单个 goroutine 串行服务所有槽，在这里等
+// 一条拥塞的连接，其余槽（含控制连接的心跳）会一起被拖停。这里用「对端永不读取」的
+// net.Pipe 模拟拥塞槽 —— 原来的同步写实现会卡在 Write 上直到写超时。
+func TestFlushBatchNeverBlocksOnSlowSlot(t *testing.T) {
+	sess, _ := pipeSession(t) // peer 故意不读，Write 会一直阻塞
+	pkt := []byte{0x45, 0x00, 0x00, 0x14, 10, 0, 0, 2, 8, 8, 8, 8}
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < slotQueueLen*4; i++ {
+			sess.flushBatch(0, batchOf(pkt))
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flushBatch 被慢槽阻塞：pumpTun 会被一条拥塞连接拖停全部")
+	}
+	sl := sess.slotEntry(0)
+	if sl == nil {
+		t.Fatal("槽 0 不该为空")
+	}
+	if sl.drops.Load() == 0 {
+		t.Error("队列早已写满，却没有丢弃计数（要么队列过大，要么在阻塞等待）")
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/antapp-cc/antapp-link/internal/pki"
@@ -27,6 +28,9 @@ const (
 	// 但只剩单方向可用的半死连接会让读循环永不返回、槽位被永久占死（客户端补拨
 	// 一直拿到「槽位不可用」），所以给一个宽松的空闲上限：120s 不误杀安静连接，
 	// 又把「永久」变成有界。
+	//
+	// 现客户端每 15 秒发一次成员 PING（8 倍余量）。没带成员心跳的旧客户端会在安静
+	// 120 秒后被摘槽、接着自动补拨，升级期混跑时表现为周期性重拨，可以接受。
 	memberIdleTimeout = 120 * time.Second
 	readBufferSize    = 65535
 	protoVersion      = 1
@@ -139,6 +143,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	// accept 挪进 goroutine，Run 才能同时盯住搬运链路的致命错误
 	acceptErr := make(chan error, 1)
 	go func() {
+		var backoff time.Duration
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -146,9 +151,28 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 					acceptErr <- nil
 					return
 				}
+				// fd 耗尽是瞬时故障：进程直接退出会变成 systemd 三秒一次的重启循环，
+				// 而重启本身只是把 fd 清掉，什么都没解决。退避重试，让在途连接自然
+				// 回收；一直缓不过来（超过上限）才交回上层，让它拉一个干净进程。
+				if errors.Is(err, syscall.EMFILE) {
+					if backoff == 0 {
+						backoff = time.Second
+					} else if backoff < 30*time.Second {
+						backoff *= 2
+					}
+					s.log.Warn("accept 失败：文件描述符耗尽，稍后重试", "retry_in", backoff)
+					select {
+					case <-runCtx.Done():
+						acceptErr <- nil
+						return
+					case <-time.After(backoff):
+					}
+					continue
+				}
 				acceptErr <- fmt.Errorf("accept: %w", err)
 				return
 			}
+			backoff = 0
 			go s.handle(runCtx, conn)
 		}
 	}()
@@ -222,9 +246,7 @@ func (s *Server) pumpTun(ctx context.Context) {
 			}
 			kk := sess.flow.Slot(buf[:m], sess.membersN(), sess.slotAlive)
 			if kk != k {
-				if err := sess.flushBatch(k, batch); err != nil {
-					s.log.Debug("转发给客户端失败", connLogAttrs(err, nil, "client", sess.name)...)
-				}
+				sess.flushBatch(k, batch)
 				batch = batch[:0]
 				k = kk
 				batch = proto.AppendHeader(batch, proto.TypeIP, m)
@@ -235,9 +257,7 @@ func (s *Server) pumpTun(ctx context.Context) {
 			batch = append(batch, buf[:m]...)
 		}
 
-		if err := sess.flushBatch(k, batch); err != nil {
-			s.log.Debug("转发给客户端失败", connLogAttrs(err, nil, "client", sess.name)...)
-		}
+		sess.flushBatch(k, batch)
 		batch = batch[:0]
 	}
 }
@@ -345,6 +365,9 @@ func (s *Server) handleMember(ctx context.Context, tlsConn *tls.Conn, name strin
 			return
 		}
 		sess.touch()
+		if sl := sess.slotEntry(hello.Member); sl != nil {
+			sl.touch()
+		}
 		switch typ {
 		case proto.TypeIP:
 			if sl := sess.slotEntry(hello.Member); sl != nil {
@@ -546,7 +569,7 @@ func (s *Server) handleControl(ctx context.Context, tlsConn *tls.Conn, name stri
 		flow:        proto.NewFlowTable(),
 	}
 	sess.slots = make([]*slotConn, approved)
-	sess.slots[0] = &slotConn{conn: tlsConn}
+	sess.slots[0] = newSlotConn(tlsConn)
 	sess.touch()
 	if err := sess.write(proto.TypeHelloAck, ack); err != nil {
 		s.log.Warn("回 HELLO_ACK 失败", connLogAttrs(err, tlsConn, "client", name)...)
@@ -576,6 +599,7 @@ func (s *Server) serveSession(ctx context.Context, sess *session) {
 				return
 			}
 			sess.touch()
+			sess.slot(0).touch()
 			switch typ {
 			case proto.TypeIP:
 				if sl := sess.slotEntry(0); sl != nil {
@@ -617,8 +641,10 @@ func (s *Server) serveSession(ctx context.Context, sess *session) {
 		case <-sess.closed:
 			return
 		case <-ticker.C:
-			if idle := sess.idleFor(); idle > clientDeadAfter {
-				s.log.Warn("客户端长时间没有任何帧，判定掉线", "client", sess.name, "idle", idle.Round(time.Second))
+			// 只看控制连接：成员连接上的数据帧不该给一条已经半死的控制连接续命
+			// （没有 FIN 的那种半死连接，靠会话级 lastSeen 是永远发现不了的）。
+			if idle := sess.slot(0).idleFor(); idle > clientDeadAfter {
+				s.log.Warn("控制连接长时间没有任何帧，判定掉线", "client", sess.name, "idle", idle.Round(time.Second))
 				return
 			}
 		}
@@ -711,11 +737,88 @@ type session struct {
 }
 
 // slotConn 是逻辑会话里的一条物理连接。
+//
+// 数据批走独立写协程（out + close(out) 的 closed），控制帧仍用 write 同步写。
+// 分两条路是因为调用方不同：write 只在各连接的读循环/握手路径里调，阻塞它只影响
+// 那一条连接；而数据批来自 pumpTun —— 那是单个 goroutine 串行服务所有槽，在那里
+// 同步写任何一条，拥塞时都会把其余槽（含控制连接的心跳）一起拖停。
 type slotConn struct {
 	conn    net.Conn
 	writeMu sync.Mutex
 	txBytes atomic.Uint64 // 写出的链路字节（含帧头）
 	rxBytes atomic.Uint64 // 读入的链路字节（含帧头）
+
+	out    chan []byte   // 待写数据批，队列满即丢，绝不阻塞 pumpTun
+	closed chan struct{} // 关闭后写协程退出
+	once   sync.Once
+	drops  atomic.Uint64 // 因队列满被丢弃的批数，排障时看这个
+
+	// lastSeen 是这条连接自己的活跃时刻。判掉线只能看控制连接（槽 0）的这个值：
+	// 会话级的 lastSeen 会被成员连接一起刷新，于是「控制连接半死（没有 FIN）但成员
+	// 还在收数据」时服务端永不判死，僵尸会话一直挂在 current 上、status 还显示运行中。
+	lastSeen atomic.Int64
+}
+
+func (s *slotConn) touch() { s.lastSeen.Store(time.Now().UnixNano()) }
+
+func (s *slotConn) idleFor() time.Duration {
+	return time.Since(time.Unix(0, s.lastSeen.Load()))
+}
+
+// slotQueueLen 是每槽待写批的队列深度。批最大 MaxBatchBytes（约 20KB 量级），
+// 8 批约百来 KB，够吸收一个写超时周期内的突发，又不会让延迟长到难忍。
+const slotQueueLen = 8
+
+func newSlotConn(conn net.Conn) *slotConn {
+	sc := &slotConn{
+		conn:   conn,
+		out:    make(chan []byte, slotQueueLen),
+		closed: make(chan struct{}),
+	}
+	sc.touch() // lastSeen 为零值会让 idleFor 算出天文数字，判死逻辑一上来就误杀
+	go sc.writeLoop()
+	return sc
+}
+
+// writeLoop 是每槽唯一的写协程，串行消费队列。写失败就关掉这条连接：读循环会随之
+// 退出、槽位被 leave 回收，客户端按退避补拨，比留一条写不动的连接强。
+func (s *slotConn) writeLoop() {
+	for {
+		select {
+		case batch := <-s.out:
+			if err := s.writeRaw(batch); err != nil {
+				_ = s.conn.Close()
+				return
+			}
+		case <-s.closed:
+			return
+		}
+	}
+}
+
+// enqueue 把数据批交给写协程，绝不阻塞调用方 —— pumpTun 只有一个 goroutine，在这里
+// 等任何一个槽都会拖停全部。队列满就丢这一批：那条 TCP 本来也在重传或重连，丢包
+// 远好过全局停顿。
+//
+// batch 必须拷一份：调用方用的是可复用缓冲（发完就 batch[:0] 接着拼下一个包），
+// 直接入队会让写协程读到被覆写的内容。
+func (s *slotConn) enqueue(batch []byte) {
+	if len(batch) == 0 {
+		return
+	}
+	cp := make([]byte, len(batch))
+	copy(cp, batch)
+	select {
+	case s.out <- cp:
+	case <-s.closed:
+	default:
+		s.drops.Add(1)
+	}
+}
+
+// closeWrite 让写协程退出。由 session.close 调用。
+func (s *slotConn) closeWrite() {
+	s.once.Do(func() { close(s.closed) })
 }
 
 // slotWriteTimeout 限制单次写槽。pumpTun 是单 goroutine 串行往各槽写，
@@ -827,7 +930,7 @@ func (s *session) commitSlot(k int, conn net.Conn) bool {
 	if k <= 0 || k >= len(s.slots) || s.slots[k] != nil {
 		return false
 	}
-	s.slots[k] = &slotConn{conn: conn}
+	s.slots[k] = newSlotConn(conn)
 	return true
 }
 
@@ -870,22 +973,23 @@ func (s *session) write(t proto.Type, payload []byte) error {
 	return ctrl.write(t, payload)
 }
 
-// flushBatch 把合并缓冲一次写入槽位 k 的连接。
+// flushBatch 把合并缓冲交给槽位 k 的写协程。
 //
 // 用 slotEntry 而不是 slot：slot 在槽为空时会回落到控制连接，而控制连接的职责是
 // 心跳 —— 成员一断，本该发那条的数据就全涌进槽 0，把 PING/PONG 挤到排队，面板延迟
 // 立刻从两百毫秒涨到上千；断两条时一半流量都挤过去，这也正是「有成员断开延迟就大」
 // 的原因。槽空就把这批丢掉：那条链路的 TCP 本来也在重传或重连，等成员回来自会恢复。
 // 控制帧（PING/PONG）仍然走 slot() 回落，它们必须发出去。
-func (s *session) flushBatch(k int, batch []byte) error {
+//
+// 入队不阻塞：pumpTun 是单个 goroutine 串行服务所有槽，在这里同步写任何一条，拥塞
+// 时都会把其余槽一起拖停（20 秒写超时意味着最坏 20 秒的全局停顿）。
+func (s *session) flushBatch(k int, batch []byte) {
 	if len(batch) == 0 {
-		return nil
+		return
 	}
-	sc := s.slotEntry(k)
-	if sc == nil {
-		return nil
+	if sc := s.slotEntry(k); sc != nil {
+		sc.enqueue(batch)
 	}
-	return sc.writeRaw(batch)
 }
 
 // membersN 返回生效的连接总数（读锁内拷贝，避免与握手竞态）。
@@ -901,6 +1005,7 @@ func (s *session) close() {
 		defer s.mu.Unlock()
 		for _, sl := range s.slots {
 			if sl != nil {
+				sl.closeWrite()
 				_ = sl.conn.Close()
 			}
 		}

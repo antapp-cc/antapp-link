@@ -43,7 +43,8 @@ func TestRulesMasqueradeAndForward(t *testing.T) {
 	rules := ruleStrings(Default(), "eth0")
 	mustContain(t, rules, "-t nat -A POSTROUTING -s 10.10.0.0/24 -o eth0 -j MASQUERADE")
 	mustContain(t, rules, "FORWARD -s 10.10.0.0/24 -j ACCEPT")
-	mustContain(t, rules, "FORWARD -d 10.10.0.0/24 -j ACCEPT")
+	// 入向只放已有连接的回程：节点机只会被动接受服务端 relay 的拨号
+	mustContain(t, rules, "FORWARD -d 10.10.0.0/24 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
 }
 
 func TestRulesClampMSS(t *testing.T) {

@@ -48,7 +48,10 @@ func Rules(cfg Config, wanIface string) []Rule {
 		// 客户端借云服的干净出口出网
 		{Table: "nat", Chain: "POSTROUTING", Args: []string{"-s", network, "-o", wanIface, "-j", "MASQUERADE"}},
 		{Chain: "FORWARD", Args: []string{"-s", network, "-j", "ACCEPT"}},
-		{Chain: "FORWARD", Args: []string{"-d", network, "-j", "ACCEPT"}},
+		// 入向只放已有连接的回程：节点机只会被动接受服务端 relay 的拨号，公网不需要
+		// 主动发起到 10.10.0.0/24 的新连接（无状态全放行比实际需要宽）。
+		{Chain: "FORWARD", Args: []string{"-d", network, "-m", "conntrack",
+			"--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"}},
 
 		// 内层 MTU 只有 1400，不 clamp 就会出现「小包通、网页打不开」的黑洞
 		{Table: "mangle", Chain: "FORWARD", Args: []string{
