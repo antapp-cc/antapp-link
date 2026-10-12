@@ -664,14 +664,22 @@ const memberStagger = 400 * time.Millisecond
 
 // memberRetryDelay 是补拨成员连接前的等待。
 //
-// 首次建连由调用方直接拨（错开由 memberStagger 负责），断开后的补拨一律先等一等：
-// 返回 0 那种「断开就立刻重拨」会让链路抖动时反复建连又立刻失败，日志里表现为
-// 「成员连接断开」紧跟着「成员连接已就位」来回刷。
+// 首次（含断开后的第一次补拨）不等待：单条成员连接断掉时数据还能走其他槽，越快补回
+// 越好 —— 让它干等十秒没有任何好处，只会让多连接长时间退化成少连接、吞吐直接掉。
+// 只有连续失败才退避，而且用比会话级重连短得多的档位（1s 起、封顶 15s）：这里退避的
+// 代价是吞吐，不像整条隧道断开那样需要给对端留恢复时间。
 func memberRetryDelay(attempt int) time.Duration {
 	if attempt <= 0 {
-		return Backoff(0)
+		return 0
 	}
-	return Backoff(attempt - 1)
+	if attempt > 5 {
+		attempt = 5
+	}
+	d := time.Second << (attempt - 1) // 1s 2s 4s 8s 16s
+	if d > 15*time.Second {
+		return 15 * time.Second
+	}
+	return d
 }
 
 // maintainMembers 每个成员槽位一条常驻协程：退避重拨，断开后自动补位。
@@ -692,17 +700,10 @@ func maintainMembers(ctx context.Context, t *Tunnel, sess *clientSession) {
 				}
 			}
 			attempt := 0
-			first := true
 			for {
-				// 会话刚建立时立刻拨（错开交给上面的 memberStagger）；只有断开后的补拨
-				// 才等退避 —— 否则链路一抖就「断开 → 立刻重拨」来回刷。
-				var d time.Duration
-				if first {
-					first = false
-				} else {
-					d = memberRetryDelay(attempt)
-				}
-				if d > 0 {
+				// 首次与断开后的第一次补拨都不等待（memberRetryDelay(0) == 0）；
+				// 只有连续失败才退避。
+				if d := memberRetryDelay(attempt); d > 0 {
 					select {
 					case <-ctx.Done():
 						return

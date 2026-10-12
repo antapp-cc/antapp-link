@@ -124,28 +124,24 @@ func TestLoadInviteErrors(t *testing.T) {
 	}
 }
 
-// 补拨成员连接前必须等一等。
-//
-// 返回 0（断开就立刻重拨）会让链路抖动时反复「断开 → 立刻重拨」来回刷，日志看着像
-// 在疯狂重连、实际每次都在对端刚清理连接时失败。首次建连不走这里 —— maintainMembers
-// 第一次直接拨，错开交给 memberStagger。
+// 单条成员连接断掉要尽快补回来：数据还能走其他槽，让它干等只会把多连接拖成少连接、
+// 吞吐直接掉。只有连续失败才退避，而且档位要短 —— 长退避是留给整条隧道断开用的。
 func TestMemberRetryDelay(t *testing.T) {
-	if got := memberRetryDelay(0); got != Backoff(0) {
-		t.Errorf("补拨要先等一个退避起点，实际 %v", got)
+	if got := memberRetryDelay(0); got != 0 {
+		t.Errorf("成员补拨不该等待，实际 %v", got)
 	}
-	if got := memberRetryDelay(1); got != Backoff(0) {
-		t.Errorf("首次失败后按退避，实际 %v", got)
+	if got := memberRetryDelay(1); got != time.Second {
+		t.Errorf("首次失败后退避 1 秒，实际 %v", got)
 	}
-	if got := memberRetryDelay(9); got != Backoff(8) {
-		t.Errorf("退避应封顶，实际 %v", got)
+	if got := memberRetryDelay(9); got != 15*time.Second {
+		t.Errorf("成员补拨退避应封顶 15 秒，实际 %v", got)
 	}
-	for i := 0; i <= 12; i++ {
-		if d := memberRetryDelay(i); d <= 0 {
-			t.Errorf("第 %d 次补拨等待 %v：不该存在零等待的补拨", i, d)
+	// 起步阶段必须明显短于会话级起点：成员补拨退避的代价是吞吐，只有整条隧道断开
+	// 才需要给对端留恢复时间。（封顶值可以接近会话起点，所以只比前几档）
+	for i := 1; i <= 3; i++ {
+		if memberRetryDelay(i) >= Backoff(0) {
+			t.Errorf("第 %d 次成员补拨退避 %v 不该达到会话级起点 %v", i, memberRetryDelay(i), Backoff(0))
 		}
-	}
-	if Backoff(0) < 5*time.Second {
-		t.Errorf("退避起点太短（%v）：链路抖动往往几秒才恢复，立刻重拨只会反复失败", Backoff(0))
 	}
 }
 
