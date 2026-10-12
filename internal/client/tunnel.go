@@ -78,11 +78,14 @@ type Stats struct {
 func (s *Stats) RTT() time.Duration { return time.Duration(s.RTTNanos.Load()) }
 
 // Backoff 返回第 attempt 次重连前应等待的时长（attempt 从 0 开始）。
-// 指数退避但封顶 30 秒：云服重启后客户端要能自己恢复，又不能把云服打爆。
+//
+// 指数退避，10 秒起步、封顶 3 分钟。起点刻意不短：链路抖动往往几秒内就恢复，
+// 立刻重拨只会在对端刚断开、TCP 还没完全清理时反复失败，日志看着像在疯狂重连；
+// 等一下再试成功率更高，也不会给云服添无谓的连接压力。
 func Backoff(attempt int) time.Duration {
 	const (
-		base = time.Second
-		cap  = 30 * time.Second
+		base = 10 * time.Second
+		cap  = 3 * time.Minute
 	)
 	if attempt <= 0 {
 		return base
@@ -659,11 +662,14 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 // 正常客户端不会这样。错开也不影响可用性 —— 成员没就位时数据走控制连接。
 const memberStagger = 400 * time.Millisecond
 
-// memberRetryDelay 是补拨成员连接前的等待：首次立刻拨（错开由调用方负责），
-// 失败之后才按退避来。
+// memberRetryDelay 是补拨成员连接前的等待。
+//
+// 首次建连由调用方直接拨（错开由 memberStagger 负责），断开后的补拨一律先等一等：
+// 返回 0 那种「断开就立刻重拨」会让链路抖动时反复建连又立刻失败，日志里表现为
+// 「成员连接断开」紧跟着「成员连接已就位」来回刷。
 func memberRetryDelay(attempt int) time.Duration {
 	if attempt <= 0 {
-		return 0
+		return Backoff(0)
 	}
 	return Backoff(attempt - 1)
 }
@@ -686,8 +692,17 @@ func maintainMembers(ctx context.Context, t *Tunnel, sess *clientSession) {
 				}
 			}
 			attempt := 0
+			first := true
 			for {
-				if d := memberRetryDelay(attempt); d > 0 {
+				// 会话刚建立时立刻拨（错开交给上面的 memberStagger）；只有断开后的补拨
+				// 才等退避 —— 否则链路一抖就「断开 → 立刻重拨」来回刷。
+				var d time.Duration
+				if first {
+					first = false
+				} else {
+					d = memberRetryDelay(attempt)
+				}
+				if d > 0 {
 					select {
 					case <-ctx.Done():
 						return

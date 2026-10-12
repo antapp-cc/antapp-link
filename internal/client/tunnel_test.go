@@ -16,19 +16,21 @@ import (
 )
 
 func TestBackoffSequence(t *testing.T) {
+	// 起点 10 秒、封顶 3 分钟：链路抖动往往几秒才恢复，1 秒起步会在对端刚清理连接时
+	// 反复失败，日志看着像在疯狂重连。
 	want := []time.Duration{
-		time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second,
-		16 * time.Second, 30 * time.Second, 30 * time.Second,
+		10 * time.Second, 20 * time.Second, 40 * time.Second, 80 * time.Second,
+		160 * time.Second, 3 * time.Minute, 3 * time.Minute,
 	}
 	for i, w := range want {
 		if got := Backoff(i); got != w {
 			t.Errorf("Backoff(%d) = %v, want %v", i, got, w)
 		}
 	}
-	if got := Backoff(1000); got != 30*time.Second {
-		t.Errorf("退避必须封顶在 30 秒，实际 %v", got)
+	if got := Backoff(1000); got != 3*time.Minute {
+		t.Errorf("退避必须封顶在 3 分钟，实际 %v", got)
 	}
-	if got := Backoff(-5); got != time.Second {
+	if got := Backoff(-5); got != 10*time.Second {
 		t.Errorf("负数次数应按首次处理，实际 %v", got)
 	}
 }
@@ -122,17 +124,28 @@ func TestLoadInviteErrors(t *testing.T) {
 	}
 }
 
-// 首次补拨要立刻拨（成员连接本来就是并发建的），失败之后才退避：
-// 原来是每个槽先干等 1 秒，白白推迟了多连接生效的时间。
+// 补拨成员连接前必须等一等。
+//
+// 返回 0（断开就立刻重拨）会让链路抖动时反复「断开 → 立刻重拨」来回刷，日志看着像
+// 在疯狂重连、实际每次都在对端刚清理连接时失败。首次建连不走这里 —— maintainMembers
+// 第一次直接拨，错开交给 memberStagger。
 func TestMemberRetryDelay(t *testing.T) {
-	if got := memberRetryDelay(0); got != 0 {
-		t.Errorf("首次补拨不该等待，实际 %v", got)
+	if got := memberRetryDelay(0); got != Backoff(0) {
+		t.Errorf("补拨要先等一个退避起点，实际 %v", got)
 	}
-	if got := memberRetryDelay(1); got != time.Second {
-		t.Errorf("首次失败后退避 1 秒，实际 %v", got)
+	if got := memberRetryDelay(1); got != Backoff(0) {
+		t.Errorf("首次失败后按退避，实际 %v", got)
 	}
-	if got := memberRetryDelay(9); got != 30*time.Second {
-		t.Errorf("退避应封顶 30 秒，实际 %v", got)
+	if got := memberRetryDelay(9); got != Backoff(8) {
+		t.Errorf("退避应封顶，实际 %v", got)
+	}
+	for i := 0; i <= 12; i++ {
+		if d := memberRetryDelay(i); d <= 0 {
+			t.Errorf("第 %d 次补拨等待 %v：不该存在零等待的补拨", i, d)
+		}
+	}
+	if Backoff(0) < 5*time.Second {
+		t.Errorf("退避起点太短（%v）：链路抖动往往几秒才恢复，立刻重拨只会反复失败", Backoff(0))
 	}
 }
 

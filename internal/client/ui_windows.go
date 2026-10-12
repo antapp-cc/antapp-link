@@ -791,7 +791,7 @@ func (u *UI) onReconnect() {
 //
 // 用户点「断开连接」会把 wantConnected 置 false，这里随即收手。
 func (u *UI) keepConnected(name string) {
-	delay := 15 * time.Second
+	delay := 30 * time.Second
 	for {
 		select {
 		case <-u.done:
@@ -803,7 +803,7 @@ func (u *UI) keepConnected(name string) {
 		}
 		st := u.app.Status()
 		if st.Online {
-			delay = 15 * time.Second // 在线：退避清零，继续盯着
+			delay = 30 * time.Second // 在线：退避清零，继续盯着
 			continue
 		}
 		// 上一次连接或断开还没结束：Connect() 会立刻返回「正在连接/正在断开，请稍候」，
@@ -813,8 +813,8 @@ func (u *UI) keepConnected(name string) {
 		}
 		u.app.Log().Info(fmt.Sprintf("隧道不在线，自动重连 %s……", name))
 		if err := u.app.Connect(); err != nil {
-			// 连不上就退避，最多 3 分钟一次；连上后由上面的 Online 分支清零
-			if delay < 3*time.Minute {
+			// 连不上就退避，最多 5 分钟一次；连上后由上面的 Online 分支清零
+			if delay < 5*time.Minute {
 				delay *= 2
 			}
 		}
