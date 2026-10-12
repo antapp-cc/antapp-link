@@ -36,9 +36,17 @@ func Up(cfg Config, logger *slog.Logger, force bool) error {
 
 	// 自定义链已存在时这条会报错，忽略即可
 	_ = iptables("-t", "nat", "-N", ChainName)
-	// 整链清空重铺：这条链完全归本项目管理，升级机器上遗留的历史规则
-	// 也一并清掉。
+	// 整链清空重铺（这条链归本项目管理）。
 	_ = iptables("-t", "nat", "-F", ChainName)
+
+	// 再按形态清一遍历史规则：Rules() 全在内置链上，上面那次 -F 清的自定义链早就
+	// 没人用了，不补这一步的话跨版本升级时旧规则永远残留（实测入向那条无状态全放行
+	// 会让本次的 --ctstate 收紧失效）。不存在就忽略。
+	for _, r := range legacyRules(cfg) {
+		args := []string{"-t", TableOrDefault(r.Table), "-D", r.Chain}
+		args = append(args, r.Args...)
+		_ = iptables(args...)
+	}
 
 	for _, r := range Rules(cfg, wan) {
 		if err := ensureRule(r); err != nil {

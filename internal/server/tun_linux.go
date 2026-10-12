@@ -90,6 +90,12 @@ func (t *TUN) Read(p []byte) (int, error) {
 		if n == 0 {
 			continue // 超时：回去看是否已被关闭
 		}
+		// 错误位不能当成"有数据"：这个 fd 是阻塞模式（没注册 netpoller），带着
+		// POLLERR/POLLHUP 直接 read 会一直挂住，pumpTun 就此卡死、还不会投 fatal，
+		// 表现为下行静默中断 —— 正是这个函数要防的故障形态。
+		if rev := fds[0].Revents; rev&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+			return 0, fmt.Errorf("网卡不可用（poll revents=0x%x）", rev)
+		}
 		return t.file.Read(p)
 	}
 }
@@ -110,6 +116,10 @@ func (t *TUN) TryRead(p []byte) (int, error) {
 	}
 	if n == 0 {
 		return 0, nil
+	}
+	// 同 Read：错误位不能当成有数据，否则会在阻塞 fd 上挂死
+	if rev := fds[0].Revents; rev&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+		return 0, fmt.Errorf("网卡不可用（poll revents=0x%x）", rev)
 	}
 	return t.file.Read(p)
 }

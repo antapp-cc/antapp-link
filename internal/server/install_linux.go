@@ -223,13 +223,21 @@ cache-size=1000
 // 还没写进去；而 start 对已 active 的 unit 是 no-op、不会重载配置。于是新写的
 // listen-address + filter-AAAA 不生效，install 却报成功 —— 浏览器随后会拿到 AAAA
 // 绕开隧道直连（实测内嵌页面白屏）。deploy/install.sh 早就补了这一步，Go 侧漏了。
+//
+// 失败只警告不返回错误：这一步排在写 unit 之前，让它中断安装会留下「二进制换了、
+// dnsmasq 配置改了、但 unit 还没写」的半成品机器（deploy/install.sh 同样只是警告）。
 func enableDNSRelay() error {
 	if _, err := exec.LookPath("dnsmasq"); err != nil {
 		fmt.Println("提示: 未安装 dnsmasq，隧道 DNS 中继未启用（deploy/install.sh 会自动安装）")
 		return nil
 	}
 	if err := runSystemctl("enable", "dnsmasq"); err != nil {
-		return err
+		fmt.Printf("警告: 启用 dnsmasq 失败: %v\n", err)
+		return nil
 	}
-	return runSystemctl("restart", "dnsmasq")
+	if err := runSystemctl("restart", "dnsmasq"); err != nil {
+		fmt.Printf("警告: 重启 dnsmasq 失败: %v\n"+
+			"      filter-AAAA 可能没生效 —— 浏览器会拿到 AAAA 地址绕开隧道直连\n", err)
+	}
+	return nil
 }

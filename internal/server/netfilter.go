@@ -69,3 +69,17 @@ func Rules(cfg Config, wanIface string) []Rule {
 		{Chain: "INPUT", Args: []string{"-p", "tcp", "--dport", portRange, "-j", "ACCEPT"}},
 	}
 }
+
+// legacyRules 是本项目历史上铺过、现在已经不用的规则形态，供 Up 在铺新规则前清理。
+//
+// 为什么需要它：Rules() 全部落在内置链（FORWARD/INPUT/POSTROUTING），而 Up 的「整链
+// 清空重铺」清的是 nat 里那个自定义链 —— 它早就没人用了。于是升级机器上旧版留下的
+// 规则会一直躺着。实测踩到的是入向那条无状态全放行（-d 10.10.0.0/24 -j ACCEPT）：
+// 它与新规则的 --ctstate ESTABLISHED,RELATED 并存，旧的在前面，收紧等于没生效。
+//
+// 按形态硬删（-D 容忍不存在），新装机器上是空操作。
+func legacyRules(cfg Config) []Rule {
+	return []Rule{
+		{Chain: "FORWARD", Args: []string{"-d", cfg.Tunnel.Network, "-j", "ACCEPT"}},
+	}
+}

@@ -104,9 +104,10 @@ func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp 
 // handleRelayConn 双向搬运一条转发连接。任一方向出错即整条关闭。
 func handleRelayConn(conn net.Conn, target string, log *slog.Logger) {
 	defer conn.Close()
-	// 3 秒而不是 10 秒：节点机进程活着、那个端口却没服务时，外部连接要白挂满超时。
-	// 目标是隧道内的直连地址（跨境 RTT 两百毫秒量级），3 秒已经非常宽裕。
-	upstream, err := net.DialTimeout("tcp", target, 3*time.Second)
+	// 6 秒：目标是隧道内的跨境直连地址，Linux 的 SYN 重传是 1s/3s/7s，而这条链路
+	// 实测有 30% 级别丢包 —— 3 秒只容得下第二个 SYN，约 9% 的转发连接会被误判失败。
+	// 「节点机端口没服务」的快速路径靠对端回 RST（秒回），不依赖缩短这个超时。
+	upstream, err := net.DialTimeout("tcp", target, 6*time.Second)
 	if err != nil {
 		log.Debug("转发连接拨号节点机失败", connLogAttrs(err, conn, "target", target)...)
 		return

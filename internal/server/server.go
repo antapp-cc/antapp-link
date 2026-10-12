@@ -151,16 +151,16 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 					acceptErr <- nil
 					return
 				}
-				// fd 耗尽是瞬时故障：进程直接退出会变成 systemd 三秒一次的重启循环，
-				// 而重启本身只是把 fd 清掉，什么都没解决。退避重试，让在途连接自然
-				// 回收；一直缓不过来（超过上限）才交回上层，让它拉一个干净进程。
-				if errors.Is(err, syscall.EMFILE) {
+				// fd / 内核缓冲耗尽是瞬时故障：进程直接退出会变成 systemd 三秒一次的
+				// 重启循环，而重启只是把资源清掉，什么都没解决。持续退避重试，让在途
+				// 连接自然回收；不设放弃路径 —— 放弃了就等于这个进程再也接不了连接。
+				if isResourceExhausted(err) {
 					if backoff == 0 {
 						backoff = time.Second
 					} else if backoff < 30*time.Second {
 						backoff *= 2
 					}
-					s.log.Warn("accept 失败：文件描述符耗尽，稍后重试", "retry_in", backoff)
+					s.log.Warn("accept 失败：资源不足（fd 或内核缓冲），稍后重试", "retry_in", backoff)
 					select {
 					case <-runCtx.Done():
 						acceptErr <- nil
@@ -190,6 +190,19 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	case err := <-acceptErr:
 		return err
 	}
+}
+
+// isResourceExhausted 判断 accept 失败是不是「资源暂时不够」（fd、内核缓冲、内存）。
+//
+// 这类错误重试就好；当成致命错误会让进程陷入 systemd 三秒一次的重启循环。
+// ECONNABORTED 不在此列 —— Go 的 poll.FD.Accept 内部已经重试，不会浮上来。
+func isResourceExhausted(err error) bool {
+	for _, e := range []error{syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
 }
 
 // pumpTun 把网卡上的包送往当前客户端。没有客户端时直接丢弃：云服自身的流量不会
@@ -364,7 +377,6 @@ func (s *Server) handleMember(ctx context.Context, tlsConn *tls.Conn, name strin
 			}
 			return
 		}
-		sess.touch()
 		if sl := sess.slotEntry(hello.Member); sl != nil {
 			sl.touch()
 		}
@@ -570,7 +582,6 @@ func (s *Server) handleControl(ctx context.Context, tlsConn *tls.Conn, name stri
 	}
 	sess.slots = make([]*slotConn, approved)
 	sess.slots[0] = newSlotConn(tlsConn)
-	sess.touch()
 	if err := sess.write(proto.TypeHelloAck, ack); err != nil {
 		s.log.Warn("回 HELLO_ACK 失败", connLogAttrs(err, tlsConn, "client", name)...)
 		return
@@ -598,7 +609,6 @@ func (s *Server) serveSession(ctx context.Context, sess *session) {
 				sess.close()
 				return
 			}
-			sess.touch()
 			sess.slot(0).touch()
 			switch typ {
 			case proto.TypeIP:
@@ -726,7 +736,6 @@ type session struct {
 	members     int    // 生效的连接总数（含控制连接），1=单连接
 	closed      chan struct{}
 	once        sync.Once
-	lastSeen    atomic.Int64
 	connectedAt time.Time
 
 	mu    sync.Mutex
@@ -804,6 +813,11 @@ func (s *slotConn) writeLoop() {
 // 直接入队会让写协程读到被覆写的内容。
 func (s *slotConn) enqueue(batch []byte) {
 	if len(batch) == 0 {
+		return
+	}
+	// 先看队列满没满再拷贝：恒定溢出时不必白花一次 16KB 的分配和拷贝
+	if len(s.out) == cap(s.out) {
+		s.drops.Add(1)
 		return
 	}
 	cp := make([]byte, len(batch))
@@ -901,6 +915,7 @@ func (s *session) slotStats() []SlotStatus {
 		if sl != nil {
 			st.RxBytes = sl.rxBytes.Load()
 			st.TxBytes = sl.txBytes.Load()
+			st.Drops = sl.drops.Load()
 		}
 		out = append(out, st)
 	}
@@ -934,11 +949,17 @@ func (s *session) commitSlot(k int, conn net.Conn) bool {
 	return true
 }
 
-// leave 把槽位摘除（成员连接断开时）。该槽流量此后落回控制连接。
+// leave 把槽位摘除（成员连接断开时）。数据此后走 slotEntry → nil → 整批丢弃，
+// 而不是落回控制连接（那会把心跳挤到排队）。
+//
+// 必须先 closeWrite 再置 nil：写协程不属于任何列表，槽位一被摘掉，session.close()
+// 就再也遍历不到它 —— goroutine 和它那 8 格的队列会永久挂住，成员每断开/超时一次
+// 漏一个（实测 20 次断开残留 19 个）。
 func (s *session) leave(k int, conn net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if k > 0 && k < len(s.slots) && s.slots[k] != nil && s.slots[k].conn == conn {
+		s.slots[k].closeWrite()
 		s.slots[k] = nil
 	}
 }
@@ -954,12 +975,6 @@ func (s *session) liveMembers() int {
 		}
 	}
 	return n
-}
-
-func (s *session) touch() { s.lastSeen.Store(time.Now().UnixNano()) }
-
-func (s *session) idleFor() time.Duration {
-	return time.Since(time.Unix(0, s.lastSeen.Load()))
 }
 
 // write 走控制连接（槽 0）写：搬运、心跳、BYE 等控制语义都在这条连接上。

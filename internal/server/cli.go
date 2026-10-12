@@ -403,8 +403,12 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 			if st.Members > 1 {
 				fmt.Fprintf(stdout, "并行连接    : %d/%d 条存活\n", st.LiveMembers, st.Members)
 				for _, sl := range st.Slots {
-					fmt.Fprintf(stdout, "  槽 %d        : 收 %d 字节，发 %d 字节\n",
+					line := fmt.Sprintf("  槽 %d        : 收 %d 字节，发 %d 字节",
 						sl.Slot, sl.RxBytes, sl.TxBytes)
+					if sl.Drops > 0 {
+						line += fmt.Sprintf("，丢批 %d", sl.Drops)
+					}
+					fmt.Fprintln(stdout, line)
 				}
 			}
 			if st.JoinFailures > 0 {

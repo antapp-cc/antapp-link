@@ -16,3 +16,8 @@ var releasePubKey = [32]byte{
 	0xfc, 0x44, 0x0e, 0xbd, 0xed, 0xf2, 0x91, 0x1c,
 	0xda, 0x8b, 0x75, 0xd6, 0xd5, 0x33, 0xda, 0x57,
 }
+
+// ReleasePublicKey 返回内置的发布公钥，供 cmd/antapp-sign 的 -verify 使用：
+// 发布后拿它把刚签出来的清单验一遍（就是节点端会做的那件事），这样「私钥与内置公钥
+// 不配对」会在发布时立刻暴露，而不是等所有节点拒收更新才发现。
+func ReleasePublicKey() [32]byte { return releasePubKey }

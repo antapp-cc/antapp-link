@@ -107,6 +107,10 @@ if (Test-Path $manifest) {
     Write-Host '== 更新清单签名 ==' -ForegroundColor Cyan
     go run ./cmd/antapp-sign -key $releaseKey -in $manifest
     if ($LASTEXITCODE -ne 0) { throw 'latest.json 签名失败' }
+    # 再用内置公钥验一遍（就是节点端会做的事）：私钥与 pubkey.go 不配对时签出来的
+    # 清单会被全网拒收，必须在发布前拦住，而不是等所有节点停止更新。
+    go run ./cmd/antapp-sign -verify -in $manifest
+    if ($LASTEXITCODE -ne 0) { throw 'latest.json 的签名与内置公钥不配对 —— 发布出去所有节点都会拒收' }
 } else {
     Write-Warning 'dist 里没有 latest.json，跳过清单签名（发布自动更新时要手动补 .sig，否则新版本会拒绝更新）'
 }

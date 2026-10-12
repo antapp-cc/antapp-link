@@ -47,6 +47,10 @@ type SlotStatus struct {
 	Slot    int    `json:"slot"`
 	RxBytes uint64 `json:"rx_bytes"`
 	TxBytes uint64 `json:"tx_bytes"`
+	// Drops 是该槽写队列满、整批丢弃的次数。它的作用是给 slotQueueLen 定值提供依据：
+	// 队列深度该按链路 BDP 算（跨境 200ms / 10Mbps 约 250KB），不是按写超时周期，
+	// 而 8 批只有约 128KB —— 到底够不够要看真实丢包率，所以先让它可见。
+	Drops uint64 `json:"drops"`
 }
 
 // WriteStatus 先写临时文件再改名，避免 status 读到半个 JSON。

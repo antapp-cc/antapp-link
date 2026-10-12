@@ -48,11 +48,9 @@ type Asset struct {
 	SHA256 string `json:"sha256"`
 	Size   int64  `json:"size"`
 
-	// Sig 预留给将来的签名校验。
-	//
-	// 现在只校 sha256，挡得住传输损坏，但挡不住更新源本身被替换 —— 谁能改
-	// latest.json 就能往所有节点机推任意程序。这个字段先占好位置，
-	// 以后加 Ed25519 签名不用改清单结构，老客户端也不会因为多了字段而解析失败。
+	// Sig 是历史遗留字段，不再使用：签名改走清单旁边的独立文件 latest.json.sig
+	// （见 verify.go），签的是清单的原始字节 —— 内嵌在清单里做不到，签名要覆盖一个
+	// 包含它自己的文档。留着只为兼容已经写成这样的老清单。
 	Sig string `json:"sig,omitempty"`
 }
 
@@ -76,6 +74,17 @@ type Checker struct {
 	Sources []Source
 	Current string
 	HTTP    *http.Client
+	// PubKey 覆盖内置的发布公钥，只给测试和本地联调工具（tools/updatetest）用：
+	// 它们得拿测试密钥签本地清单，否则只能用生产私钥，那个工具就废了。
+	// 生产路径留空，走 releasePubKey。
+	PubKey *[32]byte
+}
+
+func (c *Checker) publicKey() [32]byte {
+	if c.PubKey != nil {
+		return *c.PubKey
+	}
+	return releasePubKey
 }
 
 // 这里刻意不留「用环境变量覆盖更新源」的口子（曾经有过 ANTAPP_UPDATE_SOURCES）。
@@ -155,7 +164,7 @@ func (c *Checker) fetchManifest(ctx context.Context, src Source) (*Manifest, err
 	if err != nil {
 		return nil, err
 	}
-	if err := verifyManifest(raw, sig); err != nil {
+	if err := verifyManifest(raw, sig, c.publicKey()); err != nil {
 		return nil, err
 	}
 	var m Manifest
