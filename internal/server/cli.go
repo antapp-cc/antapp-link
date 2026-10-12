@@ -26,7 +26,7 @@ const (
 // Version 是 var 而不是 const：发布构建用 -ldflags -X 注入版本号，const 无法在链接期覆盖。
 // 默认值跟着当前版本走 —— 万一有人手搓构建没带 -X，也不至于自认旧版而陷入每小时
 // 「发现新版本 → 下载 → 替换 → 重启」的循环。
-var Version = "0.4.0"
+var Version = "0.4.1"
 
 // RunCLI 是 antapp-linkd 的入口，返回进程退出码。
 func RunCLI(args []string, stdout, stderr io.Writer) int {

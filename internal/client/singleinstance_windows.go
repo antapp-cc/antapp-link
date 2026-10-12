@@ -4,6 +4,7 @@ package client
 
 import (
 	"fmt"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -23,23 +24,34 @@ const (
 // 少了这道闸，桌面快捷方式点几次就起几个实例：托盘上堆一排图标，更要紧的是
 // 几个实例会同时去抢同一块虚拟网卡和同一批路由，把网络搅乱。
 //
-// 返回 ok=false 表示已经有实例在跑。ok=true 时，调用方在退出前要调用 release。
+// 拿不到锁时会短暂重试：自动更新是「先拉起新进程、再退出旧进程」（见
+// update/apply_windows.go 的 swapExe），新进程启动时旧进程往往还在 —— 不等这一下，
+// 新进程会被自己的闸门挡回去，而旧进程紧接着退出，结果更新完一个实例都不剩。
+//
+// 返回 ok=false 表示确实已有实例在跑（不是刚退出）。ok=true 时调用方退出前要 release。
 func SingleInstance() (release func(), ok bool, err error) {
 	name, err := windows.UTF16PtrFromString(instanceMutexName)
 	if err != nil {
 		return nil, false, err
 	}
 
-	h, err := windows.CreateMutex(nil, false, name)
-	if err != nil {
-		// 已存在时 CreateMutex 会把 ERROR_ALREADY_EXISTS 当错误返回
-		if err == windows.ERROR_ALREADY_EXISTS {
-			return nil, false, nil
+	// 4 × 300ms：够等正在退出的旧进程释放互斥体，又不会让「真的已有实例」这种
+	// 最常见的情况等太久。
+	const attempts = 4
+	for i := 0; i < attempts; i++ {
+		h, cerr := windows.CreateMutex(nil, false, name)
+		if cerr == nil {
+			// 句柄不能提前关：关掉就等于放锁，后来的实例又会以为自己是第一个
+			return func() { _ = windows.CloseHandle(h) }, true, nil
 		}
-		return nil, false, fmt.Errorf("创建互斥体: %w", err)
+		if cerr != windows.ERROR_ALREADY_EXISTS {
+			return nil, false, fmt.Errorf("创建互斥体: %w", cerr)
+		}
+		if i < attempts-1 {
+			time.Sleep(300 * time.Millisecond)
+		}
 	}
-	// 句柄不能提前关：关掉就等于放锁，后来的实例又会以为自己是第一个
-	return func() { _ = windows.CloseHandle(h) }, true, nil
+	return nil, false, nil
 }
 
 // ActivateExisting 把已经在跑的那个实例叫到前台来。
