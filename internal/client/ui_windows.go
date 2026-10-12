@@ -477,6 +477,9 @@ func (u *UI) adoptByName(name string) bool {
 		u.alert("切换配置失败", err.Error())
 		return false
 	}
+	// 采纳某个配置就意味着「用户期望连上」：不置这一位的话，先点过「断开连接」
+	// （wantConnected=false）再从托盘切换配置，就永远不会自动重连。
+	u.wantConnected.Store(true)
 	// watchInvite 是后台协程调进来的，控件操作必须回主线程
 	u.mw.Synchronize(u.refresh)
 	go func() {
@@ -625,6 +628,11 @@ func (u *UI) refresh() {
 	}
 
 	// 按钮文字跟着状态走；操作进行中一律禁用，防重入。
+	//
+	// autoRetry 覆盖后台的自动重连：keepConnected 不经过按钮、也不置 busyOp，而
+	// Connect() 失败时 st.Running 一直是 false —— 不额外认这一条，界面就停在
+	// 「连接」上，用户看到日志在刷重连、按钮却毫无反应，以为程序卡死了。
+	autoRetry := busyOp == "" && !st.Online && u.wantConnected.Load()
 	switch {
 	case busyOp == "disconnect":
 		u.btnPrimary.SetText("断开中…")
@@ -632,7 +640,7 @@ func (u *UI) refresh() {
 	case busyOp == "porttest":
 		u.btnPrimary.SetText("断开连接")
 		u.btnPrimary.SetEnabled(false)
-	case busyOp == "connect" || busyOp == "reconnect":
+	case busyOp == "connect" || busyOp == "reconnect" || st.Connecting || autoRetry:
 		u.btnPrimary.SetText("连接中…")
 		u.btnPrimary.SetEnabled(false)
 	case !configured:
@@ -668,12 +676,16 @@ func (u *UI) refresh() {
 		switch {
 		case busyOp == "disconnect":
 			u.ni.SetToolTip("AntApp Link · 正在断开…")
-		case busyOp != "" || (st.Running && !st.Online):
+		case busyOp != "" || st.Connecting || (st.Running && !st.Online):
 			u.ni.SetToolTip("AntApp Link · 连接中…")
 		case !configured:
 			u.ni.SetToolTip("AntApp Link · 未配置连接码")
 		case !st.Running:
-			u.ni.SetToolTip("AntApp Link · 未连接")
+			if u.wantConnected.Load() {
+				u.ni.SetToolTip("AntApp Link · 自动重连中…")
+			} else {
+				u.ni.SetToolTip("AntApp Link · 未连接")
+			}
 		case st.Online:
 			u.ni.SetToolTip(fmt.Sprintf("AntApp Link · 已连接 %s · %d ms", st.TunnelIP, st.RTT.Milliseconds()))
 		default:
@@ -1192,6 +1204,11 @@ func (u *UI) onImport() {
 		u.alert(where, "需要服务端生成的 .antapp 连接码文件，或整行 antapp:// 连接码。\n\n"+err.Error())
 		return
 	}
+
+	// 导入只负责把连接码放好并切过去，界面上会提示「现在可以点连接」——
+	// 所以这里明确清掉自动重连意图：否则 keepConnected 会抢在用户点击之前自己连上，
+	// 和那句提示自相矛盾。
+	u.wantConnected.Store(false)
 
 	// 导入 = 把连接码文件原样复制进 config\（保留你的名字），再切换连接。别卡住界面线程
 	go func() {
