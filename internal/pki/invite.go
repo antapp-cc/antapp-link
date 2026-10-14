@@ -254,11 +254,19 @@ func sessionCacheKey(inv Invite) string {
 	return inv.Server + "\x00" + hex.EncodeToString(sum[:8])
 }
 
+// sessionCacheLimit 是票据缓存的分片上限。键里含服务端地址和客户端身份，换码或换机器
+// 都会新增条目，所以要有界：正常用不了几条（一台机器一个身份），超过说明在频繁换码，
+// 整体清掉重来即可 —— 代价只是这些会话重新做一次完整握手。
+const sessionCacheLimit = 32
+
 func sessionCacheFor(key string) tls.ClientSessionCache {
 	sessionCacheMu.Lock()
 	defer sessionCacheMu.Unlock()
 	if c, ok := sessionCaches[key]; ok {
 		return c
+	}
+	if len(sessionCaches) >= sessionCacheLimit {
+		sessionCaches = map[string]tls.ClientSessionCache{}
 	}
 	// 容量给足：一次会话最多 4 条连接，外加重连后遗留的几个旧票据
 	c := tls.NewLRUClientSessionCache(16)

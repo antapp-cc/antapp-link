@@ -4,6 +4,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -20,6 +21,9 @@ import (
 
 // CREATE_NO_WINDOW：托盘程序调子进程时不能闪黑框
 const createNoWindow = 0x08000000
+
+// resolveTimeout 是连接码里写域名时的解析上限（见 resolveIPv4）。
+const resolveTimeout = 5 * time.Second
 
 func hiddenProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
@@ -143,7 +147,12 @@ func resolveIPv4(host string) (netip.Addr, error) {
 	if a, err := netip.ParseAddr(strings.TrimSpace(host)); err == nil && a.Is4() {
 		return a, nil
 	}
-	addrs, err := net.LookupHost(host)
+	// 必须带超时：net.LookupHost 走的是无超时的默认解析器，DNS 卡住时会把 Capture
+	// 整段拖住 —— 而 Capture 在 Connect 的关键路径上，退出流程的 shutdownWait 正是
+	// 按这条路径的最坏耗时定的。
+	ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
 	if err != nil {
 		return netip.Addr{}, fmt.Errorf("解析 %s 失败: %w", host, err)
 	}

@@ -651,7 +651,11 @@ func (u *UI) refresh() {
 		// （启动时置的），那种情况要显示「导入连接码」让人能重新导入
 		u.btnPrimary.SetText("导入连接码")
 		u.btnPrimary.SetEnabled(true)
-	case busyOp == "connect" || busyOp == "reconnect" || st.Connecting || autoRetry:
+	case busyOp == "connect":
+		// 给得出取消的出口（见 onPrimary）
+		u.btnPrimary.SetText("取消连接")
+		u.btnPrimary.SetEnabled(true)
+	case busyOp == "reconnect" || st.Connecting || autoRetry:
 		u.btnPrimary.SetText("连接中…")
 		u.btnPrimary.SetEnabled(false)
 	case st.Running:
@@ -739,6 +743,12 @@ func (u *UI) refresh() {
 // busyOp 让按钮在点击的一瞬间就给出过渡态并禁用 —— 旧版这里十几秒没有任何变化，
 // 用户以为没点上，反复点击还会跟进行中的网络还原撞车。
 func (u *UI) onPrimary() {
+	// 连接中再点是「取消」：probe 最长 30 秒，不给出口的话用户只能干等，而这时界面上
+	// 每个按钮都是禁用的。
+	if u.busyOp == "connect" {
+		u.app.CancelConnect()
+		return
+	}
 	if u.busyOp != "" {
 		return
 	}

@@ -296,15 +296,19 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	dialer := &net.Dialer{Timeout: handshakeTimeout}
-	raw, err := dialer.DialContext(ctx, "tcp", t.inv.Server)
+	// dial、TLS 握手、等 HELLO_ACK 三段共用一个总预算：三段各给 30 秒的话最坏会拖到 90 秒，
+	// 而重连节奏（keepConnected 的 30 秒一轮）是按「一轮多久」安排的。
+	// 不能只靠 defer cancel —— 下面要跑 sess.run 长循环，预算必须在它之前就释放。
+	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+	defer cancel()
+
+	dialer := &net.Dialer{}
+	raw, err := dialer.DialContext(hctx, "tcp", t.inv.Server)
 	if err != nil {
 		return false, fmt.Errorf("连接 %s: %w", t.inv.Server, err)
 	}
 	conn := tls.Client(raw, tlsCfg)
 
-	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
-	defer cancel()
 	if err := conn.HandshakeContext(hctx); err != nil {
 		raw.Close()
 		return false, fmt.Errorf("TLS 握手（证书或网络问题）: %w", err)
@@ -323,11 +327,17 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if dl, ok := hctx.Deadline(); ok {
+		_ = conn.SetWriteDeadline(dl)
+	}
 	if err := proto.WriteFrame(conn, proto.TypeHello, hello); err != nil {
 		return false, fmt.Errorf("发 HELLO: %w", err)
 	}
+	_ = conn.SetWriteDeadline(time.Time{})
 
-	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	if dl, ok := hctx.Deadline(); ok {
+		_ = conn.SetReadDeadline(dl)
+	}
 	typ, payload, err := proto.ReadFrame(conn)
 	if err != nil {
 		return false, fmt.Errorf("等 HELLO_ACK: %w", err)
@@ -356,6 +366,7 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	if sess.members > 1 {
 		t.log.Info(fmt.Sprintf("多连接并发已启用：%d 条并行连接（含控制连接）", sess.members))
 	}
+	cancel() // 建连结束：后面的读循环与保活只受外层 ctx 约束
 	return true, sess.run(ctx)
 }
 
@@ -613,9 +624,15 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 		"version": protoVersion, "client": t.inv.Name,
 		"sid": sess.sid, "members": sess.members, "member": k,
 	})
+	// HELLO 的写也要吃总预算：高丢包/零窗口下 write 能长时间阻塞，而 hctx 到期并不会
+	// 关掉连接（closeOnDone 监听的是外层 ctx），只靠它封不住这一段。
+	if dl, ok := hctx.Deadline(); ok {
+		_ = conn.SetWriteDeadline(dl)
+	}
 	if err := proto.WriteFrame(conn, proto.TypeHello, hello); err != nil {
 		return err
 	}
+	_ = conn.SetWriteDeadline(time.Time{})
 	// 等两个 ACK 也吃同一个总预算：用 hctx 的截止时刻，而不是再起一段独立超时
 	if dl, ok := hctx.Deadline(); ok {
 		_ = conn.SetReadDeadline(dl)
