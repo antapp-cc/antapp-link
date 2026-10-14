@@ -22,9 +22,6 @@ import (
 // CREATE_NO_WINDOW：托盘程序调子进程时不能闪黑框
 const createNoWindow = 0x08000000
 
-// resolveTimeout 是连接码里写域名时的解析上限（见 resolveIPv4）。
-const resolveTimeout = 5 * time.Second
-
 func hiddenProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 }

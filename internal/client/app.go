@@ -39,8 +39,12 @@ type App struct {
 
 	// connectCtx/connectCancel 是本次连接尝试的上下文，CancelConnect 取消它。
 	// 只覆盖到「接管网络之前」：一旦开始改路由就必须走完，否则会留下半接管状态。
-	connectCtx    context.Context
-	connectCancel context.CancelFunc
+	// connectCtx/connectCancel 是本次连接尝试的上下文，CancelConnect 取消它。
+	// connectCancelable 记录是否还处在可取消阶段（Apply 之前），供界面决定按钮该写
+	// 「取消连接」还是「连接中…」—— 过了那个点还显示可取消、点下去没反应更让人困惑。
+	connectCtx        context.Context
+	connectCancel     context.CancelFunc
+	connectCancelable bool
 
 	checker *update.Checker
 	pending *update.Manifest
@@ -184,14 +188,14 @@ func (a *App) Connect() error {
 	// 整段连接尝试共用一个可取消的 ctx：用户点「取消连接」时，probe 以及它之后的
 	// 抓网络现场、落盘都还有机会中止（接管网络那一步之后不再中止，理由见 connectSlow）。
 	ctx, cancel := context.WithCancel(context.Background())
-	a.connectCtx, a.connectCancel = ctx, cancel
+	a.connectCtx, a.connectCancel, a.connectCancelable = ctx, cancel, true
 	a.mu.Unlock()
 
 	err := a.connectSlow(inv, noNetCfg, statePath)
 
 	a.mu.Lock()
 	a.connecting = false
-	a.connectCtx, a.connectCancel = nil, nil
+	a.connectCtx, a.connectCancel, a.connectCancelable = nil, nil, false
 	// 用户主动取消不是故障，别记进 lastError（界面会把它当错误显示出来）
 	if err != nil && !errors.Is(err, errConnectCanceled) {
 		a.lastError = err.Error()
@@ -215,6 +219,14 @@ func (a *App) CancelConnect() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// CanCancelConnect 报告这次连接尝试是否还处在可取消阶段（Apply 之前）。
+// 界面据此决定按钮写「取消连接」还是「连接中…」。
+func (a *App) CanCancelConnect() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.connectCancel != nil && a.connectCancelable
 }
 
 // connectSlow 干连接这件慢活，全程不持有 a.mu。
@@ -284,6 +296,10 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 		_ = dev.Close()
 		return errConnectCanceled
 	}
+	// 过了这个点就不可取消了（Apply 一开始改路由就必须走完），界面也要据此改口
+	a.mu.Lock()
+	a.connectCancelable = false
+	a.mu.Unlock()
 	if err := snap.Apply(cfg); err != nil {
 		// 网络已经改了一半，立刻还原，别把用户留在半截状态
 		restoreErr := snap.Restore(cfg)
@@ -604,10 +620,16 @@ func (a *App) Disconnect() error {
 // 探测的实际上限（见那里的注释：曾经内层 dial 写死 8 秒，把外层的放宽完全架空）。
 const probeTimeout = 30 * time.Second
 
+// resolveTimeout 是连接码里写域名时那次解析的上限。放在这里而不是平台文件里，是为了让
+// 超时预算的总账在任何平台都算得出来（Windows 专用文件里的常量别处看不见）。
+const resolveTimeout = 5 * time.Second
+
 // shutdownWait 是退出时等待「正在进行的连接/断开」收尾的上限。
 //
-// 要盖住连接流程里最长的两段：probeTimeout，外加接管网络那几秒。
-const shutdownWait = 40 * time.Second
+// 要盖住连接流程里最长的三段：probeTimeout、Capture 里那次域名解析（连接码写域名时才会
+// 走到），外加接管网络那几秒。留 45 秒而不是贴着 35 秒算，是因为超时的代价不对称：等久了
+// 只是关窗慢一点，等漏了则会让退出时网络停在半接管状态 —— 那正是这个常量要防的。
+const shutdownWait = 45 * time.Second
 
 // Shutdown 是「退出程序」专用的收尾：等正在进行的连接/断开结束，再走一次还原。
 //

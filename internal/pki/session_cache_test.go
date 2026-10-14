@@ -6,6 +6,9 @@ import (
 	"testing"
 )
 
+// 注意：本文件的用例会触碰包级 sessionCaches，所以不能加 t.Parallel() ——
+// 并行跑起来会互相清空对方的分片。
+
 // 票据缓存的键必须同时区分「哪台服务器」和「什么身份」。
 //
 // 身份这一维是安全项：TLS 1.3 的 PSK 恢复不会重新验证客户端证书，Go 服务端直接沿用
@@ -54,5 +57,34 @@ func TestSessionCachesBounded(t *testing.T) {
 	sessionCacheMu.Unlock()
 	if n > sessionCacheLimit {
 		t.Errorf("分片数 %d 超过上限 %d", n, sessionCacheLimit)
+	}
+}
+
+// 只测 key 和 map 是不够的：③ 真正的回归点是 ClientTLSConfig 有没有把这个缓存用上。
+// 把 invite.go 里那行改回 tls.NewLRUClientSessionCache(8)，上面那些用例照样会过。
+func TestClientTLSConfigSharesSessionCache(t *testing.T) {
+	inv := mustIssue(t, mustInit(t), "cache-wired")
+	cfg1, err := ClientTLSConfig(inv)
+	if err != nil {
+		t.Fatalf("ClientTLSConfig: %v", err)
+	}
+	cfg2, err := ClientTLSConfig(inv)
+	if err != nil {
+		t.Fatalf("ClientTLSConfig: %v", err)
+	}
+	if cfg1.ClientSessionCache == nil {
+		t.Fatal("ClientTLSConfig 没配会话缓存：重连永远命中不了票据，每次都要完整握手")
+	}
+	if cfg1.ClientSessionCache != cfg2.ClientSessionCache {
+		t.Error("同一个连接码两次建配置应共享同一个会话缓存实例")
+	}
+
+	other := mustIssue(t, mustInit(t), "cache-wired-other")
+	cfg3, err := ClientTLSConfig(other)
+	if err != nil {
+		t.Fatalf("ClientTLSConfig: %v", err)
+	}
+	if cfg3.ClientSessionCache == cfg1.ClientSessionCache {
+		t.Error("不同身份不该共用会话缓存")
 	}
 }

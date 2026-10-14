@@ -1,6 +1,9 @@
 package client
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // 钉住这组超时的相对关系，防止「外层预算被内层更短的硬编码架空」那类回归再次出现 ——
 // 曾经 probeCtx 从 12 秒放宽到 30 秒，而 probeServer 里 dial 写死 8 秒，改动一点没生效，
@@ -17,9 +20,14 @@ func TestHandshakeBudgets(t *testing.T) {
 			memberHandshakeTimeout, handshakeTimeout)
 	}
 
-	// 退出时等待必须盖得住一次完整的连接尝试：探测最坏 probeTimeout，外加接管网络。
-	if shutdownWait < probeTimeout {
-		t.Errorf("shutdownWait %v 盖不住 probeTimeout %v", shutdownWait, probeTimeout)
+	// 退出时等待必须盖得住一次完整的连接尝试：探测最坏 probeTimeout，加上 Capture 里
+	// 那次域名解析（连接码写域名时才会走到，但预算要按最坏算），再加接管网络那几秒。
+	if shutdownWait < probeTimeout+resolveTimeout {
+		t.Errorf("shutdownWait %v 盖不住 probeTimeout %v + resolveTimeout %v",
+			shutdownWait, probeTimeout, resolveTimeout)
+	}
+	if shutdownWait-probeTimeout-resolveTimeout < 5*time.Second {
+		t.Errorf("shutdownWait %v 留给接管网络的余量不足 5 秒", shutdownWait)
 	}
 
 	// 隧道建立后靠心跳判死，判死线必须显著大于一次写超时，否则慢批会把好会话判死。

@@ -250,8 +250,10 @@ var (
 )
 
 func sessionCacheKey(inv Invite) string {
+	// 用完整摘要，不截断：这个键是拿来做身份隔离的，截断等于白送碰撞面，
+	// 而键长多几十字节没有任何代价。
 	sum := sha256.Sum256([]byte(inv.CertPEM))
-	return inv.Server + "\x00" + hex.EncodeToString(sum[:8])
+	return inv.Server + "\x00" + hex.EncodeToString(sum[:])
 }
 
 // sessionCacheLimit 是票据缓存的分片上限。键里含服务端地址和客户端身份，换码或换机器

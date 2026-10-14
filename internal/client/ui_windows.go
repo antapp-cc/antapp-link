@@ -657,10 +657,15 @@ func (u *UI) refresh() {
 		u.btnPrimary.SetText("连接中…")
 		u.btnPrimary.SetEnabled(false)
 	case busyOp == "connect" || st.Connecting:
-		// 给得出取消的出口（见 onPrimary）。st.Connecting 覆盖自动重连发起的那次尝试：
-		// 它同样可能卡在 probe 上最长 30 秒，按钮不该是禁用的。
-		u.btnPrimary.SetText("取消连接")
-		u.btnPrimary.SetEnabled(true)
+		// 只有还处在可取消阶段才给「取消连接」。过了 Apply 那个点再显示可取消、点下去
+		// 却没反应，比直接写「连接中…」更让人困惑。
+		if u.app.CanCancelConnect() {
+			u.btnPrimary.SetText("取消连接")
+			u.btnPrimary.SetEnabled(true)
+		} else {
+			u.btnPrimary.SetText("连接中…")
+			u.btnPrimary.SetEnabled(false)
+		}
 	case autoRetry:
 		u.btnPrimary.SetText("连接中…")
 		u.btnPrimary.SetEnabled(false)
