@@ -37,7 +37,9 @@ type App struct {
 	disconnecting bool
 	lastError     string
 
-	// connectCancel 用于中断正在进行的连接尝试（见 CancelConnect）。
+	// connectCtx/connectCancel 是本次连接尝试的上下文，CancelConnect 取消它。
+	// 只覆盖到「接管网络之前」：一旦开始改路由就必须走完，否则会留下半接管状态。
+	connectCtx    context.Context
 	connectCancel context.CancelFunc
 
 	checker *update.Checker
@@ -179,23 +181,33 @@ func (a *App) Connect() error {
 	}
 	a.connecting = true
 	inv, noNetCfg, statePath := a.inv, a.noNetCfg, a.statePath
+	// 整段连接尝试共用一个可取消的 ctx：用户点「取消连接」时，probe 以及它之后的
+	// 抓网络现场、落盘都还有机会中止（接管网络那一步之后不再中止，理由见 connectSlow）。
+	ctx, cancel := context.WithCancel(context.Background())
+	a.connectCtx, a.connectCancel = ctx, cancel
 	a.mu.Unlock()
 
 	err := a.connectSlow(inv, noNetCfg, statePath)
 
 	a.mu.Lock()
 	a.connecting = false
-	if err != nil {
+	a.connectCtx, a.connectCancel = nil, nil
+	// 用户主动取消不是故障，别记进 lastError（界面会把它当错误显示出来）
+	if err != nil && !errors.Is(err, errConnectCanceled) {
 		a.lastError = err.Error()
 	}
 	a.mu.Unlock()
+	cancel()
 	return err
 }
 
+// errConnectCanceled 表示这次连接尝试被用户主动取消。调用方据此把它与真正的故障区分开。
+var errConnectCanceled = errors.New("连接已取消")
+
 // CancelConnect 中断正在进行的连接尝试。
 //
-// 只覆盖 probe 那一段 —— 它是整条连接路径上最长的等待（最长 probeTimeout），其余步骤
-// （抓网络现场、改路由）都是秒级，为它们引入中途回退不值得。
+// 覆盖到「接管网络之前」为止：probe、抓网络现场、落盘都可以中止。Apply 一旦开始改路由
+// 就不再理会取消 —— 半接管状态比让用户多等几秒糟得多。
 func (a *App) CancelConnect() {
 	a.mu.Lock()
 	cancel := a.connectCancel
@@ -207,6 +219,15 @@ func (a *App) CancelConnect() {
 
 // connectSlow 干连接这件慢活，全程不持有 a.mu。
 func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error {
+	// 本次尝试的取消信号（见 Connect）。接管网络之前的每一步之间都查一次；Apply 之后
+	// 不再查 —— 那时已经动过路由，半途退出会留下半接管状态，比多等一会儿糟得多。
+	a.mu.Lock()
+	ctx := a.connectCtx
+	a.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	cfg := BuildNetConfig(inv)
 	dev, err := OpenDevice()
 	if err != nil {
@@ -230,24 +251,21 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 	//
 	// probeServer 内部不得再压更短的硬编码超时，否则这里放宽多少都白费（曾经就是如此：
 	// 外面从 12 秒改到 30 秒，里面 dial 写死 8 秒照旧先到）。
-	probeCtx, cancelProbe := context.WithTimeout(context.Background(), probeTimeout)
-	// 登记给「取消连接」：这是整条连接路径上最长的一段等待，界面上必须给得出出口。
-	a.mu.Lock()
-	a.connectCancel = cancelProbe
-	a.mu.Unlock()
+	probeCtx, cancelProbe := context.WithTimeout(ctx, probeTimeout)
 	probeErr := a.probeServer(inv, probeCtx)
 	cancelProbe()
-	a.mu.Lock()
-	a.connectCancel = nil
-	a.mu.Unlock()
 	if probeErr != nil {
 		_ = dev.Close()
 		if errors.Is(probeErr, context.Canceled) {
-			return errors.New("连接已取消")
+			return errConnectCanceled
 		}
 		return fmt.Errorf("连接服务端失败，未改动网络: %w", probeErr)
 	}
 
+	if err := ctx.Err(); err != nil {
+		_ = dev.Close()
+		return errConnectCanceled
+	}
 	snap, err := Capture(cfg)
 	if err != nil {
 		_ = dev.Close()
@@ -257,6 +275,14 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 	if err := SaveSnapshot(statePath, snap); err != nil {
 		_ = dev.Close()
 		return fmt.Errorf("写状态文件失败: %w", err)
+	}
+	// 最后一个检查点：Apply 一旦开始改路由就必须走完，不能再中途退出。
+	// 这时状态文件已经落地，取消的话要把它一起清掉，免得下次启动拿它去"自愈"一个
+	// 其实从没被接管的网络。
+	if err := ctx.Err(); err != nil {
+		_ = RemoveSnapshot(statePath)
+		_ = dev.Close()
+		return errConnectCanceled
 	}
 	if err := snap.Apply(cfg); err != nil {
 		// 网络已经改了一半，立刻还原，别把用户留在半截状态

@@ -651,11 +651,17 @@ func (u *UI) refresh() {
 		// （启动时置的），那种情况要显示「导入连接码」让人能重新导入
 		u.btnPrimary.SetText("导入连接码")
 		u.btnPrimary.SetEnabled(true)
-	case busyOp == "connect":
-		// 给得出取消的出口（见 onPrimary）
+	case busyOp == "reconnect":
+		// 断开+连接的组合操作，中途取消的语义不清（算连上还是算断开？），
+		// 所以这一路仍然只显示进行中。
+		u.btnPrimary.SetText("连接中…")
+		u.btnPrimary.SetEnabled(false)
+	case busyOp == "connect" || st.Connecting:
+		// 给得出取消的出口（见 onPrimary）。st.Connecting 覆盖自动重连发起的那次尝试：
+		// 它同样可能卡在 probe 上最长 30 秒，按钮不该是禁用的。
 		u.btnPrimary.SetText("取消连接")
 		u.btnPrimary.SetEnabled(true)
-	case busyOp == "reconnect" || st.Connecting || autoRetry:
+	case autoRetry:
 		u.btnPrimary.SetText("连接中…")
 		u.btnPrimary.SetEnabled(false)
 	case st.Running:
@@ -743,11 +749,10 @@ func (u *UI) refresh() {
 // busyOp 让按钮在点击的一瞬间就给出过渡态并禁用 —— 旧版这里十几秒没有任何变化，
 // 用户以为没点上，反复点击还会跟进行中的网络还原撞车。
 func (u *UI) onPrimary() {
-	// 连接中再点是「取消」：probe 最长 30 秒，不给出口的话用户只能干等，而这时界面上
-	// 每个按钮都是禁用的。
-	if u.busyOp == "connect" {
-		// 意图标志也必须一起放下：keepConnected 每轮都看它，留着的话过 30 秒又自己连回来，
-		// 用户看到的是「明明取消了却还是连上了」。
+	// 手动连接中、或自动重连正在跑一次尝试：再点都是「取消」。
+	// 意图标志必须一起放下：keepConnected 每轮都看它，留着的话过 30 秒又自己连回来，
+	// 用户看到的是「明明取消了却还是连上了」。
+	if u.busyOp == "connect" || (u.busyOp == "" && u.app.Status().Connecting) {
 		u.wantConnected.Store(false)
 		u.app.CancelConnect()
 		return
