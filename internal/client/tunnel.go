@@ -24,21 +24,32 @@ import (
 const (
 	pingInterval = 10 * time.Second
 	// deadAfter 必须显著大于 slotWriteTimeout：单连接模式（members=1）下数据也走槽 0，
-	// 一个数据批最长能占住那条连接的写锁 20 秒，心跳只能排在它后面。30 秒的判死线只留
-	// 10 秒余量，连续两个慢批就会把好好的会话自己判死重连。
+	// 一个数据批最长能占住那条连接的写锁 20 秒，心跳只能排在它后面。60 秒的判死线留了
+	// 三倍余量，连续两个慢批也不会把好好的会话自己判死重连。
 	deadAfter = 60 * time.Second
 	// handshakeTimeout 同时管 dial、TLS 握手、等 HELLO_ACK 三段，取的是三者的公共上限。
 	//
-	// 从 15 秒放宽到 30 秒，依据是晚高峰跨境链路的实测：16% 丢包、RTT 250ms 时握手要经历
-	// 多次重传才可能通过；内核 tcp_syn_retries=6 会一直重试到 63 秒，客户端 15 秒就放弃，
-	// 等于把后面几次重传机会全部浪费掉。实测某晚高峰一小时内 9 次尝试、0 次建成会话，
-	// 报错清一色是 dial i/o timeout —— 不是对端拒绝，是我们自己放弃太早。
+	// 从 15 秒放宽到 30 秒，依据是高丢包跨境链路的实测：RTT 250ms、丢包 16% 时这三段
+	// 每一步都得靠 TCP 重传才过得去，累计轻易超过 15 秒。晚高峰一小时内 9 次连接尝试、
+	// 0 次建成会话，报错是 dial i/o timeout —— 不是对端拒绝，是自己放弃太早。
 	//
-	// 服务端 server.handshakeTimeout 必须同步放宽：超时是双方取最小值，任何一方先到都会
-	// 把本来能建成的连接掐掉。
+	// 客户端跑在 Windows 上，SYN 重传节奏由 Windows 内核决定（约 3 秒起步、二十来秒
+	// 放弃），Linux 的 tcp_syn_retries 管不到它 —— 服务端那台才是 Linux，两者的参数
+	// 不能混起来当依据。
+	//
+	// 服务端 server.handshakeTimeout 必须同步放宽：在 accept 之后的 TLS 握手与 HELLO 段，
+	// 超时取双方最小值，一方先到就会把本来能建成的连接掐掉（客户端看到的是「连接被重置」
+	// 而不是超时）。
 	handshakeTimeout = 30 * time.Second
-	readBufferSize   = 65535
-	protoVersion     = 1
+	// memberHandshakeTimeout 是成员连接一次建连（dial + TLS + 两个 ACK）的总预算。
+	//
+	// 不复用 handshakeTimeout：成员断了会退避重拨，它属于「补齐」而不是「首次建立」，
+	// 三段各 30 秒意味着一轮失败最坏拖 90 秒，违背「成员断开后 30 秒内补齐」的设计目标
+	// （docs/superpowers/specs/2026-10-01-multi-tcp-concurrency.md）。用一个总预算把
+	// 三段合计封住，长尾才有界。
+	memberHandshakeTimeout = 12 * time.Second
+	readBufferSize         = 65535
+	protoVersion           = 1
 
 	// memberPingInterval 是成员连接的心跳间隔。
 	//
@@ -571,8 +582,13 @@ func closeOnDone(ctx context.Context, conn io.Closer) (stop func()) {
 // dialMember 拨一条成员连接并完成认亲握手；成功后进入该连接的读循环（阻塞）。
 // TLS 配置复用会话里那一份：会话缓存在成员连接之间共享，才有机会走会话恢复。
 func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) error {
-	dialer := &net.Dialer{Timeout: handshakeTimeout}
-	raw, err := dialer.DialContext(ctx, "tcp", t.inv.Server)
+	// 建连这三段共用一个总预算（见 memberHandshakeTimeout）。进入读循环前必须让它失效，
+	// 并且保活与关闭只认外层 ctx —— 否则预算一到，会把一条已经正常工作的成员连接关掉。
+	hctx, cancelBudget := context.WithTimeout(ctx, memberHandshakeTimeout)
+	defer cancelBudget() // 兜底：任何提前 return 都要把预算放掉
+
+	dialer := &net.Dialer{}
+	raw, err := dialer.DialContext(hctx, "tcp", t.inv.Server)
 	if err != nil {
 		return fmt.Errorf("成员连接 %d 拨号: %w", k, err)
 	}
@@ -582,8 +598,6 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 	defer conn.Close()
 	defer closeOnDone(ctx, conn)()
 
-	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
-	defer cancel()
 	if err := conn.HandshakeContext(hctx); err != nil {
 		return fmt.Errorf("成员连接 %d TLS 握手: %w", k, err)
 	}
@@ -599,7 +613,10 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 	if err := proto.WriteFrame(conn, proto.TypeHello, hello); err != nil {
 		return err
 	}
-	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	// 等两个 ACK 也吃同一个总预算：用 hctx 的截止时刻，而不是再起一段独立超时
+	if dl, ok := hctx.Deadline(); ok {
+		_ = conn.SetReadDeadline(dl)
+	}
 	typ, _, err := proto.ReadFrame(conn)
 	if err != nil {
 		return err
@@ -617,6 +634,8 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 		return err
 	}
 	_ = conn.SetReadDeadline(time.Time{})
+	// 建连结束：立刻把预算放掉，后面的读循环与保活只受外层 ctx 约束
+	cancelBudget()
 	if typ2 != proto.TypeMemberAck {
 		return fmt.Errorf("成员连接 %d 期望就绪 ACK 收到 %s", k, typ2.String())
 	}

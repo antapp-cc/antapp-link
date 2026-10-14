@@ -208,9 +208,13 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 	// 先确认服务端真的连得上，再动用户的网络。
 	// 顺序反过来的话，服务端不可达时用户要白白经历「网络被接管 → 自检失败 → 再还原」
 	// 这十几秒的断网 —— 这种体验不能有第二次。
-	// 探测超时与 tunnel.handshakeTimeout 同界放宽到 30 秒：高丢包链路上 12 秒往往只够把
-	// SYN 重传两轮，探测失败就白跑一次「不接管网络」的尝试，用户看到的是反复「连接失败」。
-	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 30*time.Second)
+	// 探测超时与 tunnel.handshakeTimeout 同界：探测本身也要走 dial + TLS 握手，在高丢包
+	// 链路上同样会被重传拖过 12 秒，失败就白跑一次「不接管网络」的尝试，用户看到的是
+	// 反复「连接失败」。
+	//
+	// probeServer 内部不得再压更短的硬编码超时，否则这里放宽多少都白费（曾经就是如此：
+	// 外面从 12 秒改到 30 秒，里面 dial 写死 8 秒照旧先到）。
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), probeTimeout)
 	probeErr := a.probeServer(inv, probeCtx)
 	cancelProbe()
 	if probeErr != nil {
@@ -398,7 +402,12 @@ func (a *App) probeServer(inv pki.Invite, ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	d := net.Dialer{Timeout: 8 * time.Second}
+	// 超时完全交给调用方的 ctx，这里不再压一层更短的硬编码。
+	//
+	// 原来 dial 写死 8 秒、握手写死 10 秒，结果外面把探测预算从 12 秒放宽到 30 秒毫无
+	// 作用：先到的仍是那 8 秒，报错也仍是 dial i/o timeout（Dialer.Timeout 报 i/o timeout，
+	// context 超时报 context deadline exceeded —— 看错误文案就能分辨是谁掐的）。
+	d := net.Dialer{}
 	raw, err := d.DialContext(ctx, "tcp", inv.Server)
 	if err != nil {
 		return fmt.Errorf("连接 %s: %w", inv.Server, err)
@@ -406,9 +415,7 @@ func (a *App) probeServer(inv pki.Invite, ctx context.Context) error {
 	defer raw.Close()
 
 	conn := tls.Client(raw, tlsCfg)
-	hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := conn.HandshakeContext(hctx); err != nil {
+	if err := conn.HandshakeContext(ctx); err != nil {
 		return fmt.Errorf("TLS 握手失败（证书或网络问题）: %w", err)
 	}
 	return nil
@@ -424,8 +431,11 @@ func (a *App) healthCheck(ctx context.Context) error {
 	a.mu.Unlock()
 
 	// 第一级：连服务端在隧道里的监听地址 —— 这条一定走隧道，不受出口影响
+	// 这里的超时按跨境链路的实际成本给：隧道内 RTT 就是链路 RTT（晚高峰 250ms 且会重传），
+	// 原来给的 5 秒只够 SYN 重传两次，一旦赶上就要误判成「出网自检失败」—— 而那条路的代价
+	// 是把好好的隧道断掉、再还原用户网络。宁宽勿紧。
 	tunnelAddr := net.JoinHostPort(inv.Gateway, tunnelPortOf(inv))
-	if err := probeTCP(ctx, tunnelAddr, 5*time.Second); err != nil {
+	if err := probeTCP(ctx, tunnelAddr, 15*time.Second); err != nil {
 		return fmt.Errorf("隧道内不通（%s）: %w", tunnelAddr, err)
 	}
 
@@ -438,11 +448,11 @@ func (a *App) healthCheck(ctx context.Context) error {
 	resolver := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
+			d := net.Dialer{Timeout: 10 * time.Second}
 			return d.DialContext(ctx, network, net.JoinHostPort(dnsServer, "53"))
 		},
 	}
-	lookupCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	lookupCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	if _, err := resolver.LookupHost(lookupCtx, "www.baidu.com"); err != nil {
 		return fmt.Errorf("DNS %s 解析不了域名: %w", dnsServer, err)
@@ -538,9 +548,13 @@ func (a *App) Disconnect() error {
 	return restoreErr
 }
 
+// probeTimeout 是探测服务端的预算。probeServer 内部不再压更短的硬编码超时，所以它就是
+// 探测的实际上限（见那里的注释：曾经内层 dial 写死 8 秒，把外层的放宽完全架空）。
+const probeTimeout = 30 * time.Second
+
 // shutdownWait 是退出时等待「正在进行的连接/断开」收尾的上限。
 //
-// 要盖住连接流程里最长的两段：probeServer 的 30 秒超时，外加接管网络那几秒。
+// 要盖住连接流程里最长的两段：probeTimeout，外加接管网络那几秒。
 const shutdownWait = 40 * time.Second
 
 // Shutdown 是「退出程序」专用的收尾：等正在进行的连接/断开结束，再走一次还原。
