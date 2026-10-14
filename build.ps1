@@ -50,20 +50,11 @@ Build-Target -Goos 'linux' -Goarch 'amd64' -Out 'antapp-linkd' -Pkg './cmd/antap
 Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-link.exe' -Pkg './cmd/antapp-link' `
     -Ldflags "-s -w -H windowsgui -X github.com/antapp-cc/antapp-link/internal/client.Version=$Version"
 
-# 单文件安装器：客户端 exe 和第三方许可先拷进 assets，由 go:embed 内嵌进安装器
-$setupAssets = Join-Path $root 'cmd\antapp-setup\assets'
-New-Item -ItemType Directory -Force $setupAssets | Out-Null
-Copy-Item (Join-Path $distDir 'antapp-link.exe') (Join-Path $setupAssets 'antapp-link.exe') -Force
-Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') (Join-Path $setupAssets 'README.md') -Force
-
-# 安装程序：内嵌了客户端，分发只带这一个文件
-Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-setup.exe' -Pkg './cmd/antapp-setup' `
-    -Ldflags "-s -w -H windowsgui -X github.com/antapp-cc/antapp-link/internal/setup.Version=$Version"
-
-# 合规要求：Wintun 的预编译二进制许可要求随包附上原文
-Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') (Join-Path $distDir 'README.md') -Force
-
-# 代码签名：蚁巢证书（装在本机证书库），安装器和客户端都签，时间戳保证证书过期后签名仍有效
+# 代码签名：蚁巢证书（装在本机证书库），客户端和安装器都要签，时间戳保证证书过期后签名仍有效。
+#
+# 顺序有硬要求：客户端必须【先签名、再嵌进安装器】。反过来的话（先嵌后签），安装器里装出来
+# 的是未签名的客户端，而 dist/ 里那份 —— 也就是 latest.json 指向、自动更新会下载的那份 ——
+# 是签过名的：同一个版本，两条分发路径给出两个不同的二进制。
 $thumbprint = '58075F4CBD7592BB7A79B6B3F210A2AE551213D8'
 $timestampUrl = 'http://timestamp.digicert.com'
 $signtool = @(
@@ -79,17 +70,35 @@ if (-not $signtool) {
             Select-Object -First 1 -ExpandProperty FullName
     }
 }
-if ($signtool) {
-    Write-Host '== 代码签名 ==' -ForegroundColor Cyan
-    foreach ($exe in @('antapp-setup.exe', 'antapp-link.exe')) {
-        $path = Join-Path $distDir $exe
-        & $signtool sign /v /fd SHA256 /sha1 $thumbprint /tr $timestampUrl /td SHA256 $path | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "$exe 签名失败" }
-        Write-Host "  $exe 已签名（CN=Antapp）"
-    }
-} else {
-    Write-Warning '没找到 signtool，本次构建不签名'
+
+function Invoke-Sign {
+    param([string]$Exe)
+    if (-not $signtool) { return }
+    & $signtool sign /v /fd SHA256 /sha1 $thumbprint /tr $timestampUrl /td SHA256 (Join-Path $distDir $Exe) | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "$Exe 签名失败" }
+    Write-Host "  $Exe 已签名（CN=Antapp）"
 }
+
+if ($signtool) { Write-Host '== 代码签名 ==' -ForegroundColor Cyan }
+else { Write-Warning '没找到 signtool，本次构建不签名' }
+
+Invoke-Sign 'antapp-link.exe'
+
+# 单文件安装器：客户端 exe 和第三方许可拷进 assets，由 go:embed 内嵌进安装器。
+# 必须在客户端签名【之后】拷，理由见上面那段注释。
+$setupAssets = Join-Path $root 'cmd\antapp-setup\assets'
+New-Item -ItemType Directory -Force $setupAssets | Out-Null
+Copy-Item (Join-Path $distDir 'antapp-link.exe') (Join-Path $setupAssets 'antapp-link.exe') -Force
+Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') (Join-Path $setupAssets 'README.md') -Force
+
+# 安装程序：内嵌了客户端，分发只带这一个文件
+Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-setup.exe' -Pkg './cmd/antapp-setup' `
+    -Ldflags "-s -w -H windowsgui -X github.com/antapp-cc/antapp-link/internal/setup.Version=$Version"
+
+Invoke-Sign 'antapp-setup.exe'
+
+# 合规要求：Wintun 的预编译二进制许可要求随包附上原文
+Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') (Join-Path $distDir 'README.md') -Force
 
 # 给客户的分发物：签名后的单文件安装器，带上版本号命名
 $setupDist = Join-Path $distDir "AntAppLink-安装-$Version.exe"
