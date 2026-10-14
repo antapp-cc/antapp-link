@@ -1,10 +1,12 @@
 package pki
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -233,20 +235,34 @@ func Decode(code string) (Invite, error) {
 // 同一会话内的成员连接能命中（它们共用同一个 tls.Config）—— 一旦重连就是完整握手，
 // 在 250ms 的跨境链路上白搭掉一个 RTT。这里按服务端地址分片：换连接码去连另一台服务器
 // 时，不会拿旧服务器的票据去试（那必然失败并回退，等于白费）。
+// 缓存键必须同时含「连哪台服务器」和「以什么身份连」。
+//
+// 地址：Go 客户端缓存的 key 就是 ServerName，而本项目用的是固定常量（见 ServerName），
+// 不按地址分片就会跨服务器串用票据。
+//
+// 身份：TLS 1.3 的 PSK 恢复不会重新验证客户端证书 —— Go 服务端直接沿用票据里存的
+// peerCertificates（crypto/tls/handshake_server_tls13.go 在 usingPSK 时不发
+// CertificateRequest），而服务端是按证书 CN 认节点的。只按地址分片的话，换了连接码
+// （改名、重签证书）之后旧票据仍会被接受，服务端会把新码认成旧节点。
 var (
 	sessionCacheMu sync.Mutex
 	sessionCaches  = map[string]tls.ClientSessionCache{}
 )
 
-func sessionCacheFor(server string) tls.ClientSessionCache {
+func sessionCacheKey(inv Invite) string {
+	sum := sha256.Sum256([]byte(inv.CertPEM))
+	return inv.Server + "\x00" + hex.EncodeToString(sum[:8])
+}
+
+func sessionCacheFor(key string) tls.ClientSessionCache {
 	sessionCacheMu.Lock()
 	defer sessionCacheMu.Unlock()
-	if c, ok := sessionCaches[server]; ok {
+	if c, ok := sessionCaches[key]; ok {
 		return c
 	}
 	// 容量给足：一次会话最多 4 条连接，外加重连后遗留的几个旧票据
 	c := tls.NewLRUClientSessionCache(16)
-	sessionCaches[server] = c
+	sessionCaches[key] = c
 	return c
 }
 
@@ -269,6 +285,6 @@ func ClientTLSConfig(inv Invite) (*tls.Config, error) {
 		NextProtos:   []string{ALPN},
 		// 成员连接、以及断线重连都复用 TLS 会话（老熟人免重验），省一个 RTT。
 		// 不开 EarlyData：Go 无客户端 0-RTT 支持且有重放风险。
-		ClientSessionCache: sessionCacheFor(inv.Server),
+		ClientSessionCache: sessionCacheFor(sessionCacheKey(inv)),
 	}, nil
 }
