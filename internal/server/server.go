@@ -22,8 +22,11 @@ import (
 
 const (
 	// 客户端每 10 秒发一次 PING，这里给六倍宽限，避免网络抖动就误踢。
-	clientDeadAfter  = 60 * time.Second
-	handshakeTimeout = 15 * time.Second
+	clientDeadAfter = 60 * time.Second
+	// 与客户端 handshakeTimeout 同界放宽到 30 秒。超时是双方取最小值：客户端愿意等 30 秒
+	// 而这里 15 秒就掐，慢连接照样建不起来（客户端拿到的是「连接被重置」而非超时）。
+	// 高丢包跨境链路上客户端可能要靠多次重传才能把 TLS 握手和 HELLO 送上来。
+	handshakeTimeout = 30 * time.Second
 	// 成员连接不参与心跳（只有控制连接有 PING/PONG），一整天没数据也是正常的。
 	// 但只剩单方向可用的半死连接会让读循环永不返回、槽位被永久占死（客户端补拨
 	// 一直拿到「槽位不可用」），所以给一个宽松的空闲上限：120s 不误杀安静连接，

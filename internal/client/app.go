@@ -208,7 +208,9 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 	// 先确认服务端真的连得上，再动用户的网络。
 	// 顺序反过来的话，服务端不可达时用户要白白经历「网络被接管 → 自检失败 → 再还原」
 	// 这十几秒的断网 —— 这种体验不能有第二次。
-	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 12*time.Second)
+	// 探测超时与 tunnel.handshakeTimeout 同界放宽到 30 秒：高丢包链路上 12 秒往往只够把
+	// SYN 重传两轮，探测失败就白跑一次「不接管网络」的尝试，用户看到的是反复「连接失败」。
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 30*time.Second)
 	probeErr := a.probeServer(inv, probeCtx)
 	cancelProbe()
 	if probeErr != nil {
@@ -538,8 +540,8 @@ func (a *App) Disconnect() error {
 
 // shutdownWait 是退出时等待「正在进行的连接/断开」收尾的上限。
 //
-// 要盖住连接流程里最长的两段：probeServer 的 12 秒超时，外加接管网络那几秒。
-const shutdownWait = 20 * time.Second
+// 要盖住连接流程里最长的两段：probeServer 的 30 秒超时，外加接管网络那几秒。
+const shutdownWait = 40 * time.Second
 
 // Shutdown 是「退出程序」专用的收尾：等正在进行的连接/断开结束，再走一次还原。
 //

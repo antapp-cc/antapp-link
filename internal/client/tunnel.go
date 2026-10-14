@@ -26,8 +26,17 @@ const (
 	// deadAfter 必须显著大于 slotWriteTimeout：单连接模式（members=1）下数据也走槽 0，
 	// 一个数据批最长能占住那条连接的写锁 20 秒，心跳只能排在它后面。30 秒的判死线只留
 	// 10 秒余量，连续两个慢批就会把好好的会话自己判死重连。
-	deadAfter        = 60 * time.Second
-	handshakeTimeout = 15 * time.Second
+	deadAfter = 60 * time.Second
+	// handshakeTimeout 同时管 dial、TLS 握手、等 HELLO_ACK 三段，取的是三者的公共上限。
+	//
+	// 从 15 秒放宽到 30 秒，依据是晚高峰跨境链路的实测：16% 丢包、RTT 250ms 时握手要经历
+	// 多次重传才可能通过；内核 tcp_syn_retries=6 会一直重试到 63 秒，客户端 15 秒就放弃，
+	// 等于把后面几次重传机会全部浪费掉。实测某晚高峰一小时内 9 次尝试、0 次建成会话，
+	// 报错清一色是 dial i/o timeout —— 不是对端拒绝，是我们自己放弃太早。
+	//
+	// 服务端 server.handshakeTimeout 必须同步放宽：超时是双方取最小值，任何一方先到都会
+	// 把本来能建成的连接掐掉。
+	handshakeTimeout = 30 * time.Second
 	readBufferSize   = 65535
 	protoVersion     = 1
 
