@@ -746,6 +746,9 @@ func (u *UI) onPrimary() {
 	// 连接中再点是「取消」：probe 最长 30 秒，不给出口的话用户只能干等，而这时界面上
 	// 每个按钮都是禁用的。
 	if u.busyOp == "connect" {
+		// 意图标志也必须一起放下：keepConnected 每轮都看它，留着的话过 30 秒又自己连回来，
+		// 用户看到的是「明明取消了却还是连上了」。
+		u.wantConnected.Store(false)
 		u.app.CancelConnect()
 		return
 	}
