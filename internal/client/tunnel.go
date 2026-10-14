@@ -47,7 +47,10 @@ const (
 	// 三段各 30 秒意味着一轮失败最坏拖 90 秒，违背「成员断开后 30 秒内补齐」的设计目标
 	// （docs/superpowers/specs/2026-10-01-multi-tcp-concurrency.md）。用一个总预算把
 	// 三段合计封住，长尾才有界。
-	memberHandshakeTimeout = 12 * time.Second
+	//
+	// 取 20 秒而不是更短：这三段在丢包链路上每段都要重传（间隔 1s/2s/4s 递增），12 秒在
+	// 严重丢包时可能一次都建不起来；20 秒仍留在一「30 秒内补齐」的单次边界之内。
+	memberHandshakeTimeout = 20 * time.Second
 	readBufferSize         = 65535
 	protoVersion           = 1
 
