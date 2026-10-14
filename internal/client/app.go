@@ -9,6 +9,7 @@ import (
 	"net"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/antapp-cc/antapp-link/internal/pki"
@@ -41,6 +42,17 @@ type App struct {
 	pending *update.Manifest
 
 	orderTrace *OrderTracer
+
+	// 并行连接数按链路成败自适应：跨境晚高峰实测 16% 丢包时，一次会话要连建 1 控制 +
+	// 3 成员，每条都得走完 TLS 握手和 HELLO，全部成功的概率极低（一小时 9 次尝试、0 次
+	// 建成会话）；可写死单连接也不行 —— 心跳会和全部数据挤同一条 TCP，一个包重传就能
+	// 把延迟顶到十几秒。所以按探测结果上下调整：连不上就减，稳住了再加回去。
+	//
+	// 只在 connectSlow 这条串行路径上读写（connecting 标志已保证互斥），用 atomic 是
+	// 为了让状态读取不必去抢 a.mu。
+	preferredMembers atomic.Int32 // 0 = 还没定过，用连接码里的值
+	probeStreak      atomic.Int32 // 正数=连续成功，负数=连续失败
+	lastDowngrade    atomic.Int64 // UnixNano，升档冷却用
 }
 
 type Option func(*App)
@@ -190,7 +202,68 @@ func (a *App) Connect() error {
 }
 
 // connectSlow 干连接这件慢活，全程不持有 a.mu。
+// memberRampCooldown 是降档后的冷却期，期间不再升档 —— 否则会在临界质量上反复
+// 「降一档就连上、加一档又失败」。10 分钟足以覆盖一次晚高峰的拥塞波动。
+const memberRampCooldown = 10 * time.Minute
+
+// currentMembers 返回本次连接该请求几条并行连接。还没被自适应调整过时取连接码的值。
+//
+// 结果被 target 夹住：用户换连接码后目标可能变小（比如从 4 条的码换到 2 条的码），而
+// 自适应值是按旧目标算的，不夹的话会向服务端请求超过新码允许的连接数。
+func (a *App) currentMembers(target int) int {
+	target = effectiveMembers(target)
+	if v := int(a.preferredMembers.Load()); v > 0 && v < target {
+		return effectiveMembers(v)
+	}
+	return target
+}
+
+// noteProbeResult 记录一次服务端探测的成败，并按连续结果调整并行连接数。
+//
+// 降档要求「连续两次失败」：单次失败可能只是链路抖一下，立刻降会让连接数在临界点上
+// 来回跳。升档要求「连续三次成功」且距上次降档超过冷却期，避免刚降下去又马上加回来。
+func (a *App) noteProbeResult(ok bool, target int) {
+	if target <= 1 {
+		return // 本来就是单连接，没有可调的余地
+	}
+	var streak int32
+	if ok {
+		if s := a.probeStreak.Load(); s > 0 {
+			streak = s + 1
+		} else {
+			streak = 1
+		}
+	} else {
+		if s := a.probeStreak.Load(); s < 0 {
+			streak = s - 1
+		} else {
+			streak = -1
+		}
+	}
+	a.probeStreak.Store(streak)
+
+	cur := a.currentMembers(target)
+	switch {
+	case streak <= -2 && cur > 1:
+		a.preferredMembers.Store(int32(cur - 1))
+		a.lastDowngrade.Store(time.Now().UnixNano())
+		a.probeStreak.Store(0)
+		a.log.Warn("连续探测失败，降低并行连接数后重试", "from", cur, "to", cur-1)
+	case streak >= 3 && cur < target:
+		if time.Since(time.Unix(0, a.lastDowngrade.Load())) < memberRampCooldown {
+			return
+		}
+		a.preferredMembers.Store(int32(cur + 1))
+		a.probeStreak.Store(0)
+		a.log.Info("链路已连续探测成功，提高并行连接数", "from", cur, "to", cur+1)
+	}
+}
+
 func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error {
+	// 自适应结果覆盖连接码里的固定值。inv 是按值传进来的副本，改它不影响 App 保存的连接码。
+	rawMembers := effectiveMembers(inv.Members)
+	inv.Members = a.currentMembers(rawMembers)
+
 	cfg := BuildNetConfig(inv)
 	dev, err := OpenDevice()
 	if err != nil {
@@ -217,6 +290,7 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 	probeCtx, cancelProbe := context.WithTimeout(context.Background(), probeTimeout)
 	probeErr := a.probeServer(inv, probeCtx)
 	cancelProbe()
+	a.noteProbeResult(probeErr == nil, rawMembers)
 	if probeErr != nil {
 		_ = dev.Close()
 		return fmt.Errorf("连接服务端失败，未改动网络: %w", probeErr)

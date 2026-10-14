@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -226,6 +227,29 @@ func Decode(code string) (Invite, error) {
 	return inv, nil
 }
 
+// 会话票据缓存必须跨 ClientTLSConfig 调用共享才有意义。
+//
+// 原来每次调用都 tls.NewLRUClientSessionCache 新建一个，看着配了 resumption，实际只有
+// 同一会话内的成员连接能命中（它们共用同一个 tls.Config）—— 一旦重连就是完整握手，
+// 在 250ms 的跨境链路上白搭掉一个 RTT。这里按服务端地址分片：换连接码去连另一台服务器
+// 时，不会拿旧服务器的票据去试（那必然失败并回退，等于白费）。
+var (
+	sessionCacheMu sync.Mutex
+	sessionCaches  = map[string]tls.ClientSessionCache{}
+)
+
+func sessionCacheFor(server string) tls.ClientSessionCache {
+	sessionCacheMu.Lock()
+	defer sessionCacheMu.Unlock()
+	if c, ok := sessionCaches[server]; ok {
+		return c
+	}
+	// 容量给足：一次会话最多 4 条连接，外加重连后遗留的几个旧票据
+	c := tls.NewLRUClientSessionCache(16)
+	sessionCaches[server] = c
+	return c
+}
+
 // ClientTLSConfig 用连接码里的材料建 TLS 配置。ServerName 用固定名而不是 IP，
 // 这样服务端换 IP 不用重签证书。
 func ClientTLSConfig(inv Invite) (*tls.Config, error) {
@@ -243,8 +267,8 @@ func ClientTLSConfig(inv Invite) (*tls.Config, error) {
 		ServerName:   ServerName,
 		MinVersion:   tls.VersionTLS13,
 		NextProtos:   []string{ALPN},
-		// 多连接并发：成员连接复用 TLS 会话（老熟人免重验），省服务端计算量。
+		// 成员连接、以及断线重连都复用 TLS 会话（老熟人免重验），省一个 RTT。
 		// 不开 EarlyData：Go 无客户端 0-RTT 支持且有重放风险。
-		ClientSessionCache: tls.NewLRUClientSessionCache(8),
+		ClientSessionCache: sessionCacheFor(inv.Server),
 	}, nil
 }
