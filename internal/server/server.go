@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,6 +78,9 @@ type Server struct {
 	fatal chan error
 	// 端口转发监听结果，nil 表示还没跑起来；status 据此报真实可用性
 	relay atomic.Pointer[relayState]
+
+	// udp 是 UDP 数据通道的多路复用器（mode=udp 时才有）。控制仍走 TCP，数据包走它。
+	udp *udpMux
 }
 
 // relayState 是端口转发器的启动结果：就绪，或一句能被 status 展示的失败原因。
@@ -110,6 +114,19 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 
 	s := &Server{cfg: cfg, tun: tun, tlsCfg: tlsCfg, log: logger, joins: newJoinGuard(),
 		fatal: make(chan error, 1)}
+
+	// UDP 数据通道：与 TCP 共用同一个端口号（不同协议，不冲突）。控制连接仍走 TCP，
+	// 数据包改走这里。设计见 docs/superpowers/specs/2026-10-17-udp-data-channel-design.md
+	if cfg.Mode == string(pki.ModeUDP) {
+		m, err := newUDPMux(cfg.Listen, tun, logger)
+		if err != nil {
+			return fmt.Errorf("UDP 数据通道监听 %s: %w", cfg.Listen, err)
+		}
+		defer m.close()
+		s.udp = m
+		logger.Info("UDP 数据通道已启用（控制仍走 TCP）", "listen", cfg.Listen)
+	}
+
 	logger.Info("隧道已就绪",
 		"listen", cfg.Listen,
 		"device", tun.Name(),
@@ -247,6 +264,14 @@ func (s *Server) pumpTun(ctx context.Context) {
 		}
 		sess := s.currentSession()
 		if sess == nil {
+			continue
+		}
+		// UDP 数据通道：不走槽位、不做写合并 —— 一个 IP 包就是一个 UDP 包。
+		// 丢包交给内层应用（TCP）重传，这是设计上的取舍，见设计文档。
+		if u := sess.udpSession(); u != nil && s.udp != nil {
+			if err := u.send(s.udp, buf[:n]); err != nil {
+				s.log.Debug("UDP 下行发送失败", "err", err)
+			}
 			continue
 		}
 		k := sess.flow.Slot(buf[:n], sess.membersN(), sess.slotAlive)
@@ -557,7 +582,9 @@ func (s *Server) handleControl(ctx context.Context, tlsConn *tls.Conn, name stri
 	}
 
 	approved := 1
-	if hello.Members > 1 && s.cfg.Tunnel.MaxMembers > 1 {
+	// UDP 模式只要一条控制连接：数据包全走 UDP 数据通道。老客户端可能仍报 members=4，
+	// 这里强制压回 1，否则会白建几条没人用的成员连接。
+	if s.udp == nil && hello.Members > 1 && s.cfg.Tunnel.MaxMembers > 1 {
 		approved = hello.Members
 		if approved > s.cfg.Tunnel.MaxMembers {
 			approved = s.cfg.Tunnel.MaxMembers
@@ -585,6 +612,7 @@ func (s *Server) handleControl(ctx context.Context, tlsConn *tls.Conn, name stri
 		closed:      make(chan struct{}),
 		connectedAt: time.Now(),
 		flow:        proto.NewFlowTable(),
+		tlsConn:     tlsConn,
 	}
 	sess.slots = make([]*slotConn, approved)
 	sess.slots[0] = newSlotConn(tlsConn)
@@ -626,6 +654,33 @@ func (s *Server) serveSession(ctx context.Context, sess *session) {
 					sess.close()
 					return
 				}
+			case proto.TypeUDPPort:
+				// 客户端上报自己的 UDP 数据口：从这里开始，数据包改走 UDP。
+				if s.udp == nil {
+					s.log.Warn("收到 UDP 端口上报但没有 UDP 通道（服务端不是 udp 模式），忽略",
+						"client", sess.name)
+					continue
+				}
+				if len(payload) < 2 {
+					continue
+				}
+				port := int(binary.BigEndian.Uint16(payload))
+				remote, ok := sess.slot(0).conn.RemoteAddr().(*net.TCPAddr)
+				if !ok || sess.tlsConn == nil {
+					s.log.Warn("登记 UDP 会话失败：拿不到 TCP 远端地址", "client", sess.name)
+					continue
+				}
+				// IP 只认 TCP 连接的真实远端，端口由控制通道上报 —— 见 udprelay.go 的注释
+				u, err := s.udp.addSession(sess.tlsConn.ConnectionState(), remote.IP, port)
+				if err != nil {
+					s.log.Warn("登记 UDP 会话失败", "client", sess.name, "err", err)
+					continue
+				}
+				sess.mu.Lock()
+				sess.udp = u
+				sess.mu.Unlock()
+				s.log.Info("客户端 UDP 数据通道已登记", "client", sess.name,
+					"udp_port", port, "remote_ip", remote.IP.String())
 			case proto.TypePing:
 				if err := sess.write(proto.TypePong, payload); err != nil {
 					sess.close()
@@ -667,6 +722,13 @@ func (s *Server) serveSession(ctx context.Context, sess *session) {
 	}
 }
 
+// udpSession 返回这个会话的 UDP 数据通道，没有则 nil。
+func (s *session) udpSession() *udpSession {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.udp
+}
+
 // attach 接受新会话并踢掉旧的：客户机重装或换机时不该被一个僵死的旧连接卡住。
 func (s *Server) attach(sess *session) {
 	s.mu.Lock()
@@ -689,7 +751,16 @@ func (s *Server) detach(sess *session) {
 	if s.current == sess {
 		s.current = nil
 	}
+	// UDP 会话必须随控制连接一起移除：否则旧地址还能继续往隧道里注入数据。
+	// 锁序固定为 s.mu → sess.mu，与 udpSession() 不嵌套，无死锁风险。
+	var u *udpSession
+	sess.mu.Lock()
+	u, sess.udp = sess.udp, nil
+	sess.mu.Unlock()
 	s.mu.Unlock()
+	if s.udp != nil && u != nil {
+		s.udp.removeSession(u)
+	}
 	s.joins.forget(sess.sid)
 	sess.close()
 }
@@ -749,6 +820,13 @@ type session struct {
 	// flow 决定下行包走哪个槽：已有流固定不变（保序），新流分给当前承载流数最少的槽。
 	// 纯哈希做不到均衡 —— 一条大流会把某条成员连接塞到写超时被摘掉，别的槽却闲着。
 	flow *proto.FlowTable
+
+	// udp 是 UDP 数据通道（mode=udp 时才有）。非 nil 时下行数据不走槽位，直接走它。
+	udp *udpSession
+
+	// tlsConn 是控制连接本身。UDP 数据通道的密钥要从它的 TLS 会话导出（RFC 5705），
+	// 所以必须留着它 —— 槽位里存的是 net.Conn 接口，类型断言太脆。
+	tlsConn *tls.Conn
 }
 
 // slotConn 是逻辑会话里的一条物理连接。

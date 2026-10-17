@@ -318,7 +318,11 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	// 多连接并发数据面：sid 是本次逻辑会话的团队编号，成员连接靠它认亲。
 	// members 请求来自连接码（0/1=单连接）；服务端在 ACK 里批准实际值。
 	sid := newSessionID()
+	// UDP 模式只要一条控制连接：数据包全走 UDP，成员连接没有意义
 	wantMembers := effectiveMembers(t.inv.Members)
+	if t.inv.UseUDP() {
+		wantMembers = 1
+	}
 
 	hello, err := json.Marshal(map[string]any{
 		"version": protoVersion, "client": t.inv.Name,
@@ -366,6 +370,27 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	if sess.members > 1 {
 		t.log.Info(fmt.Sprintf("多连接并发已启用：%d 条并行连接（含控制连接）", sess.members))
 	}
+
+	// UDP 模式：数据包改走 UDP。控制连接继续跑心跳与保活，并负责把本地 UDP 端口报给
+	// 服务端（服务端按 TCP 远端 IP + 这个端口认人，不接受 UDP 包里自称的地址）。
+	// 启动失败不算致命 —— 退回 TCP 数据通道照样能用，只是慢。
+	if t.inv.UseUDP() {
+		u, uerr := startUDPChannel(ctx, t.inv, conn.ConnectionState(), sess.dev, t.log,
+			func(port int) error {
+				var p [2]byte
+				binary.BigEndian.PutUint16(p[:], uint16(port))
+				return sess.write(proto.TypeUDPPort, p[:])
+			})
+		if uerr != nil {
+			t.log.Warn("UDP 数据通道启动失败，退回 TCP 数据通道", "err", uerr)
+		} else {
+			sess.udp = u
+			defer u.close()
+			t.log.Info("UDP 数据通道已启用（控制仍走 TCP）",
+				"local_port", u.conn.LocalAddr().(*net.UDPAddr).Port)
+		}
+	}
+
 	cancel() // 建连结束：后面的读循环与保活只受外层 ctx 约束
 	return true, sess.run(ctx)
 }
@@ -396,6 +421,11 @@ func effectiveMembers(n int) int {
 // tlsCfg 是控制连接握手用的那份，成员连接必须复用它——各自新建会得到空会话缓存。
 func newClientSession(t *Tunnel, conn net.Conn, sid string, tlsCfg *tls.Config, ack Ack) *clientSession {
 	n := effectiveMembers(ack.Members)
+	if t.inv.UseUDP() {
+		// 服务端可能是老版本或没按 udp 模式回 ack，这里强制单连接：UDP 模式下建成员
+		// 连接纯属浪费，而且数据本就不该再分到槽位上。
+		n = 1
+	}
 	sess := &clientSession{
 		tunnel: t, dev: t.dev, log: t.log, stats: &t.Stats,
 		sid: sid, members: n, tlsCfg: tlsCfg, closed: make(chan struct{}),
@@ -434,6 +464,9 @@ type clientSession struct {
 	// flow 决定上行包走哪个槽：已有流固定不变（保序），新流分给当前承载流数最少的槽。
 	// 纯哈希做不到均衡，一条大流会把某条成员连接塞到写超时被摘掉。
 	flow *proto.FlowTable
+
+	// udp 是 UDP 数据通道（mode=udp 且启动成功时才有）。非 nil 时上行数据不走槽位。
+	udp *udpChannel
 }
 
 // sessionEnded 报告会话是否已进入收尾（此时连接会随会话一起关，写失败是预期内的）。
@@ -897,6 +930,16 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 			continue
 		}
 		pktLen := n
+		// UDP 数据通道：一个 IP 包就是一个 UDP 包，不分槽、不做写合并。
+		// 丢了就丢了 —— 内层应用自己的 TCP 会重传。
+		if s.udp != nil {
+			s.trace.Record("tx", 0, buf[:pktLen])
+			s.stats.TxBytes.Add(uint64(pktLen))
+			if err := s.udp.send(buf[:pktLen]); err != nil {
+				s.log.Debug("UDP 上行发送失败", "err", err)
+			}
+			continue
+		}
 		k := s.flow.Slot(buf[:n], s.members, s.slotAlive)
 		s.trace.Record("tx", k, buf[:pktLen])
 		s.stats.TxBytes.Add(uint64(pktLen))

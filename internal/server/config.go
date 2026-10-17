@@ -158,13 +158,9 @@ func (c *Config) ApplyOverrides(o Overrides) {
 }
 
 func (c Config) Validate() error {
-	// UDP 数据通道两端都还没实现（udprelay.go 没有任何调用者，客户端也没有对应实现），
-	// 但 pki.ParseMode 会接受 "udp" —— 于是 init --mode udp 能跑通，invite 还会把它写进
-	// 连接码，签出一条两端都不支持的码、静默不可用。这里直接拒绝，别让人签出废码。
-	// 需要 UDP 时把它实现完再放开；那块代码保留着，只是不允许被配置选中。
-	if strings.EqualFold(c.Mode, "udp") {
-		return errors.New("mode=udp 尚未实现（两端目前只有 TCP 数据通道），请使用默认的 tcp")
-	}
+	// 两种数据通道都已实现：tcp（默认）与 udp（控制仍走 TCP，数据包走 AES-GCM 的 UDP）。
+	// udp 模式下大包会丢（实测 1400B 丢 38%），只对交互流量有收益 —— 见
+	// docs/superpowers/specs/2026-10-17-udp-data-channel-design.md
 	if _, err := pki.ParseMode(c.Mode); err != nil {
 		return err
 	}
