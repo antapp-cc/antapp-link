@@ -36,6 +36,11 @@ type udpSession struct {
 	peer     atomic.Pointer[net.UDPAddr]
 	recv     *proto.Cipher // 解这个客户端发来的
 	sendSeal *proto.Cipher // 加密发给这个客户端
+
+	// sendMu 保护 sendSeal：Cipher.Seal 会改 sendSeq 和共享的 nonce。
+	// 下行数据（pumpTun）和保活回包（readLoop）是两个 goroutine 在并发调 send，
+	// 不串行化就会序号重复、nonce 复用 —— 后者是密码学错误，不只是丢包。
+	sendMu sync.Mutex
 }
 
 func newUDPMux(listen string, tun *TUN, log *slog.Logger) (*udpMux, error) {
@@ -171,12 +176,14 @@ func (m *udpMux) readLoop() {
 	}
 }
 
-// send 把一个 IP 包加密后发给该会话的客户端。
+// send 把一个 IP 包加密后发给该会话的客户端。并发安全：见 sendMu 的注释。
 func (s *udpSession) send(m *udpMux, pkt []byte) error {
 	peer := s.peer.Load()
 	if peer == nil {
 		return nil
 	}
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	_, err := m.conn.WriteToUDP(s.sendSeal.Seal(pkt), peer)
 	return err
 }

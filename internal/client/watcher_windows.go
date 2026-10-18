@@ -189,6 +189,13 @@ func (w *sessionWatcher) reconcile() {
 	// 用户那条本来能用的隧道一点没被动过。
 	newDef, ok, err := adapterByIndex(ifIndex)
 	if err != nil || !ok {
+		// 抓不到新网卡也要把旧网卡的 DNS 还原：否则它会一直指着隧道网关，
+		// 用户切回那张网卡时解析全超时（这是迁移失败时唯一还有副作用的残留）。
+		for _, iface := range oldSnap.Interfaces {
+			if a, ok2, _ := adapterByName(iface.Name); ok2 {
+				_ = setAdapterDNS(a.LUID, iface.DNS)
+			}
+		}
 		return
 	}
 	// DNS 原值只认第一次接管时记下的那份。
@@ -212,14 +219,6 @@ func (w *sessionWatcher) reconcile() {
 		for _, a := range newDNS {
 			newDNSStrings = append(newDNSStrings, a.String())
 		}
-	}
-	hop, _, err := bestRouteTo(w.srv, tunLUID)
-	if err != nil {
-		return
-	}
-	serverNextHop := ""
-	if !hop.IsUnspecified() && hop.Unmap() != w.srv {
-		serverNextHop = hop.Unmap().String()
 	}
 
 	// 新现场齐了，才开始拆旧的。
@@ -247,13 +246,40 @@ func (w *sessionWatcher) reconcile() {
 		}
 	}
 
+	// 旧绕行撤掉之后，再算新出口到云服该怎么绕。
+	//
+	// 必须排在这之后：连接期那条云服 /32 绕行还在表里时，最长前缀会命中它，
+	// 算出来的下一跳是旧网关（换出口后通常已不可达）。那样装到新网卡上的 /32
+	// 指向死路，隧道重拨的流量会被 /1 吸回隧道自己，永久连不上。
+	hop, _, err := bestRouteTo(w.srv, tunLUID)
+	if err != nil {
+		// 算不出来就把旧绕行原样装回去，别停在「旧绕行已删、新绕行没建」的状态
+		if oldSnap.ServerNextHop != "" && w.cfg.ServerIP != "" {
+			if a, ok, _ := adapterByIndex(uint32(oldSnap.DefaultIfIndex)); ok {
+				if oh, e := netip.ParseAddr(oldSnap.ServerNextHop); e == nil {
+					if srv, e := netip.ParseAddr(w.cfg.ServerIP); e == nil {
+						_ = a.LUID.AddRoute(netip.PrefixFrom(srv, 32), oh, 1)
+					}
+				}
+			}
+		}
+		logf("迁移中止：算不出到云服 %s 的下一跳: %v（旧绕行已恢复）", w.srv, err)
+		return
+	}
+	serverNextHop := ""
+	if !hop.IsUnspecified() && hop.Unmap() != w.srv {
+		serverNextHop = hop.Unmap().String()
+	}
+
 	// 4) 新网卡接管：DNS、绕行、国内分流、动态 MTU
 	if err := setAdapterDNS(newDef.LUID, w.cfg.DNS); err != nil {
 		logf("迁移 DNS 到 %s 失败: %v", newDef.Name, err)
 	}
 	if serverNextHop != "" {
 		if nextHop, err := netip.ParseAddr(serverNextHop); err == nil {
-			_ = newDef.LUID.AddRoute(netip.PrefixFrom(w.srv, 32), nextHop, 1)
+			if rerr := newDef.LUID.AddRoute(netip.PrefixFrom(w.srv, 32), nextHop, 1); rerr != nil {
+				logf("给新出口加云服绕行路由失败（隧道可能连不上）: %v", rerr)
+			}
 		}
 	}
 	failed := 0

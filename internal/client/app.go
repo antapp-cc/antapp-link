@@ -333,7 +333,6 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 	}
 
 	a.mu.Lock()
-	oldDev := a.dev
 	a.cfg = cfg
 	a.dev = dev
 	a.tunnel = tunnel
@@ -345,16 +344,6 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 	}
 	noNetCfg := a.noNetCfg
 	a.mu.Unlock()
-
-	// 换设备时把旧的关掉。
-	//
-	// Wintun 的 Read 是阻塞的：不关旧设备的话，上一会话的 pumpFromDevice 会一直卡在
-	// 它的 Read 上不退出（会话结束只会关 TCP/TLS）。反复重连就积累一堆旧 goroutine，
-	// 而且它们还会和新会话抢同一张网卡上的包 —— 表现为重连后偶发首包丢失。
-	// 关掉旧设备会让它的 Read 立刻返回错误，那条 goroutine 随即退出。
-	if oldDev != nil && oldDev != dev {
-		_ = oldDev.Close()
-	}
 
 	go func() {
 		if err := tunnel.Run(ctx); err != nil {
@@ -485,9 +474,16 @@ func (a *App) watchHealth(ctx context.Context) {
 	case <-time.After(1500 * time.Millisecond):
 	}
 
-	// 自检失败要重试：链路抖一下不该直接拆掉一条本来能用的隧道
+	// 自检失败要重试：链路抖一下不该直接拆掉一条本来能用的隧道。
+	// 但整个自检要有总预算 —— 等握手 30s + 3 轮 × (2 DNS × 2 域名 × 12s) 最坏能拖到
+	// 两分多钟，用户点完连接等两分钟才看到失败是不可接受的。
+	healthDeadline := time.Now().Add(60 * time.Second)
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
+		if time.Now().After(healthDeadline) {
+			err = errors.New("自检总预算（60 秒）耗尽")
+			break
+		}
 		err = a.healthCheck(ctx)
 		if err == nil {
 			a.log.Info("出网自检通过")
