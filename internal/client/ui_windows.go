@@ -188,17 +188,11 @@ func (u *UI) build() error {
 		return fmt.Errorf("创建主窗口: %w", err)
 	}
 
-	// 日志区跟其他控件区分开：深色底 + 浅白字，像一块独立的终端面板。
-	// 只读 TextEdit 走的是 WM_CTLCOLORSTATIC（可编辑的才走 WM_CTLCOLOREDIT），
-	// walk 在 container.go 里两种消息都转发到同一个颜色处理，所以这两个 API 够用，
-	// 不用去子类化主窗口。
+	// 日志区保持系统默认的白底黑字。
 	//
-	// 之前试过浅灰底 #F7F7F7，跟窗口白底几乎看不出差别；深色底才真正把它独立出来。
-	// 文字用 #D4D4D4 而不是纯白：纯白在深底上偏刺眼，长时间看日志累。
-	if bg, berr := walk.NewSolidColorBrush(walk.RGB(0x1E, 0x1E, 0x1E)); berr == nil {
-		u.txtLog.SetBackground(bg)
-	}
-	u.txtLog.SetTextColor(walk.RGB(0xD4, 0xD4, 0xD4))
+	// 试过浅灰底（#F7F7F7，和窗口白底几乎分不出来）和深色底（#1E1E1E，太扎眼），
+	// 都不如默认配色。区分度靠布局本身（日志区夹在状态行和按钮行之间）就够了，
+	// 不必靠反色。
 
 	// 关窗口只是收进托盘，不是退出 —— 否则隧道会跟着一起断
 	u.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
