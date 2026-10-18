@@ -10,13 +10,18 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TUNNEL_PORT=""
 FORWARD_RANGE=""
 NETWORK=""
+MODE=""
+VERSION=""
 ASSUME_YES=0
 
 usage() {
   cat <<'EOF'
-用法: bash install.sh [--forward 31400-31409] [--tunnel-port 62233] [--network 10.10.0.0/24] [--yes]
+用法: bash install.sh [--mode tcp|udp] [--version v0.4.3] [--forward 31400-31409] [--tunnel-port 62233] [--network 10.10.0.0/24] [--yes]
 不带参数时全部用默认值。
---yes 已装过时不再询问，直接重装。
+--mode     数据通道模式：tcp（默认，N 条 TCP 并联）或 udp（单条控制 + 加密 UDP 数据面）。
+           不传则保留配置里已有的值（新装即 tcp）。
+--version  指定 antapp-linkd 的 release 标签（如 v0.4.3）。不传则取 latest。
+--yes      已装过时不再询问，直接重装。
 EOF
 }
 
@@ -25,6 +30,18 @@ die() { echo "[antapp-link] $*" >&2; exit 1; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --mode)
+      m="${2:-}"
+      [[ "$m" == "tcp" || "$m" == "udp" ]] || die "--mode 只接受 tcp 或 udp"
+      MODE="$m"
+      shift 2
+      ;;
+    --version)
+      v="${2:-}"
+      [[ "$v" =~ ^v?[0-9] ]] || die "--version 需要形如 v0.4.3 的标签"
+      VERSION="$v"
+      shift 2
+      ;;
     --forward)
       range="${2:-}"
       [[ "$range" =~ ^[0-9]+-[0-9]+$ ]] || die "--forward 需要形如 31400-31409 的参数"
@@ -160,6 +177,10 @@ if command -v apt-get >/dev/null; then
 fi
 
 url="https://github.com/antapp-cc/antapp-link/releases/latest/download/antapp-linkd"
+if [[ -n "$VERSION" ]]; then
+  url="https://github.com/antapp-cc/antapp-link/releases/download/$VERSION/antapp-linkd"
+  log "指定版本：$VERSION"
+fi
 downloaded=0
 if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
   log "没有 wget 也没有 curl，先装 wget"
@@ -226,6 +247,7 @@ init_args=(-c "$CONF")
 [[ -n "$FORWARD_RANGE" ]] && init_args+=(--forward "$FORWARD_RANGE")
 [[ -n "$TUNNEL_PORT" ]]   && init_args+=(--listen "0.0.0.0:$TUNNEL_PORT")
 [[ -n "$NETWORK" ]]       && init_args+=(--network "$NETWORK")
+[[ -n "$MODE" ]]          && init_args+=(--mode "$MODE")
 
 "$BIN" init "${init_args[@]}"
 
@@ -298,10 +320,19 @@ log "当前状态"
 log "重新签发连接码到 /root（覆盖旧文件，让里面的参数跟上当前配置）"
 "$BIN" invite pi-node-01 -c "$CONF" -o /root || log "警告: 签发失败，可手动执行: $BIN invite pi-node-01 -c $CONF -o /root"
 
+# ---- 模式提示 ----
+# 读实际生效的模式：传了 --mode 用它，否则看配置文件（init 可能保留了旧值）
+EFFECTIVE_MODE="$MODE"
+if [[ -z "$EFFECTIVE_MODE" ]]; then
+  EFFECTIVE_MODE="$(sed -n 's/.*"mode"[[:space:]]*:[[:space:]]*"\([a-zA-Z]*\)".*/\1/p' "$CONF" 2>/dev/null | head -1)"
+  [[ -n "$EFFECTIVE_MODE" ]] || EFFECTIVE_MODE="tcp"
+fi
+
 cat <<EOF
 
 [antapp-link] --------------------------------------------------
 [antapp-link] 安装完成。连接码文件：/root/pinode.antapp（本次已重新签发）
+[antapp-link] 数据通道模式：$EFFECTIVE_MODE
 [antapp-link] 把它发给节点机双击导入即可（内含私钥，等同密码，注意保管）。
 [antapp-link] 本次只换新了客户端证书；CA 未变，之前发出去的旧连接码依然有效。
 [antapp-link] 旧码泄漏过要真正作废，只能重建 CA —— 那会让所有节点掉线并重新导入。
