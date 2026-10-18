@@ -9,4 +9,4 @@ package version
 // Version 是当前版本号。发版时改这里一处。
 //
 // 必须是 var 而不是 const：-X 只能改包级 var。
-var Version = "0.4.5"
+var Version = "0.4.6"
