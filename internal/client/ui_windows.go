@@ -188,6 +188,15 @@ func (u *UI) build() error {
 		return fmt.Errorf("创建主窗口: %w", err)
 	}
 
+	// 日志区跟其他控件区分开：浅灰底 + 深灰字，像一块独立的输出面板。
+	// 只读 TextEdit 走的是 WM_CTLCOLORSTATIC（可编辑的才走 WM_CTLCOLOREDIT），
+	// walk 在 container.go 里两种消息都转发到同一个颜色处理，所以这两个 API 够用，
+	// 不用去子类化主窗口。
+	if bg, berr := walk.NewSolidColorBrush(walk.RGB(0xF7, 0xF7, 0xF7)); berr == nil {
+		u.txtLog.SetBackground(bg)
+	}
+	u.txtLog.SetTextColor(walk.RGB(0x2B, 0x2B, 0x2B))
+
 	// 关窗口只是收进托盘，不是退出 —— 否则隧道会跟着一起断
 	u.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
 		if u.quitting {
@@ -863,6 +872,9 @@ func (u *UI) keepConnected() {
 }
 
 // waitBeforeReconnect 等待 delay，期间每 20 秒报一次剩余时间。
+//
+// 等待期间隧道如果自己恢复了就提前收工：否则会出现「明明连着，日志还在报还剩 N 秒」
+// 这种自相矛盾的输出（守护循环是先等再查状态，刚连上时那一轮也在等）。
 // 返回 false 表示 UI 正在退出，调用方应当直接收手。
 func (u *UI) waitBeforeReconnect(delay time.Duration) bool {
 	const step = 20 * time.Second
@@ -878,6 +890,9 @@ func (u *UI) waitBeforeReconnect(delay time.Duration) bool {
 		case <-time.After(wait):
 		}
 		left -= wait
+		if u.app.Status().Online {
+			return true
+		}
 		if left > 0 {
 			u.app.Log().Info(fmt.Sprintf("等待重连：还剩 %d 秒", int(left.Seconds())))
 		}
