@@ -583,9 +583,15 @@ func (s *Server) handleControl(ctx context.Context, tlsConn *tls.Conn, name stri
 	}
 
 	approved := 1
-	// UDP 模式只要一条控制连接：数据包全走 UDP 数据通道。老客户端可能仍报 members=4，
-	// 这里强制压回 1，否则会白建几条没人用的成员连接。
-	if s.udp == nil && hello.Members > 1 && s.cfg.Tunnel.MaxMembers > 1 {
+	// 按客户端请求的成员数批准。
+	//
+	// 服务的 mode=udp 时**不能**在这里压回 1：模式是服务端配置，客户端可能还拿着
+	// tcp 连接码（大量节点机就是这种）。压成 1 条的话，那些客户端的 4 条成员变成
+	// 1 条，所有流量挤在单条 TCP 上 —— 在 16~20% 重传的跨境链路上慢得能感觉出来。
+	//
+	// UDP 客户端本来就不会多要：client/tunnel.go 里 UseUDP 时 wantMembers 直接置 1，
+	// 所以这里放开不会白建任何连接。
+	if hello.Members > 1 && s.cfg.Tunnel.MaxMembers > 1 {
 		approved = hello.Members
 		if approved > s.cfg.Tunnel.MaxMembers {
 			approved = s.cfg.Tunnel.MaxMembers
