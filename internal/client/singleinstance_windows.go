@@ -30,7 +30,13 @@ const (
 //
 // 返回 ok=false 表示确实已有实例在跑（不是刚退出）。ok=true 时调用方退出前要 release。
 func SingleInstance() (release func(), ok bool, err error) {
-	name, err := windows.UTF16PtrFromString(instanceMutexName)
+	return acquireInstance(instanceMutexName)
+}
+
+// acquireInstance 是 SingleInstance 的可测部分：名字由调用方给，测试才能用临时
+// 名字验证交接行为，不去碰真实实例的锁。
+func acquireInstance(name string) (release func(), ok bool, err error) {
+	utf16Name, err := windows.UTF16PtrFromString(name)
 	if err != nil {
 		return nil, false, err
 	}
@@ -39,7 +45,7 @@ func SingleInstance() (release func(), ok bool, err error) {
 	// 最常见的情况等太久。
 	const attempts = 4
 	for i := 0; i < attempts; i++ {
-		h, cerr := windows.CreateMutex(nil, false, name)
+		h, cerr := windows.CreateMutex(nil, false, utf16Name)
 		if cerr == nil {
 			// 句柄不能提前关：关掉就等于放锁，后来的实例又会以为自己是第一个
 			return func() { _ = windows.CloseHandle(h) }, true, nil
@@ -47,6 +53,17 @@ func SingleInstance() (release func(), ok bool, err error) {
 		if cerr != windows.ERROR_ALREADY_EXISTS {
 			return nil, false, fmt.Errorf("创建互斥体: %w", cerr)
 		}
+
+		// ERROR_ALREADY_EXISTS 时 h 仍是本次打开的有效句柄，必须关掉。
+		//
+		// 不关的后果是自动更新后整个客户端消失：新进程第一次检查时旧进程还在，
+		// 拿到已存在对象的句柄却没关 —— 旧进程随后退出，可对象仍被这个句柄撑着。
+		// 后面每次重试都还是 ERROR_ALREADY_EXISTS（自己卡的自己），4 次全失败后
+		// 走 ActivateExisting + return 0，而旧进程已经死了：一个实例都不剩。
+		//
+		// 这个窗口只有几十毫秒，所以只在部分电脑上出现（取决于新旧进程的启动速度差）。
+		_ = windows.CloseHandle(h)
+
 		if i < attempts-1 {
 			time.Sleep(300 * time.Millisecond)
 		}
