@@ -67,10 +67,29 @@ $manifest = [ordered]@{
 
 # 写无 BOM 的 UTF-8：带 BOM 的话有些 JSON 解析器会直接报错
 $json = $manifest | ConvertTo-Json -Depth 6
-[System.IO.File]::WriteAllText(
-    (Join-Path $out 'latest.json'),
-    $json + "`n",
+$manifestPath = Join-Path $out 'latest.json'
+[System.IO.File]::WriteAllText($manifestPath, $json + "`n",
     (New-Object System.Text.UTF8Encoding($false)))
+
+# 签这份**最终**清单。
+#
+# 必须在这里签，不能指望 build.ps1 那一步：它签的是 dist/latest.json，而发布产物
+# 在 dist/release-<版本>/ 下，是另一个路径、也是后来才生成的。漏了这一步的后果不是
+# 「签名缺失」这么好听 —— 更新器要求清单旁必须有 latest.json.sig，缺了直接拒绝更新，
+# 发出去的版本所有已部署节点都收不到，只能手动重装。
+$releaseKey = Join-Path $env:USERPROFILE '.antapp-release\release.key'
+if (-not (Test-Path $releaseKey)) {
+    throw "缺发布私钥 $releaseKey —— 没有它签不出节点会接受的清单。"
+}
+Write-Host '== 更新清单签名 ==' -ForegroundColor Cyan
+& go run ./cmd/antapp-sign -key $releaseKey -in $manifestPath
+if ($LASTEXITCODE -ne 0) { throw '清单签名失败' }
+if (-not (Test-Path "$manifestPath.sig")) { throw "签名没有生成：$manifestPath.sig 不存在" }
+
+# 用编译期内置的公钥验一遍 —— 就是节点端会做的那件事。签错了本地就发现，不用等发布。
+Write-Host '== 更新清单验签（模拟节点端）==' -ForegroundColor Cyan
+& go run ./cmd/antapp-sign -verify -in $manifestPath
+if ($LASTEXITCODE -ne 0) { throw '清单验签失败 —— 发布后节点会拒绝更新' }
 
 $guide = @"
 发布 $Version
@@ -81,10 +100,11 @@ $guide = @"
   1. 到 https://github.com/$Repo/releases/new 新建 Release
   2. Tag 填：$tag      （必须和 latest.json 里的 url 一致）
   3. 标题随便写，比如：AntApp Link $Version
-  4. 把下面四个文件作为附件传上去（文件名不要改）：
+  4. 把下面五个文件作为附件传上去（文件名不要改）：
        antapp-link.exe
        antapp-linkd
        latest.json
+       latest.json.sig        ← 少传这个，两端都会拒绝自动更新
        README.md
   5. 发布。客户端和服务端下次检查更新时会读到 latest.json，比对版本后各自下载。
 
