@@ -42,7 +42,14 @@ func swapExe(self, newExe string, launch func(string) error) error {
 		return fmt.Errorf("写入新版本失败（已回滚）: %w", err)
 	}
 	if err := launch(self); err != nil {
-		return fmt.Errorf("新版本已就位但启动失败；旧版留在 %s，可手动改回: %w", old, err)
+		// 新版起不来就把旧版改回原名。不恢复的话，用户下次从快捷方式启动跑的还是
+		// 这个起不来的版本，而能用的旧版只剩在一个 .old 文件里 —— 他根本不会想到去
+		// 手动改名。恢复失败才只能报错并指明路径，同时**保留** .old。
+		if rerr := os.Rename(old, self); rerr != nil {
+			return fmt.Errorf("新版本启动失败，且回滚也失败（旧版仍在 %s，可手动改回）: %v / %w",
+				old, rerr, err)
+		}
+		return fmt.Errorf("新版本启动失败（已回滚到旧版）: %w", err)
 	}
 	return nil
 }

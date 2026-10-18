@@ -3,8 +3,10 @@
 package update
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -112,6 +114,46 @@ func TestSwapExeRollsBackWhenCopyFails(t *testing.T) {
 	}
 	if string(got) != "old" {
 		t.Errorf("失败后 self 内容 = %q, want \"old\"", got)
+	}
+}
+
+// 新版本启动失败时，必须把旧版改回原名。
+//
+// 不恢复的话，用户下次从快捷方式启动跑的还是那个起不来的版本，而能用的旧版只剩在
+// 一个 .old 文件里 —— 他根本不会想到去手动改名。这正是复审报告 7.1 指出的缺口。
+func TestSwapExeRollsBackWhenLaunchFails(t *testing.T) {
+	dir := t.TempDir()
+	self := filepath.Join(dir, "app.exe")
+	newExe := filepath.Join(dir, "app.exe.new")
+
+	if err := os.WriteFile(self, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newExe, []byte("new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := swapExe(self, newExe, func(string) error {
+		return errors.New("模拟启动失败")
+	})
+	if err == nil {
+		t.Fatal("启动失败必须报错")
+	}
+	if !strings.Contains(err.Error(), "已回滚") {
+		t.Errorf("错误信息应说明已回滚，实际: %v", err)
+	}
+
+	// 关键：正常路径上必须是旧版，而不是起不来的新版
+	got, rerr := os.ReadFile(self)
+	if rerr != nil {
+		t.Fatalf("回滚后应该还能读到旧版: %v", rerr)
+	}
+	if string(got) != "old" {
+		t.Errorf("启动失败后 self 内容 = %q, want \"old\"（旧版必须回到正常路径）", got)
+	}
+	// .old 已经被改回正常路径，不该还留着
+	if _, serr := os.Stat(self + ".old"); !os.IsNotExist(serr) {
+		t.Errorf("回滚成功后 .old 应该消失，实际 err=%v", serr)
 	}
 }
 
