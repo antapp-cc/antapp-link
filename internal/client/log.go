@@ -223,14 +223,17 @@ func (h *teeHandler) WithGroup(name string) slog.Handler {
 	return &teeHandler{file: h.file.WithGroup(name), buf: h.buf}
 }
 
+// levelTag 用符号而不是「信息/警告/错误」四个字：每条都印一遍的话，
+// 那两个字占了时间戳之后最醒目的位置，而绝大多数行都是「信息」，纯属噪声。
+// 符号在 Consolas 里都有，宽度也稳定。
 func levelTag(l slog.Level) string {
 	switch {
 	case l >= slog.LevelError:
-		return "错误"
+		return "×"
 	case l >= slog.LevelWarn:
-		return "警告"
+		return "▲"
 	default:
-		return "信息"
+		return "·"
 	}
 }
 
