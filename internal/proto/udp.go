@@ -100,7 +100,8 @@ func (c *Cipher) Open(pkt []byte) ([]byte, error) {
 		return nil, ErrShortPacket
 	}
 	seq := binary.BigEndian.Uint64(pkt[:NonceLen])
-	if !c.accept(seq) {
+	// 先只检查、不动窗口：伪造的高序号包如果能推进窗口，后续合法包就全被当成旧包丢掉。
+	if !c.canAccept(seq) {
 		return nil, ErrReplay
 	}
 
@@ -109,6 +110,8 @@ func (c *Cipher) Open(pkt []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("proto: udp 解密失败（密钥不符或包被篡改）: %w", err)
 	}
+	// 只有通过认证（GCM 标签校验）才提交窗口
+	c.commitAccept(seq)
 	return plain, nil
 }
 
@@ -117,11 +120,29 @@ func (c *Cipher) setNonce(seq uint64) {
 	// 最后 1 字节留给方向标记（构造时已写入），中间 3 字节保持 0
 }
 
-// accept 判断这个序号是否可以接收，可以就把它记进滑动窗口。
-func (c *Cipher) accept(seq uint64) bool {
+// canAccept 只判断这个序号是否可接收，**不修改**窗口状态。
+//
+// 拆成两步是为了让「认证」先于「提交」：伪造的高序号包能通过序号检查，但过不了
+// GCM 认证；如果它提前推进了窗口，后续合法包就全会被判成旧包丢掉。
+func (c *Cipher) canAccept(seq uint64) bool {
+	if !c.seen {
+		return true
+	}
+	if seq > c.hi {
+		return true
+	}
+	diff := c.hi - seq
+	if diff >= 64 {
+		return false // 太老，窗口已经滑过去了
+	}
+	return c.bitmap&(uint64(1)<<diff) == 0
+}
+
+// commitAccept 把一个已通过认证的序号记进滑动窗口。
+func (c *Cipher) commitAccept(seq uint64) {
 	if !c.seen {
 		c.seen, c.hi, c.bitmap = true, seq, 1
-		return true
+		return
 	}
 	if seq > c.hi {
 		shift := seq - c.hi
@@ -132,17 +153,7 @@ func (c *Cipher) accept(seq uint64) bool {
 		}
 		c.bitmap |= 1
 		c.hi = seq
-		return true
+		return
 	}
-	// 落在窗口内：看那一位有没有被标记过
-	diff := c.hi - seq
-	if diff >= 64 {
-		return false // 太老，窗口已经滑过去了
-	}
-	mask := uint64(1) << diff
-	if c.bitmap&mask != 0 {
-		return false // 重复包
-	}
-	c.bitmap |= mask
-	return true
+	c.bitmap |= uint64(1) << (c.hi - seq)
 }

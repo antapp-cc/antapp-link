@@ -435,20 +435,56 @@ func (a *App) hotApplyRouteTable() {
 // 结果用户面对的是一台「显示已连接、却什么都打不开、还没有任何提示」的机器。
 // 宁可明确报「连不上」并把网络还原，也不要留下这种状态。
 func (a *App) watchHealth(ctx context.Context) {
+	// 等隧道真正建立，而不是固定睡 3 秒：TLS 握手 + HELLO_ACK 在丢包链路上可能超过
+	// 3 秒（实测晚高峰能到 7 秒），固定睡眠会把一条好隧道误判成连接失败。
+	a.mu.Lock()
+	tl := a.tunnel
+	a.mu.Unlock()
+	if tl == nil {
+		return
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for !tl.Stats.Connected.Load() {
+		if ctx.Err() != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			a.log.Warn("等待隧道建立超时，跳过出网自检", "waited", 30*time.Second)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	// 握手成功后再给路由与 DNS 一点落定时间
 	select {
 	case <-ctx.Done():
 		return
-	case <-time.After(3 * time.Second):
+	case <-time.After(1500 * time.Millisecond):
 	}
 
-	err := a.healthCheck(ctx)
-	if err == nil {
-		a.log.Info("出网自检通过")
-		return
-	}
-	if ctx.Err() != nil {
-		// 用户自己断开或者换了连接码，不是故障
-		return
+	// 自检失败要重试：链路抖一下不该直接拆掉一条本来能用的隧道
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		err = a.healthCheck(ctx)
+		if err == nil {
+			a.log.Info("出网自检通过")
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if attempt < 3 {
+			a.log.Warn("出网自检失败，稍后重试", "attempt", attempt, "err", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
 	}
 
 	a.log.Error("出网自检失败，自动断开并还原网络", connLogAttrs(err, nil)...)
@@ -509,23 +545,36 @@ func (a *App) healthCheck(ctx context.Context) error {
 
 	// 第二级：用下发的 DNS 真解析一次。这正是整套方案存在的理由 ——
 	// DNS 查不通，用户看到的就是「连上了但网页打不开」。
-	dnsServer := "8.8.8.8"
-	if len(inv.DNS) > 0 {
-		dnsServer = inv.DNS[0]
+	//
+	// 多 DNS × 多域名：只试第一个 DNS + 固定 www.baidu.com 时，单个 DNS 短暂不可用
+	// 或那个域名恰好被过滤，就会误判成"出网失败"并拆掉一条本来能用的隧道 —— 而拆隧道
+	// 的代价是断网 + 还原，远比多试几次贵。
+	dnsServers := inv.DNS
+	if len(dnsServers) == 0 {
+		dnsServers = []string{"8.8.8.8"}
 	}
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 10 * time.Second}
-			return d.DialContext(ctx, network, net.JoinHostPort(dnsServer, "53"))
-		},
+	probeDomains := []string{"www.baidu.com", "www.qq.com"}
+	var lastErr error
+	for _, srv := range dnsServers {
+		for _, domain := range probeDomains {
+			resolver := &net.Resolver{
+				PreferGo: true,
+				Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					d := net.Dialer{Timeout: 10 * time.Second}
+					return d.DialContext(ctx, network, net.JoinHostPort(srv, "53"))
+				},
+			}
+			lookupCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+			_, err := resolver.LookupHost(lookupCtx, domain)
+			cancel()
+			if err == nil {
+				return nil
+			}
+			lastErr = err
+		}
 	}
-	lookupCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	if _, err := resolver.LookupHost(lookupCtx, "www.baidu.com"); err != nil {
-		return fmt.Errorf("DNS %s 解析不了域名: %w", dnsServer, err)
-	}
-	return nil
+	return fmt.Errorf("DNS 解析失败（试过 %d 个服务器 × %d 个域名）: %w",
+		len(dnsServers), len(probeDomains), lastErr)
 }
 
 func probeTCP(ctx context.Context, addr string, timeout time.Duration) error {
@@ -789,7 +838,9 @@ func (a *App) DownloadUpdate(ctx context.Context, m *update.Manifest) (string, e
 // 成功返回后调用方必须立刻退出自己 —— 磁盘上的文件名已经被新版占用了。
 func (a *App) ApplyUpdate(newExe string) error {
 	if err := a.Disconnect(); err != nil {
-		a.log.Warn("更新前还原网络失败，仍然继续替换", "err", err)
+		// 还原失败还继续替换的话：旧进程带着半接管的网络消失、新进程还没起来，
+		// 用户就直接断网了。宁可这次不更新，让用户手动断开后重试。
+		return fmt.Errorf("更新前还原网络失败，已取消更新: %w", err)
 	}
 	a.log.Info("替换程序并重启", "new", newExe)
 	return update.Apply(newExe)

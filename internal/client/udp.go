@@ -39,6 +39,11 @@ type udpChannel struct {
 	log      *slog.Logger
 	stats    *Stats
 
+	// sendMu 必须把 Seal 和 Write 一起锁住：Cipher.Seal 会改 sendSeq 和 nonce，
+	// 而数据面（pumpFromDevice）和 keepalive 是两个 goroutine 在并发调用。
+	// 只锁 Write 不够 —— 序号重复/nonce 覆盖会让对端 GCM 解密失败，表现为随机丢包。
+	sendMu sync.Mutex
+
 	lastRx atomic.Int64 // UnixNano，判活用
 	closed chan struct{}
 	once   sync.Once
@@ -95,8 +100,10 @@ func startUDPChannel(ctx context.Context, inv pki.Invite, state tls.ConnectionSt
 	return c, nil
 }
 
-// send 把一个 IP 包加密后发出去。
+// send 把一个 IP 包加密后发出去。并发安全：见 sendMu 的注释。
 func (c *udpChannel) send(pkt []byte) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	_, err := c.conn.Write(c.sendSeal.Seal(pkt))
 	return err
 }

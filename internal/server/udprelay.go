@@ -92,6 +92,10 @@ func (m *udpMux) addSession(tlsState tls.ConnectionState, ip net.IP, port int) (
 	return sess, nil
 }
 
+// removeSession 从索引里摘掉一个会话。
+//
+// 必须确认 map 里存的仍然是同一个对象：重连时旧会话可能晚于新会话才 detach，
+// 无条件 delete 会把新会话的映射一起删掉，新会话的下行就永久不通了。
 func (m *udpMux) removeSession(sess *udpSession) {
 	if sess == nil {
 		return
@@ -100,22 +104,26 @@ func (m *udpMux) removeSession(sess *udpSession) {
 	if p == nil {
 		return
 	}
+	key := p.IP.String()
 	m.mu.Lock()
-	delete(m.sessions, p.IP.String())
+	if cur, ok := m.sessions[key]; ok && cur == sess {
+		delete(m.sessions, key)
+	}
 	m.mu.Unlock()
 }
 
-// lookup 按来源 IP 找会话，并顺便学习真实源端口。
+// lookup 只按来源 IP 找候选会话，**不改** peer —— 必须等包通过 GCM 认证后才允许
+// 更新端口（见 confirmPeer），否则伪造包就能把下行数据导向错误的地方。
 func (m *udpMux) lookup(from *net.UDPAddr) *udpSession {
 	m.mu.RLock()
 	sess := m.sessions[from.IP.String()]
 	m.mu.RUnlock()
-	if sess == nil {
-		return nil
-	}
-	// 每次收到包都刷新端口：NAT 的空洞可能因设备重连而换端口
-	sess.peer.Store(&net.UDPAddr{IP: from.IP, Port: from.Port})
 	return sess
+}
+
+// confirmPeer 在包通过认证后刷新真实源端口：NAT 的空洞可能因设备重连而换端口。
+func (m *udpMux) confirmPeer(sess *udpSession, from *net.UDPAddr) {
+	sess.peer.Store(&net.UDPAddr{IP: from.IP, Port: from.Port})
 }
 
 func (m *udpMux) readLoop() {
@@ -143,7 +151,18 @@ func (m *udpMux) readLoop() {
 
 		plain, err := sess.recv.Open(buf[:n])
 		if err != nil {
-			// 重放/乱序是 UDP 的常态，不当错误刷日志
+			// 重放/乱序/伪造都是 UDP 的常态，不当错误刷日志。
+			// 注意这里**不更新** peer —— 未认证的包不能影响下行目标。
+			continue
+		}
+		// 认证通过了，才承认这个来源端口
+		m.confirmPeer(sess, from)
+		if len(plain) == 0 {
+			// 空负载 = 客户端的保活包。回一个空的加密包，让它的 lastRx 能刷新 ——
+			// 客户端只看"我发出去了"判断不了下行还通不通。
+			if err := sess.send(m, nil); err != nil {
+				m.log.Debug("UDP 保活回包失败", "err", err)
+			}
 			continue
 		}
 		if _, err := m.tun.Write(plain); err != nil {

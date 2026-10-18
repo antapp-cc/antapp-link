@@ -47,8 +47,12 @@ func OpenTUN(name string) (*TUN, error) {
 
 func (t *TUN) Name() string { return t.name }
 
+// Configure 配置 TUN 接口。
+//
+// 用 addr replace 而不是 addr add：TUN 设备不会随进程退出而消失，服务重启时地址
+// 往往还在，add 会报 "File exists" 让新进程起不来。replace 是幂等的。
 func (t *TUN) Configure(ip string, prefix, mtu int) error {
-	if err := runIP("addr", "add", fmt.Sprintf("%s/%d", ip, prefix), "dev", t.name); err != nil {
+	if err := runIP("addr", "replace", fmt.Sprintf("%s/%d", ip, prefix), "dev", t.name); err != nil {
 		return err
 	}
 	if err := runIP("link", "set", "dev", t.name, "mtu", strconv.Itoa(mtu)); err != nil {
