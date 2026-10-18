@@ -375,10 +375,23 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 
 // updateSnapshot 供 watcher 在迁移网络出口时更新接管现场，
 // 保证断开还原时用的是最新状态。
-func (a *App) updateSnapshot(s Snapshot) {
+//
+// 必须同时落盘：只改内存的话，程序被强杀/掉电后启动自愈拿到的是旧网卡（迁移前那张）
+// 的快照，没法准确恢复新网卡的原 DNS 和路由 —— 用户表现为重启后解析全超时。这正是
+// 报告 4.1 复现的那条。
+//
+// 返回 error 是给 watcher 用的：落盘失败时它不能把这次迁移当成已提交（否则下次出口
+// 变化就永远不会重试，磁盘上永远留着旧现场）。
+func (a *App) updateSnapshot(s Snapshot) error {
 	a.mu.Lock()
 	a.snapshot = s
 	a.mu.Unlock()
+
+	if err := SaveSnapshot(a.statePath, s); err != nil {
+		a.log.Error("迁移后的网络快照写盘失败，崩溃恢复可能用到旧现场", "err", err)
+		return err
+	}
+	return nil
 }
 
 // routeTableRefresher 让分流网段表长期保持最新：连接成功 1 分钟后拉一次，

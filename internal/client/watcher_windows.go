@@ -35,8 +35,9 @@ type sessionWatcher struct {
 	cfg NetConfig
 	srv netip.Addr // 云服地址（迁移绕行路由用）
 
-	// update 把迁移后的现场写回 App，让断开还原时用的是最新状态
-	update func(Snapshot)
+	// update 把迁移后的现场写回 App，让断开还原时用的是最新状态。
+	// 返回错误表示落盘失败 —— 那时不能把这次迁移当成已提交。
+	update func(Snapshot) error
 	// kick 唤醒隧道重连
 	kick func()
 
@@ -55,7 +56,7 @@ type sessionWatcher struct {
 // startSessionWatcher 注册网络变化回调并开始守护。注册回调只挂 /0 前缀过滤，
 // 我们自己写的路由（/1、/32、国内分流）不会触发事件风暴。
 func startSessionWatcher(ctx context.Context, snap Snapshot, cfg NetConfig,
-	update func(Snapshot), kick func(),
+	update func(Snapshot) error, kick func(),
 ) (*sessionWatcher, error) {
 	srv, err := resolveIPv4(cfg.ServerIP)
 	if err != nil {
@@ -288,14 +289,24 @@ func (w *sessionWatcher) reconcile() {
 		}
 	}
 
-	// 6) 更新现场 + 唤醒隧道立刻重连
-	w.snap = newSnapshot(gw.Unmap().String(), int(ifIndex), serverNextHop,
+	// 6) 提交现场 + 唤醒隧道立刻重连
+	//
+	// 只有落盘成功才算提交：写盘失败时保留 lastGw/lastIdx 不动，下次出口事件会重新
+	// 走一遍迁移并重试写盘 —— 否则磁盘上会永远留着迁移前的旧现场，强杀后恢复错网卡。
+	snap := newSnapshot(gw.Unmap().String(), int(ifIndex), serverNextHop,
 		w.srv.String(), []IfaceDNS{{Name: newDef.Name, Index: int(newDef.Index), DNS: newDNSStrings}}, w.cfg)
+	if w.update != nil {
+		if err := w.update(snap); err != nil {
+			logf("网络出口迁移已生效，但现场写盘失败（%v）：保留旧提交点，下次事件会重试", err)
+			if w.kick != nil {
+				w.kick()
+			}
+			return
+		}
+	}
+	w.snap = snap
 	w.lastGw = gw.Unmap()
 	w.lastIdx = ifIndex
-	if w.update != nil {
-		w.update(w.snap)
-	}
 	if w.kick != nil {
 		w.kick()
 	}
