@@ -70,13 +70,12 @@ func applyUpdate(newBinary string, out io.Writer) error {
 	}
 
 	// 健康判据要两条互相独立的信号：状态文件被"新进程"重写过（before），以及
-	// systemd 记的重启次数没涨（restartsBefore）。只看前者会被崩溃循环骗过去 ——
-	// 每次重启后 reportStatus 都会写出一份新的时间戳。
+	// systemd 记的重启次数没涨。只看前者会被崩溃循环骗过去 —— 每次重启后
+	// reportStatus 都会写出一份新的时间戳。
 	before := ""
 	if st, err := ReadStatus(); err == nil {
 		before = st.UpdatedAt
 	}
-	restartsBefore := serviceRestarts()
 
 	backup := self + ".bak"
 	if err := copyBinary(self, backup); err != nil {
@@ -92,7 +91,12 @@ func applyUpdate(newBinary string, out io.Writer) error {
 	if err := runSystemctl("restart", "antapp-linkd"); err != nil {
 		return rollback(self, backup, fmt.Errorf("重启失败: %w", err))
 	}
-	if err := waitHealthy(60*time.Second, before, restartsBefore); err != nil {
+	// 重启之后再取计数基线，不能拿重启前那个比。
+	//
+	// systemd 在非自动重启的启动流程里会把 NRestarts 清零（v252 的 service.c 如此），
+	// 于是「旧实例 7、新实例从 0 涨到 1」的对比会判成「没涨」而漏掉崩溃。现在基线
+	// 取的是新实例自己的起点：清零了就是 0，没清零就是它保留的值，两种都对。
+	if err := waitHealthy(60*time.Second, before, serviceRestarts()); err != nil {
 		return rollback(self, backup, err)
 	}
 	return nil
@@ -106,7 +110,6 @@ func rollback(self, backup string, cause error) error {
 	if st, err := ReadStatus(); err == nil {
 		before = st.UpdatedAt
 	}
-	restartsBefore := serviceRestarts()
 
 	if err := copyBinary(backup, self); err != nil {
 		return fmt.Errorf("%v；回滚也失败（旧版本仍在 %s，可用 install -m755 手动放回）: %w", cause, backup, err)
@@ -114,8 +117,8 @@ func rollback(self, backup string, cause error) error {
 	if err := runSystemctl("restart", "antapp-linkd"); err != nil {
 		return fmt.Errorf("%v；文件已回滚但重启失败: %w", cause, err)
 	}
-	// restart 返回 0 只代表 systemd 接下了请求，不代表服务真起来了
-	if err := waitHealthy(30*time.Second, before, restartsBefore); err != nil {
+	// 同 applyUpdate：基线取回滚之后新实例自己的起点
+	if err := waitHealthy(30*time.Second, before, serviceRestarts()); err != nil {
 		return fmt.Errorf("%v；文件已回滚但回滚后的服务也没就绪: %w", cause, err)
 	}
 	return fmt.Errorf("%w（已回滚到备份版本）", cause)
@@ -157,6 +160,16 @@ func waitHealthy(timeout time.Duration, before string, restartsBefore int) error
 		}
 		if !st.Fresh() {
 			last, healthy = "状态文件没有刷新", 0
+			continue
+		}
+		// 转发器是节点机访问服务的入口。它启动失败时进程照样健康、状态文件照样刷新，
+		// 但节点机的端口转发全不通 —— 这种「活着但没用」不能算健康，否则坏版本会被
+		// 记成更新成功、跳过回滚。
+		//
+		// 只认「已确认失败」：状态文件来自旧版 daemon 时 ForwardKnown 是 false，
+		// 那种未知状态不能当成失败（否则老版本一升级就被误回滚）。
+		if st.ForwardKnown && !st.ForwardReady {
+			last, healthy = "端口转发器启动失败: "+st.ForwardError, 0
 			continue
 		}
 		// 连两次都健康才算：单次采样可能正好落在两次崩溃之间

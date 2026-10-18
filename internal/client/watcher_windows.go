@@ -31,6 +31,17 @@ const (
 // 网卡。如果不迁移：绕行路由指着旧网关（隧道断线后连不回去）、DNS 还写在
 // 旧网卡（污染回流）、国内分流随旧接口消失（国内流量挤进隧道）。
 // watcher 检测到默认出口变化后，原子地把这三样迁到新网卡，并唤醒隧道重连。
+// pendingMigration 是一次「已改到系统上、但还没完全提交」的迁移。
+//
+// dnsApplied / routeApplied 各自记录关键配置有没有写上：只用一个「整体失败」标志
+// 的话，DNS 补上了而绕行还没补，也会被误当成可以提交，然后把出口标记清掉 ——
+// 那个配置就再也补不上了。
+type pendingMigration struct {
+	snap         Snapshot
+	dnsApplied   bool
+	routeApplied bool
+}
+
 type sessionWatcher struct {
 	cfg NetConfig
 	srv netip.Addr // 云服地址（迁移绕行路由用）
@@ -50,8 +61,11 @@ type sessionWatcher struct {
 	//
 	// 有它才能让重试安全：写盘失败后如果走完整迁移流程重新读网卡 DNS，读到的是
 	// 已经被我们改成隧道网关的值，会被当成用户原值存进快照 —— 断开时把物理网卡
-	// DNS 恢复到一个已经拆掉的隧道地址，用户解析全超时。所以重试只重做写盘这一步。
-	pending *Snapshot
+	// DNS 恢复到一个已经拆掉的隧道地址，用户解析全超时。所以重试只重做没做完的步骤。
+	//
+	// dnsApplied / routeApplied 记录关键配置各自有没有写上（见 reconcile 的重试分支）：
+	// 只用一个「都失败」标志的话，DNS 补上了、绕行还没补，也会被误当成可以提交。
+	pending *pendingMigration
 
 	events chan struct{} // 回调 → 对账循环的通知（带缓冲，风暴合并）
 
@@ -192,20 +206,52 @@ func (w *sessionWatcher) reconcile() {
 	// 必须在这里短路：走完整流程会重新读新网卡的 DNS，而它此刻已经是隧道网关，
 	// 于是把「我们自己的值」当成用户原值保存下来 —— 断开时物理网卡 DNS 被恢复成
 	// 一个不可用的隧道地址，用户表现为解析全超时。
-	if w.pending != nil && w.pending.DefaultIfIndex == int(ifIndex) &&
-		w.pending.DefaultGateway == gw.Unmap().String() {
-		pending := *w.pending
+	if w.pending != nil && w.pending.snap.DefaultIfIndex == int(ifIndex) &&
+		w.pending.snap.DefaultGateway == gw.Unmap().String() {
+		p := w.pending
+		newDef, ok, err := adapterByIndex(ifIndex)
+		if err != nil || !ok {
+			return
+		}
+
+		// 先补没写完的关键配置。用的是 pending 里那份**第一次捕获的原始现场**，
+		// 不是当前网卡上的值（那已经被改成隧道网关了）。
+		//
+		// 原来这里只补写盘、直接清 pending 提交：DNS 写入失败之后下一轮对账发现
+		// 「接口和网关都没变」就返回，于是那一次 DNS 失败永远补不上，状态却显示
+		// 迁移完成 —— 隧道一直连不上，而系统里的 DNS 还指着隧道网关。
+		if !p.dnsApplied {
+			if derr := setAdapterDNS(newDef.LUID, w.cfg.DNS); derr != nil {
+				logf("补写 DNS 仍失败（保留待修状态）: %v", derr)
+				return
+			}
+			p.dnsApplied = true
+			logf("上次迁移漏写的 DNS 已补上")
+		}
+		if !p.routeApplied && p.snap.ServerNextHop != "" {
+			if nextHop, e := netip.ParseAddr(p.snap.ServerNextHop); e == nil {
+				if rerr := newDef.LUID.AddRoute(netip.PrefixFrom(w.srv, 32), nextHop, 1); rerr != nil &&
+					!errors.Is(rerr, windows.ERROR_OBJECT_ALREADY_EXISTS) {
+					logf("补写云服绕行路由仍失败（保留待修状态）: %v", rerr)
+					return
+				}
+			}
+			p.routeApplied = true
+			logf("上次迁移漏写的云服绕行路由已补上")
+		}
+
+		// 配置补齐了，再补写盘；写完才算提交
 		if w.update != nil {
-			if err := w.update(pending); err != nil {
-				logf("迁移现场仍写不进磁盘（%v），保留待提交状态，下次事件再试", err)
+			if uerr := w.update(p.snap); uerr != nil {
+				logf("迁移现场仍写不进磁盘（%v），保留待提交状态，下次事件再试", uerr)
 				return
 			}
 		}
-		w.snap = pending
+		w.snap = p.snap
 		w.pending = nil
 		w.lastGw = gw.Unmap()
 		w.lastIdx = ifIndex
-		logf("上次迁移的现场已补写入磁盘")
+		logf("上次迁移的现场已补齐并写入磁盘")
 		return
 	}
 
@@ -335,7 +381,7 @@ func (w *sessionWatcher) reconcile() {
 	snap := newSnapshot(gw.Unmap().String(), int(ifIndex), serverNextHop,
 		w.srv.String(), []IfaceDNS{{Name: newDef.Name, Index: int(newDef.Index), DNS: newDNSStrings}}, w.cfg)
 	if !dnsApplied || !routeApplied {
-		w.pending = &snap
+		w.pending = &pendingMigration{snap: snap, dnsApplied: dnsApplied, routeApplied: routeApplied}
 		logf("网络出口已切换，但关键配置没写全：保留待提交状态，下次事件会补修")
 		if w.kick != nil {
 			w.kick()
@@ -344,7 +390,7 @@ func (w *sessionWatcher) reconcile() {
 	}
 	if w.update != nil {
 		if err := w.update(snap); err != nil {
-			w.pending = &snap
+			w.pending = &pendingMigration{snap: snap, dnsApplied: true, routeApplied: true}
 			logf("网络出口迁移已生效，但现场写盘失败（%v）：保留待提交状态，下次事件会重试", err)
 			if w.kick != nil {
 				w.kick()

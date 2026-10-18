@@ -193,6 +193,12 @@ func (a *App) Connect() error {
 	case a.running:
 		a.mu.Unlock()
 		return nil
+	case a.pendingRestore != nil:
+		// 上一次断开没把网络还原干净。这时候去抓网络现场，抓到的是「半接管」状态
+		// （DNS 还指着隧道网关、/1 路由还在），存进快照就把磁盘上本来正确的恢复
+		// 信息覆盖掉了 —— 之后自愈再也还原不回去。
+		a.mu.Unlock()
+		return errors.New("上次断开的网络还没有还原干净，请再点一次「断开连接」重试还原")
 	case !a.configuredLocked():
 		a.mu.Unlock()
 		return errors.New("还没有连接码，请先在界面上点「导入连接码」")

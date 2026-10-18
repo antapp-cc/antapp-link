@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,9 +13,13 @@ import (
 )
 
 // fakeDevice 的 Read 立刻返回预设错误，用来模拟网卡读失败。
+//
+// closed 用 atomic.Bool：Read 在后台协程里轮询它，而 Close 从测试协程写，
+// 用普通 bool 会被 -race 抓出来（第三轮复审 T1 报的就是这个）。
+// chan 也行，但 atomic 更直白，也不用管谁来关。
 type fakeDevice struct {
 	readErr error
-	closed  bool
+	closed  atomic.Bool
 }
 
 func (d *fakeDevice) Read(p []byte) (int, error) {
@@ -22,7 +27,7 @@ func (d *fakeDevice) Read(p []byte) (int, error) {
 		return 0, d.readErr
 	}
 	// 没有错误时一直阻塞，直到 Close（模拟无流量）
-	for !d.closed {
+	for !d.closed.Load() {
 		time.Sleep(5 * time.Millisecond)
 	}
 	return 0, ErrDeviceClosed
@@ -30,7 +35,7 @@ func (d *fakeDevice) Read(p []byte) (int, error) {
 func (d *fakeDevice) TryRead([]byte) (int, error) { return 0, ErrNoTryRead }
 func (d *fakeDevice) Write(p []byte) (int, error) { return len(p), nil }
 func (d *fakeDevice) Name() string                { return "fake" }
-func (d *fakeDevice) Close() error                { d.closed = true; return nil }
+func (d *fakeDevice) Close() error                { d.closed.Store(true); return nil }
 
 func silentTunnel(dev Device) *Tunnel {
 	return NewTunnel(pki.Invite{}, dev, slog.New(slog.NewTextHandler(io.Discard, nil)))
