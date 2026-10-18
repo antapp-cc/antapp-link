@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/antapp-cc/antapp-link/internal/proto"
@@ -30,7 +31,9 @@ type udpMux struct {
 
 // udpSession 是一个客户端在 UDP 侧的全部状态。
 type udpSession struct {
-	peer     *net.UDPAddr
+	// peer 是客户端真实的 UDP 端点。IP 由 TCP 连接确定，端口靠收到包时学习 ——
+	// 客户端上报的端口会被家宽 NAT 改写，在服务端看到的往往不是同一个值。
+	peer     atomic.Pointer[net.UDPAddr]
 	recv     *proto.Cipher // 解这个客户端发来的
 	sendSeal *proto.Cipher // 加密发给这个客户端
 }
@@ -52,10 +55,14 @@ func newUDPMux(listen string, tun *TUN, log *slog.Logger) (*udpMux, error) {
 	return m, nil
 }
 
-// addSession 从一个已完成的 TLS 会话导出密钥，登记这个客户端的 UDP 端点。
+// addSession 从一个已完成的 TLS 会话导出密钥，登记这个客户端的 UDP 身份。
 //
 // ip 由调用方从 TCP 连接的真实远端取，**不接受**客户端声称的 IP ——
-// 否则任何人都能冒充这个客户端把隧道劫走。port 由控制通道上报。
+// 否则任何人都能冒充这个客户端把隧道劫走。
+//
+// 端口参数只用于日志：家宽 NAT 会把客户端自报的源端口改掉，服务端真正能用的端口
+// 必须从收到的第一个包里学习（见 lookup）。按 IP 收敛没有歧义 —— 服务端同一时刻
+// 只服务一个客户端。
 func (m *udpMux) addSession(tlsState tls.ConnectionState, ip net.IP, port int) (*udpSession, error) {
 	c2sKey, err := tlsState.ExportKeyingMaterial(proto.UDPLabelC2S, nil, 32)
 	if err != nil {
@@ -75,12 +82,12 @@ func (m *udpMux) addSession(tlsState tls.ConnectionState, ip net.IP, port int) (
 	}
 
 	sess := &udpSession{
-		peer:     &net.UDPAddr{IP: ip, Port: port},
 		recv:     recv,
 		sendSeal: send,
 	}
+	sess.peer.Store(&net.UDPAddr{IP: ip, Port: port})
 	m.mu.Lock()
-	m.sessions[sess.peer.String()] = sess
+	m.sessions[ip.String()] = sess
 	m.mu.Unlock()
 	return sess, nil
 }
@@ -89,15 +96,26 @@ func (m *udpMux) removeSession(sess *udpSession) {
 	if sess == nil {
 		return
 	}
+	p := sess.peer.Load()
+	if p == nil {
+		return
+	}
 	m.mu.Lock()
-	delete(m.sessions, sess.peer.String())
+	delete(m.sessions, p.IP.String())
 	m.mu.Unlock()
 }
 
+// lookup 按来源 IP 找会话，并顺便学习真实源端口。
 func (m *udpMux) lookup(from *net.UDPAddr) *udpSession {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.sessions[from.String()]
+	sess := m.sessions[from.IP.String()]
+	m.mu.RUnlock()
+	if sess == nil {
+		return nil
+	}
+	// 每次收到包都刷新端口：NAT 的空洞可能因设备重连而换端口
+	sess.peer.Store(&net.UDPAddr{IP: from.IP, Port: from.Port})
+	return sess
 }
 
 func (m *udpMux) readLoop() {
@@ -136,7 +154,11 @@ func (m *udpMux) readLoop() {
 
 // send 把一个 IP 包加密后发给该会话的客户端。
 func (s *udpSession) send(m *udpMux, pkt []byte) error {
-	_, err := m.conn.WriteToUDP(s.sendSeal.Seal(pkt), s.peer)
+	peer := s.peer.Load()
+	if peer == nil {
+		return nil
+	}
+	_, err := m.conn.WriteToUDP(s.sendSeal.Seal(pkt), peer)
 	return err
 }
 
