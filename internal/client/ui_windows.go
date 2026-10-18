@@ -188,11 +188,15 @@ func (u *UI) build() error {
 		return fmt.Errorf("创建主窗口: %w", err)
 	}
 
-	// 日志区保持系统默认的白底黑字。
+	// 日志区显式涂成纯白底 + 纯黑字。
 	//
-	// 试过浅灰底（#F7F7F7，和窗口白底几乎分不出来）和深色底（#1E1E1E，太扎眼），
-	// 都不如默认配色。区分度靠布局本身（日志区夹在状态行和按钮行之间）就够了，
-	// 不必靠反色。
+	// 不写的话用的是系统 COLOR_WINDOW：浅色主题下本来就是白，但深色主题 / 高对比度
+	// 方案下会变成深灰或别的颜色，日志区肤色就跟着系统跑。这里钉死 #FFFFFF，
+	// 和浅色界面保持一致。
+	if bg, berr := walk.NewSolidColorBrush(walk.RGB(0xFF, 0xFF, 0xFF)); berr == nil {
+		u.txtLog.SetBackground(bg)
+	}
+	u.txtLog.SetTextColor(walk.RGB(0x00, 0x00, 0x00))
 
 	// 关窗口只是收进托盘，不是退出 —— 否则隧道会跟着一起断
 	u.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
