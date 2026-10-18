@@ -712,6 +712,12 @@ func (a *App) Disconnect() error {
 	// 先停 watcher：它可能正在把快照迁移到新出口，停完再取才是终态。
 	if watcher != nil {
 		watcher.Stop()
+		// Stop 已经等 reconcile 退出，这里没有并发。
+		//
+		// 停完还要看一眼有没有未完成的迁移：那笔 pending 指向的可能是另一张网卡
+		// （A→B 失败后用户切到 C 又立刻断开），它的隧道 DNS 和云服绕行路由不在
+		// 最终快照里 —— 不在这里清就会一直留在那张网卡上。
+		watcher.revertPending()
 	}
 	a.mu.Lock()
 	snap, cfg, noNetCfg := a.snapshot, a.cfg, a.noNetCfg

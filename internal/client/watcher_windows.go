@@ -425,6 +425,9 @@ func (w *sessionWatcher) reconcile() {
 //
 // 用的全是 pending 里记下的原始值：那张网卡的 DNS 原值和绕行下一跳。清理完就不再
 // 保留 —— 新迁移会重新记一份。
+//
+// 调用点两个：reconcile 持 w.mu 时（出口已经换成别的网卡），以及 Disconnect 里
+// Stop 之后（那里没有并发，所以不加锁 —— 加了会和 reconcile 的持锁调用死锁）。
 func (w *sessionWatcher) revertPending() {
 	p := w.pending
 	if p == nil {
