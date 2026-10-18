@@ -624,7 +624,10 @@ func (a *App) Disconnect() error {
 		return errors.New("正在连接，请稍候")
 	case a.disconnecting:
 		a.mu.Unlock()
-		return nil // 已经在断开了，别重复跑
+		// 不能返回 nil：调用方（尤其 ApplyUpdate）会据此认为「网络已经还原干净」，
+		// 于是在还原还没跑完时就替换程序 —— 旧进程带着半接管的网络消失、新进程还没
+		// 起来，用户直接断网。这与 Connect 在 connecting 时的处理保持一致。
+		return errors.New("正在断开，请稍候")
 	case !a.running && a.dev == nil:
 		a.mu.Unlock()
 		return nil
