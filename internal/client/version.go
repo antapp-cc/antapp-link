@@ -4,4 +4,4 @@ package client
 //
 // 必须是 var 而不是 const：build.ps1 要用 -ldflags -X 把它注进去。
 // 默认值跟着当前版本走 —— 手搓构建没带 -X 时也不至于自认旧版、反复「发现新版本」。
-var Version = "0.4.4"
+var Version = "0.4.5"
