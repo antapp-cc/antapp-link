@@ -143,13 +143,22 @@ type Tunnel struct {
 	// Trace 是联调用的顺序追踪（nil = 关闭，零开销）。它记录每个包的槽位，
 	// 用来断言「同一内层流始终走同一条外层连接」。
 	Trace *OrderTracer
+
+	// pktCh 是网卡读循环与「当前会话」之间的包管道。
+	//
+	// 读循环只有一条、由 Tunnel 持有：Wintun 的 Read 是阻塞的，如果每个会话各起一条，
+	// 会话结束时那条 goroutine 会一直卡在 Read 里，直到下一个包到来才退出 —— 反复重连
+	// 就积累一堆旧 reader，而且它们还会和新会话抢同一个网卡上的包（表现为重连后偶发
+	// 首包丢失）。把读循环提到这一层，会话怎么重拨都只有这一条。
+	pktCh chan []byte
 }
 
 func NewTunnel(inv pki.Invite, dev Device, logger *slog.Logger) *Tunnel {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Tunnel{inv: inv, dev: dev, log: logger, wake: make(chan struct{}, 1)}
+	return &Tunnel{inv: inv, dev: dev, log: logger, wake: make(chan struct{}, 1),
+		pktCh: make(chan []byte, 64)}
 }
 
 // Kick 唤醒重连循环。非阻塞：正在连接时通知被丢弃，无害。
@@ -247,6 +256,9 @@ func connLogAttrs(err error, conn net.Conn, attrs ...any) []any {
 // 网卡与路由在整个过程中保持不动：隧道断掉时靠「原默认路由仍在、只是 metric 更高」
 // 自动回落到本地线路，不会整机断网。
 func (t *Tunnel) Run(ctx context.Context) error {
+	// 唯一的网卡读循环：整个 Tunnel 生命周期只起这一次
+	go t.readPump(ctx)
+
 	attempt := 0
 	for {
 		if ctx.Err() != nil {
@@ -285,6 +297,39 @@ func (t *Tunnel) Run(ctx context.Context) error {
 		}
 		if attempt < 10 {
 			attempt++
+		}
+	}
+}
+
+// readPump 是全局唯一的网卡读循环。
+//
+// 它不属于任何会话：读到包就塞进 pktCh，由当前会话取走。这样会话怎么重拨都不会
+// 积累旧 reader，也不会有旧会话抢走新会话的首包。读失败就停下 —— 设备坏了，
+// 重拨 TCP 也救不了，交给 App 的完整重连（RebuildDevice）。
+func (t *Tunnel) readPump(ctx context.Context) {
+	buf := make([]byte, readBufferSize)
+	for {
+		n, err := t.dev.Read(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			t.log.Error("读网卡失败，上行搬运停止", "err", err)
+			return
+		}
+		if n <= 0 {
+			continue
+		}
+		if n > proto.MaxPayload {
+			t.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", n, "max", proto.MaxPayload)
+			continue
+		}
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		select {
+		case t.pktCh <- pkt:
+		case <-ctx.Done():
+			return
 		}
 	}
 }
@@ -909,84 +954,69 @@ func (s *clientSession) pumpFromTunnel(ctx context.Context) error {
 	}
 }
 
-// pumpFromDevice：网卡上出现的包（也就是内核要发往外网的包）送进隧道。
+// pumpFromDevice：把网卡上出现的包（内核要发往外网的包）送进隧道。
 //
-// 写合并：首包选定槽位后，非阻塞地继续收割内核缓冲里现成的、同槽的包，
-// 拼成单缓冲一次写出——外层 TLS 记录数量减半（帧头+载荷合并成一趟）。
-// 收不到就停，绝不等待：打字、ping 这类单包场景行为不变。
+// 包来自 Tunnel 的全局读循环（pktCh），这里不再直接碰设备 —— 会话重拨时这条
+// goroutine 能被 ctx 立刻叫醒，不会像以前那样卡在阻塞的 dev.Read 上、非要等下一个
+// 包到来才退出（那一等就积累旧 reader，还会抢新会话的包）。
+//
+// 写合并：首包选定槽位后，非阻塞地从 pktCh 继续收割同槽的现成包，拼成单缓冲一次
+// 写出——外层 TLS 记录数量减半。收不到就停，绝不等待。
 func (s *clientSession) pumpFromDevice(ctx context.Context) error {
-	buf := make([]byte, readBufferSize)
 	batch := make([]byte, 0, proto.MaxBatchBytes)
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
-		n, err := s.dev.Read(buf)
-		if err != nil {
-			return fmt.Errorf("读网卡: %w", err)
+		var pkt []byte
+		select {
+		case <-ctx.Done():
+			return nil
+		case pkt = <-s.tunnel.pktCh:
 		}
-		if n <= 0 {
-			continue
-		}
-		// 会话收尾后这条搬运链路已经没有意义，但网卡是跨会话复用的、不能关，
-		// 阻塞在 dev.Read 上时叫不醒 —— 只能等下一个包到时在这里退出。代价是丢这
-		// 一个包（IP 层本就尽力而为），以及无流量时旧 goroutine 会多驻留一会儿；
-		// 不退出的话它会拿旧会话的槽表继续发包，抢新会话的流量。
 		if s.isClosed() {
 			return nil
 		}
-		if n > proto.MaxPayload {
-			// 帧头装不下。硬塞会让对端把这 4 字节 IP 头当帧头解析、整条流从此错位
-			// （连接还在、数据全垃圾），所以宁可丢这个包。正常 MTU ≤1500 时读不到
-			// 这么大的包，这是给将来放宽 MTU 兜的底。
-			s.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", n, "max", proto.MaxPayload)
-			continue
-		}
-		pktLen := n
+		pktLen := len(pkt)
 		// UDP 数据通道：一个 IP 包就是一个 UDP 包，不分槽、不做写合并。
 		// 丢了就丢了 —— 内层应用自己的 TCP 会重传。
 		if s.udp != nil {
-			s.trace.Record("tx", 0, buf[:pktLen])
+			s.trace.Record("tx", 0, pkt)
 			s.stats.TxBytes.Add(uint64(pktLen))
-			if err := s.udp.send(buf[:pktLen]); err != nil {
+			if err := s.udp.send(pkt); err != nil {
 				s.log.Debug("UDP 上行发送失败", "err", err)
 			}
 			continue
 		}
-		k := s.flow.Slot(buf[:n], s.members, s.slotAlive)
-		s.trace.Record("tx", k, buf[:pktLen])
+		k := s.flow.Slot(pkt, s.members, s.slotAlive)
+		s.trace.Record("tx", k, pkt)
 		s.stats.TxBytes.Add(uint64(pktLen))
 
 		batch = proto.AppendHeader(batch[:0], proto.TypeIP, pktLen)
-		batch = append(batch, buf[:pktLen]...)
+		batch = append(batch, pkt...)
 
-		// 收割现成的同槽包：不等待、批量不超上限；设备不支持就单包模式
+		// 收割同槽的现成包：不等待、批量不超上限
 		for len(batch) < proto.MaxBatchBytes-proto.HeaderSize-proto.MaxPayload {
-			m, rerr := s.dev.TryRead(buf)
-			if rerr != nil || m <= 0 {
+			var more []byte
+			select {
+			case more = <-s.tunnel.pktCh:
+			default:
+			}
+			if more == nil {
 				break
 			}
-			if m > proto.MaxPayload {
-				s.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", m, "max", proto.MaxPayload)
-				break
-			}
-			kk := s.flow.Slot(buf[:m], s.members, s.slotAlive)
-			s.trace.Record("tx", kk, buf[:m])
+			kk := s.flow.Slot(more, s.members, s.slotAlive)
+			s.trace.Record("tx", kk, more)
 			if kk != k {
-				// 不同槽的包放回没有手段（Device 是单读接口），直接单发处理完再收
 				if err := flushBatch(s, k, batch); err != nil {
 					return err
 				}
 				k = kk
 				batch = batch[:0]
-				batch = proto.AppendHeader(batch, proto.TypeIP, m)
-				batch = append(batch, buf[:m]...)
-				s.stats.TxBytes.Add(uint64(m))
-				continue
 			}
-			batch = proto.AppendHeader(batch, proto.TypeIP, m)
-			batch = append(batch, buf[:m]...)
-			s.stats.TxBytes.Add(uint64(m))
+			batch = proto.AppendHeader(batch, proto.TypeIP, len(more))
+			batch = append(batch, more...)
+			s.stats.TxBytes.Add(uint64(len(more)))
 		}
 
 		if err := flushBatch(s, k, batch); err != nil {
