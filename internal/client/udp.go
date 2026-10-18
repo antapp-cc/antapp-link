@@ -97,7 +97,43 @@ func startUDPChannel(ctx context.Context, inv pki.Invite, state tls.ConnectionSt
 	c.lastRx.Store(time.Now().UnixNano())
 	go c.recvLoop(ctx, dev)
 	go c.keepalive(ctx)
+
+	// 验证 UDP 双向真的通。
+	//
+	// 只上报端口是控制面的事：端口从 TCP 报上去了，UDP 包却可能被防火墙 / 运营商
+	// 悄悄丢掉（这个坑真踩过 —— NAT 改了源端口那次就是「端口报上去了、包全丢」）。
+	// 不验证的话，界面会显示「UDP 数据通道已启用」而业务全不通，用户只会看到
+	// 「连上了但打不开网页」，比直接退回 TCP 难排查得多。
+	//
+	// 发一个保活包，等服务端回一个空的加密包（readLoop 收到空负载会回 ACK）。
+	// 收不到就判定这条通道不可用 —— 调用方在 uerr != nil 时本来就会走 TCP 数据面。
+	if perr := c.probe(ctx, 5*time.Second); perr != nil {
+		c.close()
+		return nil, fmt.Errorf("UDP 通道验证失败（已退回 TCP 数据通道）: %w", perr)
+	}
 	return c, nil
+}
+
+// probe 确认 UDP 双向都通：发一个保活包，等服务端的回包刷新 lastRx。
+func (c *udpChannel) probe(ctx context.Context, timeout time.Duration) error {
+	start := c.lastRx.Load()
+	if err := c.send(nil); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if c.lastRx.Load() != start {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.closed:
+			return errors.New("UDP 通道已关闭")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("%s 内没收到服务端回包（UDP 端口可能没放行）", timeout)
 }
 
 // send 把一个 IP 包加密后发出去。并发安全：见 sendMu 的注释。
