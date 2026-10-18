@@ -182,31 +182,11 @@ func (w *sessionWatcher) reconcile() {
 	oldSnap := w.snap
 	oldGw, _ := netip.ParseAddr(oldSnap.DefaultGateway)
 
-	// 1) 还原旧网卡的 DNS（用旧快照里记录的原值；网卡已消失则跳过）
-	for _, iface := range oldSnap.Interfaces {
-		if uint32(iface.Index) == ifIndex {
-			continue
-		}
-		if a, ok, _ := adapterByName(iface.Name); ok {
-			_ = setAdapterDNS(a.LUID, iface.DNS) // 原值为空 = 清空回到自动获取
-		}
-	}
-	// 2) 扫掉旧网卡上的国内分流（按旧网关 + metric 筛）
-	if oldGw.IsValid() {
-		sweepSplitRoutes(oldGw)
-	}
-	// 3) 撤旧绕行路由
-	if oldSnap.ServerNextHop != "" && w.cfg.ServerIP != "" {
-		if a, ok, _ := adapterByIndex(uint32(oldSnap.DefaultIfIndex)); ok {
-			if hop, err := netip.ParseAddr(oldSnap.ServerNextHop); err == nil {
-				if srv, err := netip.ParseAddr(w.cfg.ServerIP); err == nil {
-					_ = a.LUID.DeleteRoute(netip.PrefixFrom(srv, 32), hop)
-				}
-			}
-		}
-	}
-
-	// 4) 抓新现场
+	// 先把新现场完整抓下来，再动旧配置。
+	//
+	// 顺序反了的话（先拆旧的、再抓新的），中途任何一步失败都会留下「旧配置已删、
+	// 新配置没建」的半迁移状态，内存快照和真实系统也对不上。现在抓不到就直接返回，
+	// 用户那条本来能用的隧道一点没被动过。
 	newDef, ok, err := adapterByIndex(ifIndex)
 	if err != nil || !ok {
 		return
@@ -242,7 +222,32 @@ func (w *sessionWatcher) reconcile() {
 		serverNextHop = hop.Unmap().String()
 	}
 
-	// 5) 新网卡接管：DNS、绕行、国内分流、动态 MTU
+	// 新现场齐了，才开始拆旧的。
+	// 1) 还原旧网卡的 DNS（用旧快照里记录的原值；网卡已消失则跳过）
+	for _, iface := range oldSnap.Interfaces {
+		if uint32(iface.Index) == ifIndex {
+			continue
+		}
+		if a, ok, _ := adapterByName(iface.Name); ok {
+			_ = setAdapterDNS(a.LUID, iface.DNS) // 原值为空 = 清空回到自动获取
+		}
+	}
+	// 2) 扫掉旧网卡上的国内分流（按旧网关 + metric 筛）
+	if oldGw.IsValid() {
+		sweepSplitRoutes(oldGw)
+	}
+	// 3) 撤旧绕行路由
+	if oldSnap.ServerNextHop != "" && w.cfg.ServerIP != "" {
+		if a, ok, _ := adapterByIndex(uint32(oldSnap.DefaultIfIndex)); ok {
+			if hop, err := netip.ParseAddr(oldSnap.ServerNextHop); err == nil {
+				if srv, err := netip.ParseAddr(w.cfg.ServerIP); err == nil {
+					_ = a.LUID.DeleteRoute(netip.PrefixFrom(srv, 32), hop)
+				}
+			}
+		}
+	}
+
+	// 4) 新网卡接管：DNS、绕行、国内分流、动态 MTU
 	if err := setAdapterDNS(newDef.LUID, w.cfg.DNS); err != nil {
 		logf("迁移 DNS 到 %s 失败: %v", newDef.Name, err)
 	}

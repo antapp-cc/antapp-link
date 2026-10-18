@@ -333,6 +333,7 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 	}
 
 	a.mu.Lock()
+	oldDev := a.dev
 	a.cfg = cfg
 	a.dev = dev
 	a.tunnel = tunnel
@@ -344,6 +345,16 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 	}
 	noNetCfg := a.noNetCfg
 	a.mu.Unlock()
+
+	// 换设备时把旧的关掉。
+	//
+	// Wintun 的 Read 是阻塞的：不关旧设备的话，上一会话的 pumpFromDevice 会一直卡在
+	// 它的 Read 上不退出（会话结束只会关 TCP/TLS）。反复重连就积累一堆旧 goroutine，
+	// 而且它们还会和新会话抢同一张网卡上的包 —— 表现为重连后偶发首包丢失。
+	// 关掉旧设备会让它的 Read 立刻返回错误，那条 goroutine 随即退出。
+	if oldDev != nil && oldDev != dev {
+		_ = oldDev.Close()
+	}
 
 	go func() {
 		if err := tunnel.Run(ctx); err != nil {
