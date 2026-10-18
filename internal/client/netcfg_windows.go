@@ -134,7 +134,7 @@ func Capture(cfg NetConfig) (Snapshot, error) {
 		dnsStrings = append(dnsStrings, a.String())
 	}
 
-	return newSnapshot(gw.Unmap().String(), int(gwIfIndex), serverNextHop,
+	return newSnapshot(gw.Unmap().String(), int(gwIfIndex), serverNextHop, srv.String(),
 		[]IfaceDNS{{Name: def.Name, Index: int(def.Index), DNS: dnsStrings}}, cfg), nil
 }
 

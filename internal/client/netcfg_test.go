@@ -11,6 +11,7 @@ func testSnapshot() Snapshot {
 		DefaultGateway: "192.168.1.1",
 		DefaultIfIndex: 12,
 		ServerNextHop:  "192.168.1.1",
+		ServerIP:       "103.143.11.34",
 		Interfaces: []IfaceDNS{
 			{Name: "以太网", Index: 12, DNS: []string{"192.168.1.1"}},
 			{Name: "WLAN", Index: 7, DNS: []string{"192.168.1.1", "223.5.5.5"}},
@@ -113,7 +114,7 @@ func TestLoadSnapshotTreatsCorruptFileAsExisting(t *testing.T) {
 // 退化成「撤不掉 /1 接管路由」—— 用户表现为重启后依然断网，所以这里钉住往返。
 func TestSnapshotRoundTripKeepsTunnelInfo(t *testing.T) {
 	path := StatePath(t.TempDir())
-	want := newSnapshot("192.168.1.1", 12, "192.168.1.1", nil,
+	want := newSnapshot("192.168.1.1", 12, "192.168.1.1", "103.143.11.34", nil,
 		NetConfig{Gateway: "10.10.0.1", ServerIP: "103.143.11.34"})
 	if err := SaveSnapshot(path, want); err != nil {
 		t.Fatalf("SaveSnapshot: %v", err)

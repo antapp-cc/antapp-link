@@ -236,12 +236,10 @@ func (w *sessionWatcher) reconcile() {
 		sweepSplitRoutes(oldGw)
 	}
 	// 3) 撤旧绕行路由
-	if oldSnap.ServerNextHop != "" && w.cfg.ServerIP != "" {
+	if oldSnap.ServerNextHop != "" && w.srv.IsValid() {
 		if a, ok, _ := adapterByIndex(uint32(oldSnap.DefaultIfIndex)); ok {
 			if hop, err := netip.ParseAddr(oldSnap.ServerNextHop); err == nil {
-				if srv, err := netip.ParseAddr(w.cfg.ServerIP); err == nil {
-					_ = a.LUID.DeleteRoute(netip.PrefixFrom(srv, 32), hop)
-				}
+				_ = a.LUID.DeleteRoute(netip.PrefixFrom(w.srv, 32), hop)
 			}
 		}
 	}
@@ -254,12 +252,10 @@ func (w *sessionWatcher) reconcile() {
 	hop, _, err := bestRouteTo(w.srv, tunLUID)
 	if err != nil {
 		// 算不出来就把旧绕行原样装回去，别停在「旧绕行已删、新绕行没建」的状态
-		if oldSnap.ServerNextHop != "" && w.cfg.ServerIP != "" {
+		if oldSnap.ServerNextHop != "" && w.srv.IsValid() {
 			if a, ok, _ := adapterByIndex(uint32(oldSnap.DefaultIfIndex)); ok {
 				if oh, e := netip.ParseAddr(oldSnap.ServerNextHop); e == nil {
-					if srv, e := netip.ParseAddr(w.cfg.ServerIP); e == nil {
-						_ = a.LUID.AddRoute(netip.PrefixFrom(srv, 32), oh, 1)
-					}
+					_ = a.LUID.AddRoute(netip.PrefixFrom(w.srv, 32), oh, 1)
 				}
 			}
 		}
@@ -294,7 +290,7 @@ func (w *sessionWatcher) reconcile() {
 
 	// 6) 更新现场 + 唤醒隧道立刻重连
 	w.snap = newSnapshot(gw.Unmap().String(), int(ifIndex), serverNextHop,
-		[]IfaceDNS{{Name: newDef.Name, Index: int(newDef.Index), DNS: newDNSStrings}}, w.cfg)
+		w.srv.String(), []IfaceDNS{{Name: newDef.Name, Index: int(newDef.Index), DNS: newDNSStrings}}, w.cfg)
 	w.lastGw = gw.Unmap()
 	w.lastIdx = ifIndex
 	if w.update != nil {

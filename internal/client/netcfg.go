@@ -155,9 +155,11 @@ func routePlan(snap Snapshot, cfg NetConfig) []routeOp {
 		return nil
 	}
 	var ops []routeOp
-	if snap.ServerNextHop != "" && cfg.ServerIP != "" {
+	// 用快照里那个**已解析的 IP**，不是 cfg.ServerIP：连接码可能写域名，
+	// ParseAddr 会失败，绕行路由就不生成 —— 隧道自己的流量会被 /1 吸回隧道。
+	if snap.ServerNextHop != "" && snap.ServerIP != "" {
 		if hop, err := netip.ParseAddr(snap.ServerNextHop); err == nil {
-			if srv, err := netip.ParseAddr(cfg.ServerIP); err == nil {
+			if srv, err := netip.ParseAddr(snap.ServerIP); err == nil {
 				ops = append(ops, routeOp{dest: netip.PrefixFrom(srv, 32), nextHop: hop, metric: 1})
 			}
 		}
@@ -218,7 +220,13 @@ func RemoveSnapshot(path string) error {
 	return nil
 }
 
-func newSnapshot(gateway string, ifIndex int, serverNextHop string, ifaces []IfaceDNS, cfg NetConfig) Snapshot {
+// newSnapshot 组装快照。
+//
+// serverIP 必须是**已经解析好的 IP**，不是连接码里那个 host —— 连接码可能写域名，
+// 而 routePlan 和 watcher 都用 netip.ParseAddr 解析它：域名会直接失败，结果是绕行
+// 路由不生成，隧道流量被 /1 吸回隧道自己。
+func newSnapshot(gateway string, ifIndex int, serverNextHop, serverIP string,
+	ifaces []IfaceDNS, cfg NetConfig) Snapshot {
 	return Snapshot{
 		DefaultGateway: gateway,
 		DefaultIfIndex: ifIndex,
@@ -226,6 +234,6 @@ func newSnapshot(gateway string, ifIndex int, serverNextHop string, ifaces []Ifa
 		Interfaces:     ifaces,
 		CapturedAt:     time.Now().Format(time.RFC3339),
 		TunnelGateway:  cfg.Gateway,
-		ServerIP:       cfg.ServerIP,
+		ServerIP:       serverIP,
 	}
 }
