@@ -174,7 +174,10 @@ func fetchAndStoreRouteTable() bool {
 		return true
 	}
 	if lastErr != nil {
-		logf("分流网段表拉取失败，保持现有表：%v", lastErr)
+		// 只给结论，不贴原始错误：这条多半是 raw.githubusercontent.com 连不上
+		// （国内常态），贴一大段 `read tcp ...: i/o timeout` 帮不上任何忙。
+		// 条数保留下来，用户能确认分流仍在生效、只是没更新。
+		logf("分流表更新失败（网络不可达），继续用现有 %d 条", len(ActiveCNRoutes()))
 	}
 	return false
 }

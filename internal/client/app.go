@@ -880,9 +880,9 @@ func (a *App) CheckUpdate(ctx context.Context, quiet bool) (*update.Manifest, er
 	m, errs := a.checker.Check(ctx)
 	if m == nil {
 		if len(errs) > 0 && len(errs) == len(a.checker.Sources) {
-			for _, e := range errs {
-				a.log.Warn("更新源不可用", "err", e)
-			}
+			// 一条就够：几个更新源同时挂通常是本地出网问题，逐条打只会在日志里刷屏
+			a.log.Warn("更新检查失败（更新源不可达），本次跳过",
+				"sources", len(errs), "err", errs[0])
 			return nil, fmt.Errorf("所有更新源都不可用：%v", errs[0])
 		}
 		if !quiet {
