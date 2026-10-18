@@ -415,6 +415,12 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 				fmt.Fprintf(stdout, "加入失败    : %d 次（达 %d 次会熔断 %v）\n",
 					st.JoinFailures, joinMaxFail, joinWindow)
 			}
+			if st.UDPActive {
+				fmt.Fprintln(stdout, "数据通道    : UDP（控制仍走 TCP）")
+			}
+			if st.Goroutines > 0 {
+				fmt.Fprintf(stdout, "goroutine   : %d\n", st.Goroutines)
+			}
 		} else {
 			fmt.Fprintln(stdout, "已接入节点  : 无")
 		}

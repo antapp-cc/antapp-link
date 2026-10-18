@@ -29,6 +29,11 @@ type Status struct {
 	// ForwardKnown 区分「状态文件是旧版 daemon 写的」与「新版刚启动还没刷新」。
 	// 前者读出来是零值，不能据此替 daemon 宣称转发没起来。
 	ForwardKnown bool `json:"forward_known,omitempty"`
+	// Goroutines 是写状态那一刻的 goroutine 数。长期盯它有没有单调上涨，
+	// 比事后查 pprof 更容易发现「每次重连泄漏一点」这类问题。
+	Goroutines int `json:"goroutines,omitempty"`
+	// UDPActive 表示当前会话走的是 UDP 数据通道（mode=udp 且客户端已上报端口）。
+	UDPActive bool `json:"udp_active,omitempty"`
 }
 
 // reportStatus 每 5 秒刷新一次状态文件，超过这个阈值就说明写它的进程已经不在了。

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -778,10 +779,11 @@ func (s *Server) reportStatus(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		st := Status{
-			Listen:   s.cfg.Listen,
-			Device:   s.cfg.Tunnel.Device,
-			ServerIP: s.cfg.Tunnel.ServerIP,
-			ClientIP: s.cfg.Tunnel.ClientIP,
+			Listen:     s.cfg.Listen,
+			Device:     s.cfg.Tunnel.Device,
+			ServerIP:   s.cfg.Tunnel.ServerIP,
+			ClientIP:   s.cfg.Tunnel.ClientIP,
+			Goroutines: runtime.NumGoroutine(),
 		}
 		if rs := s.relay.Load(); rs != nil {
 			st.ForwardReady = rs.ready
@@ -795,6 +797,7 @@ func (s *Server) reportStatus(ctx context.Context) {
 			st.LiveMembers = sess.liveMembers()
 			st.Slots = sess.slotStats()
 			st.JoinFailures = s.joins.failures(sess.sid)
+			st.UDPActive = sess.udpSession() != nil
 		}
 		if err := WriteStatus(st); err != nil {
 			s.log.Debug("写状态文件失败", "err", err)
