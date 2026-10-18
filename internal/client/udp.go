@@ -201,11 +201,29 @@ func (c *udpChannel) keepalive(ctx context.Context) {
 			return
 		case <-t.C:
 			if idle := time.Since(time.Unix(0, c.lastRx.Load())); idle > udpDeadAfter {
-				c.log.Warn("UDP 数据通道长时间收不到回包，可能已失效；持续如此请改用 tcp 模式",
+				// 连续多个保活周期收不到回包：这条 UDP 路径已经没用了（NAT 映射被清、
+				// 路由变了、或者运营商开始封）。关掉它并让上层结束会话，重连时会重新
+				// 建一条 UDP 通道 —— 仍然是 UDP，不切 TCP。
+				//
+				// 原来这里只打一条 warn 就继续跑：控制连接还好好的，面板显示在线，
+				// 业务包却一直往一个死掉的 UDP 路径里灌。
+				c.log.Warn("UDP 数据通道连续多个周期收不到回包，关闭并重建",
 					"idle", idle.Round(time.Second))
+				c.close()
+				return
 			}
 			_ = c.send(nil)
 		}
+	}
+}
+
+// isClosed 报告通道是否已被关闭（keepalive 判定失效，或会话收尾）。
+func (c *udpChannel) isClosed() bool {
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
 	}
 }
 

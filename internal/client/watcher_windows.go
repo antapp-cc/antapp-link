@@ -201,6 +201,18 @@ func (w *sessionWatcher) reconcile() {
 		return // 出口没变
 	}
 
+	// 上一笔迁移留下 pending，而当前出口已经又是另一张网卡了：先把那张网卡上
+	// 我们写进去的配置撤干净，再开始新迁移。
+	//
+	// 不这么做的话：A→B 迁移失败（pending=B）后用户又从 B 切到 C，当前出口不匹配
+	// pending 的 B，下面那段 pending 分支会直接跳过，然后按「旧快照 A」迁移到 C ——
+	// B 上的隧道 DNS 和云服绕行路由就永远留在那儿了。快速切 Wi-Fi / 热点 / 睡眠唤醒
+	// 时很容易撞上。
+	if w.pending != nil && (w.pending.snap.DefaultIfIndex != int(ifIndex) ||
+		w.pending.snap.DefaultGateway != gw.Unmap().String()) {
+		w.revertPending()
+	}
+
 	// 上一次迁移已经把配置改到系统上，只是快照没写进磁盘：这次只补写盘，不重跑迁移。
 	//
 	// 必须在这里短路：走完整流程会重新读新网卡的 DNS，而它此刻已经是隧道网关，
@@ -407,6 +419,34 @@ func (w *sessionWatcher) reconcile() {
 	}
 	logf("网络出口变化，已迁移到 %s（网关 %s）%s",
 		newDef.Name, gw, migrationNote(failed))
+}
+
+// revertPending 把一笔未完成迁移在旧网卡上留下的配置撤掉。
+//
+// 用的全是 pending 里记下的原始值：那张网卡的 DNS 原值和绕行下一跳。清理完就不再
+// 保留 —— 新迁移会重新记一份。
+func (w *sessionWatcher) revertPending() {
+	p := w.pending
+	if p == nil {
+		return
+	}
+	w.pending = nil
+
+	// 还原那张网卡的原始 DNS（可能是空 = 回到自动获取）
+	for _, iface := range p.snap.Interfaces {
+		if a, ok, _ := adapterByName(iface.Name); ok {
+			_ = setAdapterDNS(a.LUID, iface.DNS)
+		}
+	}
+	// 撤掉我们写进去的云服 /32 绕行路由
+	if p.snap.ServerNextHop != "" && w.srv.IsValid() {
+		if a, ok, _ := adapterByIndex(uint32(p.snap.DefaultIfIndex)); ok {
+			if hop, err := netip.ParseAddr(p.snap.ServerNextHop); err == nil {
+				_ = a.LUID.DeleteRoute(netip.PrefixFrom(w.srv, 32), hop)
+			}
+		}
+	}
+	logf("上一笔未完成的迁移已回滚（网卡 %d），它的残留配置已清理", p.snap.DefaultIfIndex)
 }
 
 func migrationNote(failed int) string {

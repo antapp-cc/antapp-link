@@ -1065,6 +1065,11 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 			s.trace.Record("tx", 0, pkt)
 			s.stats.TxBytes.Add(uint64(pktLen))
 			if err := s.udp.send(pkt); err != nil {
+				if s.udp.isClosed() {
+					// keepalive 已经判定这条 UDP 通道失效并关掉了它。结束会话让 Run
+					// 重建 —— 重建出来的仍是 UDP 通道，不切 TCP。
+					return fmt.Errorf("UDP 数据通道已失效（准备重建）: %w", err)
+				}
 				s.log.Debug("UDP 上行发送失败", "err", err)
 			}
 			continue

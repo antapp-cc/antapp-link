@@ -161,13 +161,30 @@ func (a *App) HealIfNeeded() error {
 		// 快照本身坏了，DNS 原值已无从得知。至少把接管路由和隧道地址撤掉，
 		// 否则用户会一直卡在「所有流量都进了一条没人读的网卡」。
 		a.log.Warn("状态文件损坏，做一次保守还原（DNS 可能需要手动确认）", "err", err)
-		_ = Snapshot{}.Restore(cfg)
+		restoreErr := Snapshot{}.Restore(cfg)
 		_ = RemoveSnapshot(a.statePath)
+		// 保守还原不保证 DNS 恢复正确，所以仍然要挡住新连接：让用户先重试一次
+		// 断开（会走 restoreNetwork），而不是让 Connect 把半接管现场存成新快照。
+		a.mu.Lock()
+		a.pendingRestore = &pendingRestoreState{snap: Snapshot{}, cfg: cfg, noNetCfg: a.noNetCfg}
+		if restoreErr != nil {
+			a.lastError = "状态文件损坏，保守还原未完成: " + restoreErr.Error()
+		} else {
+			a.lastError = "状态文件损坏，DNS 可能没有恢复正确，请断开重试一次"
+		}
+		a.mu.Unlock()
 		return err
 	}
 
 	a.log.Info("发现上次残留的网络配置，先还原", "captured_at", snap.CapturedAt)
 	if err := snap.Restore(cfg); err != nil {
+		// 启动自愈失败同样必须设门禁：不设的话用户随后点连接，Capture 会把当前这个
+		// 「半接管」现场当成新快照存下来，把磁盘上正确的恢复信息覆盖掉 —— 之后
+		// 再自愈也还原不回去了。运行时的 Disconnect 失败已有同样的门禁，这里补齐。
+		a.mu.Lock()
+		a.pendingRestore = &pendingRestoreState{snap: snap, cfg: cfg, noNetCfg: a.noNetCfg}
+		a.lastError = "启动自愈失败：" + err.Error()
+		a.mu.Unlock()
 		return fmt.Errorf("还原上次的网络配置失败: %w", err)
 	}
 	if err := RemoveSnapshot(a.statePath); err != nil {

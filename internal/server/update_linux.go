@@ -96,7 +96,12 @@ func applyUpdate(newBinary string, out io.Writer) error {
 	// systemd 在非自动重启的启动流程里会把 NRestarts 清零（v252 的 service.c 如此），
 	// 于是「旧实例 7、新实例从 0 涨到 1」的对比会判成「没涨」而漏掉崩溃。现在基线
 	// 取的是新实例自己的起点：清零了就是 0，没清零就是它保留的值，两种都对。
-	if err := waitHealthy(60*time.Second, before, serviceRestarts()); err != nil {
+	baseline, berr := serviceRestarts()
+	if berr != nil {
+		// 读不到基线就直接判失败：没有它，崩溃检查等于不存在
+		return rollback(self, backup, fmt.Errorf("无法读取重启计数基线: %w", berr))
+	}
+	if err := waitHealthy(60*time.Second, before, baseline); err != nil {
 		return rollback(self, backup, err)
 	}
 	return nil
@@ -117,8 +122,12 @@ func rollback(self, backup string, cause error) error {
 	if err := runSystemctl("restart", "antapp-linkd"); err != nil {
 		return fmt.Errorf("%v；文件已回滚但重启失败: %w", cause, err)
 	}
-	// 同 applyUpdate：基线取回滚之后新实例自己的起点
-	if err := waitHealthy(30*time.Second, before, serviceRestarts()); err != nil {
+	// 同 applyUpdate：基线取回滚之后新实例自己的起点；读不到就按失败处理
+	baseline, berr := serviceRestarts()
+	if berr != nil {
+		return fmt.Errorf("%v；文件已回滚但无法确认新实例是否稳定: %w", cause, berr)
+	}
+	if err := waitHealthy(30*time.Second, before, baseline); err != nil {
 		return fmt.Errorf("%v；文件已回滚但回滚后的服务也没就绪: %w", cause, err)
 	}
 	return fmt.Errorf("%w（已回滚到备份版本）", cause)
@@ -140,7 +149,14 @@ func waitHealthy(timeout time.Duration, before string, restartsBefore int) error
 	for time.Now().Before(deadline) {
 		time.Sleep(3 * time.Second)
 
-		if n := serviceRestarts(); n > restartsBefore {
+		n, rerr := serviceRestarts()
+		if rerr != nil {
+			// 读不到重启计数就不能判健康：拿不到"起来又崩"的证据，等于放行。
+			// 安全方向必须 fail-closed（旧版这里返回 0，崩溃会被完全掩盖）。
+			last, healthy = "无法确认服务是否稳定: "+rerr.Error(), 0
+			continue
+		}
+		if n > restartsBefore {
 			// 重启次数涨了就没什么可等的：它已经证明自己稳不住
 			return fmt.Errorf("新版本启动后崩溃重启了 %d 次（systemd NRestarts %d → %d）",
 				n-restartsBefore, restartsBefore, n)
@@ -185,17 +201,22 @@ func waitHealthy(timeout time.Duration, before string, restartsBefore int) error
 // serviceRestarts 读 systemd 记的服务重启次数。
 //
 // 它是"新版本没稳住"最直接的证据：崩溃重启会让它 +1，而状态文件时间戳做不到这一点
-// （每次重启后都会写出新的时间戳）。读不到就返回 0，宁可漏判也不误报。
-func serviceRestarts() int {
+// （每次重启后都会写出新的时间戳）。
+//
+// **读不到就报错，不能返回 0**：调用方拿 0 当基线的话，"0 > 0 = false" 会让崩溃
+// 完全不可见 —— 服务恰好 active、状态文件恰好新鲜，坏版本就被判成健康、跳过回滚。
+// 这是安全方向的判断，必须 fail-closed。
+func serviceRestarts() (int, error) {
 	out, err := exec.Command("systemctl", "show", "-p", "NRestarts", "--value", "antapp-linkd").Output()
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("查 systemd 重启计数失败: %w", err)
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	raw := strings.TrimSpace(string(out))
+	n, err := strconv.Atoi(raw)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("解析 systemd 重启计数失败（输出 %q）: %w", raw, err)
 	}
-	return n
+	return n, nil
 }
 
 func serviceActive() bool {
