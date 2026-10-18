@@ -891,6 +891,11 @@ func (u *UI) waitBeforeReconnect(delay time.Duration) bool {
 		case <-time.After(wait):
 		}
 		left -= wait
+		// 用户点了「断开连接」：立刻收手，别再报倒计时。
+		// 他刚点完断开却看到「等待重连：还剩 N 秒」，会以为程序在偷偷重连。
+		if !u.wantConnected.Load() {
+			return true
+		}
 		if u.app.Status().Online {
 			return true
 		}
