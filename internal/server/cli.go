@@ -17,16 +17,19 @@ import (
 	"syscall"
 
 	"github.com/antapp-cc/antapp-link/internal/pki"
+	"github.com/antapp-cc/antapp-link/internal/version"
 )
 
 const (
 	DefaultConfigPath = "/etc/antapp-link/server.json"
 )
 
-// Version 是 var 而不是 const：发布构建用 -ldflags -X 注入版本号，const 无法在链接期覆盖。
-// 默认值跟着当前版本走 —— 万一有人手搓构建没带 -X，也不至于自认旧版而陷入每小时
-// 「发现新版本 → 下载 → 替换 → 重启」的循环。
-var Version = "0.4.5"
+// Version 是服务端版本号，默认取 internal/version 里的那一个。
+//
+// 与客户端共用同一个源：分开维护必然有一天忘改一边，两端自报不同版本只会误导排障。
+// 留成 var 是因为 -ldflags -X 只能写包级变量；build.ps1 把同一个值同时注进
+// client.Version 和 server.Version。
+var Version = version.Version
 
 // RunCLI 是 antapp-linkd 的入口，返回进程退出码。
 func RunCLI(args []string, stdout, stderr io.Writer) int {

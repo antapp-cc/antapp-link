@@ -3,7 +3,11 @@
 // Package setup 实现 AntApp Link 的安装与卸载。安装器只做 Windows。
 package setup
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/antapp-cc/antapp-link/internal/version"
+)
 
 const (
 	AppName       = "AntApp Link"
@@ -11,7 +15,7 @@ const (
 	AutostartTask = "AntAppLink"
 )
 
-var Version = "0.2.8"
+var Version = version.Version
 
 var ErrNotWindows = errors.New("setup: 安装程序只在 Windows 上可用")
 

@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/antapp-cc/antapp-link/internal/version"
 	"golang.org/x/sys/windows/registry"
 )
 
@@ -42,8 +43,11 @@ const (
 	uninstallKey = `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AntApp Link`
 )
 
-// Version 由构建脚本用 -ldflags -X 注入。
-var Version = "0.2.8"
+// Version 是安装器版本号，默认取 internal/version 里的那一个。
+//
+// 留成 var 是因为 -ldflags -X 只能写包级变量；build.ps1 用同一个 $Version
+// 注进客户端、服务端和这里，三处永远一致。
+var Version = version.Version
 
 const createNoWindow = 0x08000000
 

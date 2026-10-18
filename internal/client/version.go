@@ -1,7 +1,10 @@
 package client
 
-// Version 是客户端版本号。服务端有同名变量，发版时一起改。
+import "github.com/antapp-cc/antapp-link/internal/version"
+
+// Version 是客户端版本号，默认取 internal/version 里的那一个。
 //
-// 必须是 var 而不是 const：build.ps1 要用 -ldflags -X 把它注进去。
-// 默认值跟着当前版本走 —— 手搓构建没带 -X 时也不至于自认旧版、反复「发现新版本」。
-var Version = "0.4.5"
+// 为什么要在这里再留一个 var：-ldflags -X 只能写包级变量，客户端自报版本走的是
+// 这个符号。默认值直接引用共用版本，所以手搓构建（没带 -X）也不会自认旧版、
+// 反复「发现新版本」；正式构建由 build.ps1 把同一个值同时注进客户端和服务端。
+var Version = version.Version
