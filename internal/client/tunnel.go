@@ -469,13 +469,19 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 				return sess.write(proto.TypeUDPPort, p[:])
 			})
 		if uerr != nil {
-			t.log.Warn("UDP 数据通道启动失败，退回 TCP 数据通道", "err", uerr)
-		} else {
-			sess.udp = u
-			defer u.close()
-			t.log.Info("UDP 数据通道已启用（控制仍走 TCP）",
-				"local_port", u.conn.LocalAddr().(*net.UDPAddr).Port)
+			// UDP 模式就是要走 UDP：通道建不起来就明确失败，不偷偷退回 TCP。
+			//
+			// 退回 TCP 会把「UDP 端口没放行」伪装成「一切正常」—— 用户以为在用 UDP，
+			// 实际跑的是 TCP，既违背「纯 UDP、不自动切换」的设计，也让故障无法定位。
+			// 报错后连接失败，用户能直接看到「UDP 通道不可用」，自己决定放行端口，
+			// 或换一张 TCP 连接码。
+			return true, fmt.Errorf("UDP 数据通道不可用（%s 模式下数据只走 UDP，不回退 TCP）: %w",
+				t.inv.Mode, uerr)
 		}
+		sess.udp = u
+		defer u.close()
+		t.log.Info("UDP 数据通道已启用（控制仍走 TCP）",
+			"local_port", u.conn.LocalAddr().(*net.UDPAddr).Port)
 	}
 
 	cancel() // 建连结束：后面的读循环与保活只受外层 ctx 约束
