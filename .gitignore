@@ -26,3 +26,5 @@ cloud-server-backup-20260928/
 # 连接码内含私钥，等同密码，绝不入库
 *.antapp
 *.antapp.bak
+# 独立审查/子代理留下的临时工作目录，不入库
+.review-*/
