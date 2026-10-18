@@ -16,11 +16,11 @@ ASSUME_YES=0
 
 usage() {
   cat <<'EOF'
-用法: bash install.sh [--mode tcp|udp] [--version v0.4.3] [--forward 31400-31409] [--tunnel-port 62233] [--network 10.10.0.0/24] [--yes]
+用法: bash install.sh [--mode tcp|udp] [--version v0.4.4] [--forward 31400-31409] [--tunnel-port 62233] [--network 10.10.0.0/24] [--yes]
 不带参数时全部用默认值。
 --mode     数据通道模式：tcp（默认，N 条 TCP 并联）或 udp（单条控制 + 加密 UDP 数据面）。
            不传则保留配置里已有的值（新装即 tcp）。
---version  指定 antapp-linkd 的 release 标签（如 v0.4.3）。不传则取 latest。
+--version  指定 antapp-linkd 的 release 标签（如 v0.4.4）。不传则取 latest。
 --yes      已装过时不再询问，直接重装。
 EOF
 }
@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --version)
       v="${2:-}"
-      [[ "$v" =~ ^v?[0-9] ]] || die "--version 需要形如 v0.4.3 的标签"
+      [[ "$v" =~ ^v?[0-9] ]] || die "--version 需要形如 v0.4.4 的标签"
       VERSION="$v"
       shift 2
       ;;
@@ -304,9 +304,6 @@ systemctl enable dnsmasq >/dev/null 2>&1 || true
 systemctl restart dnsmasq >/dev/null 2>&1 || log "警告: dnsmasq 未启动，隧道 DNS 中继不可用"
 
 log "配置 netfilter（幂等）"
-# down 必须紧邻 up：它一执行转发规则就整段空缺，而后面还有会 die 的步骤。
-# antapp-link-up.service 是 RemainAfterExit，systemd 不会自动重放，一旦中途失败
-# 只能人工 restart —— 正在跑的 daemon 会一直缺着整段转发规则。
 "$BIN" down -c "$CONF" >/dev/null 2>&1 || true
 "$BIN" up -c "$CONF"
 
@@ -320,8 +317,6 @@ log "当前状态"
 log "重新签发连接码到 /root（覆盖旧文件，让里面的参数跟上当前配置）"
 "$BIN" invite pi-node-01 -c "$CONF" -o /root || log "警告: 签发失败，可手动执行: $BIN invite pi-node-01 -c $CONF -o /root"
 
-# ---- 模式提示 ----
-# 读实际生效的模式：传了 --mode 用它，否则看配置文件（init 可能保留了旧值）
 EFFECTIVE_MODE="$MODE"
 if [[ -z "$EFFECTIVE_MODE" ]]; then
   EFFECTIVE_MODE="$(sed -n 's/.*"mode"[[:space:]]*:[[:space:]]*"\([a-zA-Z]*\)".*/\1/p' "$CONF" 2>/dev/null | head -1)"
