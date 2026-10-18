@@ -37,6 +37,7 @@ type udpChannel struct {
 	recv     *proto.Cipher // 解服务端发来的
 	sendSeal *proto.Cipher // 加密发给服务端的
 	log      *slog.Logger
+	stats    *Stats
 
 	lastRx atomic.Int64 // UnixNano，判活用
 	closed chan struct{}
@@ -45,7 +46,7 @@ type udpChannel struct {
 
 // startUDPChannel 建 UDP socket、导出密钥、把本地端口报给服务端，然后起收发循环。
 func startUDPChannel(ctx context.Context, inv pki.Invite, state tls.ConnectionState,
-	dev Device, log *slog.Logger, report func(port int) error) (*udpChannel, error) {
+	dev Device, log *slog.Logger, stats *Stats, report func(port int) error) (*udpChannel, error) {
 
 	c2sKey, err := state.ExportKeyingMaterial(proto.UDPLabelC2S, nil, 32)
 	if err != nil {
@@ -86,7 +87,8 @@ func startUDPChannel(ctx context.Context, inv pki.Invite, state tls.ConnectionSt
 		return nil, err
 	}
 
-	c := &udpChannel{conn: conn, recv: recv, sendSeal: sendSeal, log: log, closed: make(chan struct{})}
+	c := &udpChannel{conn: conn, recv: recv, sendSeal: sendSeal, log: log, stats: stats,
+		closed: make(chan struct{})}
 	c.lastRx.Store(time.Now().UnixNano())
 	go c.recvLoop(ctx, dev)
 	go c.keepalive(ctx)
@@ -133,6 +135,9 @@ func (c *udpChannel) recvLoop(ctx context.Context, dev Device) {
 			continue
 		}
 		c.lastRx.Store(time.Now().UnixNano())
+		if c.stats != nil {
+			c.stats.RxBytes.Add(uint64(len(plain)))
+		}
 		if len(plain) > 0 && dev != nil {
 			if _, err := dev.Write(plain); err != nil {
 				c.log.Debug("UDP 包写网卡失败", "err", err)

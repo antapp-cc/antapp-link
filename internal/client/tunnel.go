@@ -375,7 +375,7 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	// 服务端（服务端按 TCP 远端 IP + 这个端口认人，不接受 UDP 包里自称的地址）。
 	// 启动失败不算致命 —— 退回 TCP 数据通道照样能用，只是慢。
 	if t.inv.UseUDP() {
-		u, uerr := startUDPChannel(ctx, t.inv, conn.ConnectionState(), sess.dev, t.log,
+		u, uerr := startUDPChannel(ctx, t.inv, conn.ConnectionState(), sess.dev, t.log, sess.stats,
 			func(port int) error {
 				var p [2]byte
 				binary.BigEndian.PutUint16(p[:], uint16(port))
