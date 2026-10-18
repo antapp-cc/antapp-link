@@ -74,7 +74,17 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 	}
 
 	if s, ok := t.m[key]; ok {
-		return s
+		// 映射指向的槽可能已经死了（成员断开还没补上）。原来这里直接返回它，那条流
+		// 就持续往死槽发、被 flushBatch 整批丢掉，直到那个槽补拨回来 —— 实测能黑到
+		// 几十秒，用户看到的是「显示已连接、延迟在跳，但这条流就是不动」。
+		//
+		// 迁移一次：只迁一次（迁完映射立刻更新），内层 TCP 的乱序只发生在这一刻，
+		// 比持续黑洞好得多。这也是本表唯一允许改映射的情形。
+		if alive == nil || alive(s) {
+			return s
+		}
+		delete(t.m, key)
+		// 落到下面重新选槽
 	}
 	// 表满：新流不插入，退回哈希。老流的映射绝不能动 —— 那会让内层 TCP 乱序。
 	if len(t.m) >= t.max {
@@ -97,7 +107,11 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 		}
 	}
 	if best == 0 {
-		// 一个活槽都没有（成员全断了）。退回纯哈希，别把这条流钉死在某个空槽上。
+		// 一个活槽都没有（成员全断了）。
+		//
+		// 这里**不**回退到控制连接 0：槽 0 是心跳通道，数据挤上去面板延迟立刻上千
+		// （实测过）。宁可让这条流暂时发不出去、等成员补拨（`maintainMembers` 在
+		// 后台补），内层 TCP 自己会重传。调用方要为空槽批次计数，别像以前那样静默。
 		return Slot(payload, n)
 	}
 	t.m[key] = best

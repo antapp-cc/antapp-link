@@ -502,6 +502,10 @@ type clientSession struct {
 	// 日志里带上它，用户一眼能看出「这一晚掉了几次」，不用数滚动条。
 	memberDrops atomic.Int32
 
+	// emptySlotDrops 是「所有成员槽都不可用、上行批次被迫丢弃」的批次数。
+	// 正常情况下它一直是 0；涨起来就说明成员全断了在等补拨，业务正在黑洞。
+	emptySlotDrops atomic.Int64
+
 	// closed 是本会话的关闭信号：run 返回后由 closeAll 关闭，让还阻塞在设备读上、
 	// 或正要往旧连接写包的 goroutine 能自己退出。设备跨会话复用、不能靠关设备来收尾。
 	closed    chan struct{}
@@ -1034,8 +1038,16 @@ func flushBatch(s *clientSession, k int, batch []byte) error {
 	}
 	actual, conn, mu := s.writeSlotData(k)
 	if conn == nil {
-		// 槽空（成员断了或正在补）：丢掉这批，等成员回来。
-		// 绝不能落回控制连接 —— 那是心跳通道，数据挤上去面板延迟立刻上千。
+		// 槽空（成员断了或正在补）：丢掉这批，等成员回来。绝不能落回控制连接 ——
+		// 那是心跳通道，数据挤上去面板延迟立刻上千（实测过）。
+		//
+		// 但要计数并让用户看得见：静默丢弃的表现是「显示已连接、延迟也在跳，但业务
+		// 就是不动」，排障时一点线索都没有。这里每 200 批报一次，不刷屏。
+		n := s.emptySlotDrops.Add(1)
+		if n == 1 || n%200 == 0 {
+			s.log.Warn("成员槽全不可用，上行数据暂丢（内层 TCP 会重传）",
+				"slot", k, "dropped_batches", n)
+		}
 		return nil
 	}
 	mu.Lock()

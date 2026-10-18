@@ -176,3 +176,39 @@ func TestFlowTableAvoidsDeadSlots(t *testing.T) {
 		t.Errorf("无活槽时应退回纯哈希（1..3），实际 %d", s)
 	}
 }
+
+// 映射指向的槽死掉后必须迁移到活槽。
+//
+// 原来命中映射就直接返回、不管那个槽是否还活着：流会持续往死槽发、被 flushBatch
+// 整批丢掉，直到原槽被补拨回来（实测能黑几十秒，用户看到的是「显示已连接、延迟
+// 也在跳，但这条流就是不动」）。迁移只发生一次（迁完映射立刻更新），内层 TCP 的
+// 乱序只在这一刻，比持续黑洞好得多。
+func TestFlowTableMigratesOffDeadSlot(t *testing.T) {
+	ft := NewFlowTable()
+	p := buildTCP([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 40000, 443)
+
+	all := func(int) bool { return true }
+	k1 := ft.Slot(p, 4, all)
+	if k1 == 0 {
+		t.Fatal("n=4 时应该分到成员槽")
+	}
+	if again := ft.Slot(p, 4, all); again != k1 {
+		t.Fatalf("同一流应稳定在同一槽：%d != %d", again, k1)
+	}
+
+	// 只让原来那个槽死掉
+	onlyK1Dead := func(i int) bool { return i != k1 }
+	k2 := ft.Slot(p, 4, onlyK1Dead)
+	if k2 == k1 {
+		t.Fatalf("槽 %d 已失效，不该再返回它", k1)
+	}
+	if k2 == 0 {
+		t.Fatal("还有活槽时不该退回纯哈希，更不该落控制槽")
+	}
+	// 迁移只发生一次：再查应该稳定，不会来回跳
+	for i := 0; i < 5; i++ {
+		if got := ft.Slot(p, 4, onlyK1Dead); got != k2 {
+			t.Errorf("迁移后应稳定在 %d，第 %d 次查询得到 %d", k2, i, got)
+		}
+	}
+}
