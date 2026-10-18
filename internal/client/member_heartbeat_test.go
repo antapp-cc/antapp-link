@@ -58,7 +58,7 @@ func TestMemberHeartbeatExitsOnSessionClose(t *testing.T) {
 	sess := newClientSession(testTunnel(t), nil, "sid", nil, Ack{Members: 2})
 	done := make(chan struct{})
 	go func() {
-		sess.memberHeartbeat(context.Background(), 1)
+		sess.memberHeartbeat(context.Background(), 1, nil)
 		close(done)
 	}()
 	sess.closeAll()
@@ -66,5 +66,52 @@ func TestMemberHeartbeatExitsOnSessionClose(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("会话关闭后心跳协程没退出")
+	}
+}
+
+// 槽位被摘掉后心跳也必须退出。
+//
+// 原来 memberHeartbeat 调 pingMember，而 pingMember 在空槽上返回 nil（"没什么可
+// 保活的"），循环因此永不退出 —— 每摘一次槽就漏一个空转协程，一晚上能攒一堆。
+// 报告 5.2 用缩短心跳间隔的方式复现过这一条。
+func TestMemberHeartbeatExitsWhenSlotRemoved(t *testing.T) {
+	old := memberPingInterval
+	memberPingInterval = 50 * time.Millisecond
+	t.Cleanup(func() { memberPingInterval = old })
+
+	server, peer := net.Pipe()
+	defer peer.Close()
+	defer server.Close()
+
+	sess := newClientSession(testTunnel(t), nil, "sid", nil, Ack{Members: 2})
+	sess.slots[1] = server
+
+	// net.Pipe 是同步无缓冲的：对端不读，pingMember 的写会一直阻塞到
+	// slotWriteTimeout（20 秒），测试根本等不到槽检查那一步。这里把帧吃掉。
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			if _, err := peer.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		sess.memberHeartbeat(context.Background(), 1, server)
+		close(done)
+	}()
+
+	// 等第一次心跳过去（确认它真的在跑），再模拟读循环摘槽
+	time.Sleep(120 * time.Millisecond)
+	sess.mu.Lock()
+	sess.slots[1] = nil
+	sess.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("槽位移除后心跳协程没退出（会积累空转协程）")
 	}
 }

@@ -54,14 +54,6 @@ const (
 	readBufferSize         = 65535
 	protoVersion           = 1
 
-	// memberPingInterval 是成员连接的心跳间隔。
-	//
-	// 成员连接上只有数据帧、没有控制帧：流量稀疏时它会长时间没有包往返，
-	// 跨境链路的 NAT 会把这种连接的状态清掉，客户端随后读到 i/o timeout、
-	// 摘槽重拨（实测 3 条数据连接时每 1~2 分钟一次）。定期发一个小帧保活，
-	// 比事后重拨便宜得多。取 15s 是为了短于常见 NAT 超时（30s 起）。
-	memberPingInterval = 15 * time.Second
-
 	// maxMembers 是单会话允许的并行连接数上限（与连接码、服务端 max_members 同界）。
 	maxMembers = 4
 )
@@ -634,10 +626,11 @@ func (s *clientSession) pingMember(k int) error {
 	return proto.WriteFrame(conn, proto.TypePing, ts)
 }
 
-// memberHeartbeat 给一条成员连接保活，直到会话结束或这条连接写不动。
+// memberHeartbeat 给一条成员连接保活，直到会话结束、这条连接写不动，或它的槽位
+// 已经被摘掉/换掉。
 //
 // 服务端会回 PONG（老服务端会忽略，但上行有包就已经能刷新 NAT 映射了）。
-func (s *clientSession) memberHeartbeat(ctx context.Context, k int) {
+func (s *clientSession) memberHeartbeat(ctx context.Context, k int, conn net.Conn) {
 	ticker := time.NewTicker(memberPingInterval)
 	defer ticker.Stop()
 	for {
@@ -647,12 +640,40 @@ func (s *clientSession) memberHeartbeat(ctx context.Context, k int) {
 		case <-s.closed:
 			return
 		case <-ticker.C:
+			// 槽位已经不是自己了（被摘除、或维护协程换了新连接）：退出。
+			// 不检查的话这条协程会一直空转到会话结束 —— pingMember 在空槽上返回
+			// nil，循环因此永不退出，反复掉线就积累一堆死心跳。
+			if s.slotConn(k) != conn {
+				return
+			}
 			if err := s.pingMember(k); err != nil {
 				// 写失败不在这里收尾：读循环会摘槽、维护协程会补拨
 				return
 			}
 		}
 	}
+}
+
+var (
+	// memberPingInterval 是成员连接的心跳间隔。
+	//
+	// 成员连接上只有数据帧、没有控制帧：流量稀疏时它会长时间没有包往返，
+	// 跨境链路的 NAT 会把这种连接的状态清掉，客户端随后读到 i/o timeout、
+	// 摘槽重拨（实测 3 条数据连接时每 1~2 分钟一次）。定期发一个小帧保活，
+	// 比事后重拨便宜得多。取 15s 是为了短于常见 NAT 超时（30s 起）。
+	//
+	// 是 var 而不是 const 只为让测试能临时调小它；生产路径没人写它。
+	memberPingInterval = 15 * time.Second
+)
+
+// slotConn 返回槽位 k 上此刻的连接；空槽或越界返回 nil（不像 slot 那样兜底到控制连接）。
+func (s *clientSession) slotConn(k int) net.Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if k < 0 || k >= len(s.slots) {
+		return nil
+	}
+	return s.slots[k]
 }
 
 // slot 返回槽位 k 的连接；越界或空槽 → 控制连接兜底。
@@ -756,7 +777,7 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 	t.log.Info("成员连接已就位", "member", k, "live", sess.liveCount())
 
 	// 这条连接要自己保活（理由见 memberPingInterval）：会话收尾或写不动时退出
-	go sess.memberHeartbeat(ctx, k)
+	go sess.memberHeartbeat(ctx, k, conn)
 
 	// 读循环：成员连接上来的包写网卡；断开摘槽（该槽流量落回控制连接）
 	for {
