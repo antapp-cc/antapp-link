@@ -193,36 +193,36 @@ func connBrokenReason(err error) string {
 	msg := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(msg, "use of closed network connection"):
-		return "本端主动关闭（写超时或会话正在收尾）"
+		return "本端关闭"
 	case strings.Contains(msg, "did not properly respond after a period of time"),
 		strings.Contains(msg, "host has failed to respond"),
 		strings.Contains(msg, "i/o timeout"),
 		strings.Contains(msg, "timed out"):
-		return "对端一段时间没有响应（线路中断，或对端进程卡住/被防火墙丢包）"
+		return "对端无响应"
 	case strings.Contains(msg, "forcibly closed"),
 		strings.Contains(msg, "connection reset"),
 		strings.Contains(msg, "connection abort"):
-		return "对端强制断开（连接被重置）"
+		return "对端重置"
 	case strings.Contains(msg, "eof"):
-		return "对端正常关闭了连接"
+		return "正常关闭"
 	case strings.Contains(msg, "unreachable"):
-		return "网络不可达（本机网络变动或出口中断）"
+		return "网络不可达"
 	case strings.Contains(msg, "refused"):
-		return "连接被拒绝（服务端没在运行或端口没放行）"
+		return "连接被拒绝"
 	case strings.Contains(msg, "address already in use"):
-		return "端口已被占用（另一个进程在监听这个端口）"
+		return "端口占用"
 	case strings.Contains(msg, "didn't provide a certificate"),
 		strings.Contains(msg, "certificate required"):
-		return "对端没有提供证书"
+		return "对端无证书"
 	case strings.Contains(msg, "bad certificate"),
 		strings.Contains(msg, "unknown authority"):
-		return "证书不被信任（签发者不认识）"
+		return "证书不受信"
 	case strings.Contains(msg, "certificate has expired"):
 		return "证书已过期"
 	case strings.Contains(msg, "broken pipe"):
-		return "对端已经断开（写不进去）"
+		return "对端已断开"
 	case strings.Contains(msg, "no route to host"):
-		return "没有到对端的路由（网络不通）"
+		return "无路由"
 	default:
 		return ""
 	}
@@ -452,6 +452,10 @@ type clientSession struct {
 	tlsCfg  *tls.Config
 	trace   *OrderTracer    // 联调顺序追踪（nil = 关闭）
 	ctx     context.Context // 会话上下文（run 里赋值），收尾时用来判断写失败是否预期内
+
+	// memberDrops 是本会话成员连接被摘掉的次数（含主动摘除与对端断开）。
+	// 日志里带上它，用户一眼能看出「这一晚掉了几次」，不用数滚动条。
+	memberDrops atomic.Int32
 
 	// closed 是本会话的关闭信号：run 返回后由 closeAll 关闭，让还阻塞在设备读上、
 	// 或正要往旧连接写包的 goroutine 能自己退出。设备跨会话复用、不能靠关设备来收尾。
@@ -714,7 +718,16 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 				sess.slots[k] = nil
 			}
 			sess.mu.Unlock()
-			t.log.Info("成员连接断开", connLogAttrs(err, conn, "member", k)...)
+			reason := connBrokenReason(err)
+			if reason == "本端关闭" {
+				// dropSlot 主动摘掉的连接：写那侧已经 Warn 过，这里只留 Debug，
+				// 否则同一件事会打两条（一条信息一条警告），读起来像两个故障。
+				t.log.Debug("成员连接已摘除", "member", k)
+			} else {
+				n := sess.memberDrops.Add(1)
+				t.log.Warn("成员连接断开", "member", k, "reason", reason,
+					"drops", n, "live", sess.liveCount())
+			}
 			return err
 		}
 		switch typ {
@@ -1010,9 +1023,13 @@ func flushBatch(s *clientSession, k int, batch []byte) error {
 			return fmt.Errorf("写隧道: %w", werr)
 		}
 		if actual > 0 {
-			// 一条成员连接出问题不该重启整条隧道：摘掉它，让维护协程补一条新的
+			// 一条成员连接出问题不该重启整条隧道：摘掉它，让维护协程补一条新的。
+			// dropSlot 会关连接、读循环随后也会失败，但那边按 reason=="本端关闭"
+			// 降级成 Debug，所以断开这件事只在这里 Warn 一次。
 			s.dropSlot(actual, conn)
-			s.log.Warn("成员连接写不动，已摘除该槽", connLogAttrs(werr, conn, "slot", actual)...)
+			n := s.memberDrops.Add(1)
+			s.log.Warn("成员连接写不动，已摘除", "slot", actual,
+				"reason", connBrokenReason(werr), "drops", n)
 			return nil
 		}
 		s.log.Error("写隧道失败", connLogAttrs(werr, conn, "slot", actual, "bytes", len(batch))...)

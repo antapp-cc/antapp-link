@@ -176,7 +176,7 @@ func TestConnLogAttrsPrefersChineseReason(t *testing.T) {
 
 	m := toMap(connLogAttrs(
 		errors.New("read tcp 1.2.3.4:1->5.6.7.8:2: read: connection reset by peer"), server, "member", 2))
-	if got := m["reason"]; got != "对端强制断开（连接被重置）" {
+	if got := m["reason"]; got != "对端重置" {
 		t.Errorf("reason = %v", got)
 	}
 	if _, ok := m["err"]; ok {
@@ -208,27 +208,27 @@ func TestConnBrokenReason(t *testing.T) {
 			err: "read tcp 192.168.5.15:60451->103.142.86.145:62233: wsarecv: A connection attempt " +
 				"failed because the connected party did not properly respond after a period of time, " +
 				"or established connection failed because connected host has failed to respond.",
-			want: "对端一段时间没有响应",
+			want: "对端无响应",
 		},
 		{
 			name: "Windows 的 RST",
 			err:  "read tcp 192.168.5.15:1->1.2.3.4:5: wsarecv: An existing connection was forcibly closed by the remote host.",
-			want: "对端强制断开",
+			want: "对端重置",
 		},
 		{
 			name: "Linux 的 RST",
 			err:  "read tcp 10.0.0.1:1->1.2.3.4:5: read: connection reset by peer",
-			want: "对端强制断开",
+			want: "对端重置",
 		},
 		{
 			name: "本端主动关闭（写超时后我们关的）",
 			err:  "read tcp 10.0.0.1:1->1.2.3.4:5: use of closed network connection",
-			want: "本端主动关闭",
+			want: "本端关闭",
 		},
 		{
 			name: "对端正常关闭",
 			err:  "read tcp 10.0.0.1:1->1.2.3.4:5: EOF",
-			want: "对端正常关闭",
+			want: "正常关闭",
 		},
 		{
 			name: "网络不可达",
@@ -238,22 +238,22 @@ func TestConnBrokenReason(t *testing.T) {
 		{
 			name: "端口被占用",
 			err:  "listen tcp 0.0.0.0:31400: bind: address already in use",
-			want: "端口已被占用",
+			want: "端口占用",
 		},
 		{
 			name: "TLS 没带客户端证书",
 			err:  "tls: client didn't provide a certificate",
-			want: "没有提供证书",
+			want: "对端无证书",
 		},
 		{
 			name: "证书不被信任",
 			err:  "x509: certificate signed by unknown authority",
-			want: "不被信任",
+			want: "证书不受信",
 		},
 		{
 			name: "写不进去（对端已断）",
 			err:  "write tcp 1.2.3.4:5->6.7.8.9:10: write: broken pipe",
-			want: "对端已经断开",
+			want: "对端已断开",
 		},
 		{
 			name: "认不出来就别编",

@@ -829,10 +829,10 @@ func (u *UI) keepConnected() {
 	// → 自检失败 → 还原」无限刷。
 	lastFailed := false
 	for {
-		select {
-		case <-u.done:
+		// 等待期间报倒计时：只打一行"将在 N 秒后重连"的话，用户盯着界面看不出程序
+		// 是在等还是在睡觉，容易误以为卡死了。
+		if !u.waitBeforeReconnect(delay) {
 			return
-		case <-time.After(delay):
 		}
 		if !u.wantConnected.Load() {
 			// 绝不能 return：用户点「断开连接」只表示现在不想连着，之后再点「连接」
@@ -855,10 +855,34 @@ func (u *UI) keepConnected() {
 		if lastFailed && delay < 5*time.Minute {
 			delay *= 2
 		}
-		u.app.Log().Info(fmt.Sprintf("隧道不在线，自动重连 %s……", u.app.CurrentSource()))
+		u.app.Log().Info(fmt.Sprintf("隧道不在线，%d 秒后自动重连 %s",
+			int(delay.Seconds()), u.app.CurrentSource()))
 		_ = u.app.Connect()
 		lastFailed = true // 下一轮若已 Online 会清零，否则继续退避
 	}
+}
+
+// waitBeforeReconnect 等待 delay，期间每 20 秒报一次剩余时间。
+// 返回 false 表示 UI 正在退出，调用方应当直接收手。
+func (u *UI) waitBeforeReconnect(delay time.Duration) bool {
+	const step = 20 * time.Second
+	left := delay
+	for left > 0 {
+		wait := step
+		if left < wait {
+			wait = left
+		}
+		select {
+		case <-u.done:
+			return false
+		case <-time.After(wait):
+		}
+		left -= wait
+		if left > 0 {
+			u.app.Log().Info(fmt.Sprintf("等待重连：还剩 %d 秒", int(left.Seconds())))
+		}
+	}
+	return true
 }
 
 func (u *UI) onHide() {

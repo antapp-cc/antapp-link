@@ -1,0 +1,8 @@
+{
+  "Replace": {
+    "C:\\Users\\Administrator\\Desktop\\软件打包\\antapp-link\\internal\\update\\zz_review_stability_test.go": "C:\\Users\\Administrator\\Desktop\\软件打包\\antapp-link\\.review-stability-53dca816f396400d8414ca3bb15a3345\\update_review_test.go",
+    "C:\\Users\\Administrator\\Desktop\\软件打包\\antapp-link\\internal\\client\\tunnel.go": "C:\\Users\\Administrator\\Desktop\\软件打包\\antapp-link\\.review-stability-53dca816f396400d8414ca3bb15a3345\\tunnel_review.go",
+    "C:\\Users\\Administrator\\Desktop\\软件打包\\antapp-link\\internal\\client\\zz_review_stability_test.go": "C:\\Users\\Administrator\\Desktop\\软件打包\\antapp-link\\.review-stability-53dca816f396400d8414ca3bb15a3345\\client_review_test.go",
+    "C:\\Users\\Administrator\\Desktop\\软件打包\\antapp-link\\internal\\proto\\zz_review_stability_test.go": "C:\\Users\\Administrator\\Desktop\\软件打包\\antapp-link\\.review-stability-53dca816f396400d8414ca3bb15a3345\\proto_review_test.go"
+  }
+}

@@ -18,8 +18,8 @@ func TestSessionEndInfoCoversWindowsTimeout(t *testing.T) {
 	if reason == "" {
 		t.Fatal("Windows 超时文案必须能归出中文原因，否则日志里会同时出现空 reason 和英文 err")
 	}
-	if !strings.Contains(reason, "没有响应") {
-		t.Errorf("reason = %q，期望包含「没有响应」", reason)
+	if !strings.Contains(reason, "无响应") {
+		t.Errorf("reason = %q，期望包含「无响应」", reason)
 	}
 	if lvl != slog.LevelWarn {
 		t.Errorf("级别 = %v，期望 Warn", lvl)
