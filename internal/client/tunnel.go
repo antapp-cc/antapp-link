@@ -143,6 +143,13 @@ type Tunnel struct {
 	// 就积累一堆旧 reader，而且它们还会和新会话抢同一个网卡上的包（表现为重连后偶发
 	// 首包丢失）。把读循环提到这一层，会话怎么重拨都只有这一条。
 	pktCh chan []byte
+
+	// readErr 承接读循环的致命错误。
+	//
+	// 没有它的话，设备读失败只是让 readPump 自己 return：控制连接照常收发心跳，
+	// 面板显示在线、延迟也正常，但上行早就停止搬运了 —— 直到别的方向偶然报错才重连。
+	// 带缓冲 1：读循环挂掉后塞一次就退出，不会阻塞。
+	readErr chan error
 }
 
 func NewTunnel(inv pki.Invite, dev Device, logger *slog.Logger) *Tunnel {
@@ -150,7 +157,7 @@ func NewTunnel(inv pki.Invite, dev Device, logger *slog.Logger) *Tunnel {
 		logger = slog.Default()
 	}
 	return &Tunnel{inv: inv, dev: dev, log: logger, wake: make(chan struct{}, 1),
-		pktCh: make(chan []byte, 64)}
+		pktCh: make(chan []byte, 64), readErr: make(chan error, 1)}
 }
 
 // Kick 唤醒重连循环。非阻塞：正在连接时通知被丢弃，无害。
@@ -248,15 +255,32 @@ func connLogAttrs(err error, conn net.Conn, attrs ...any) []any {
 // 网卡与路由在整个过程中保持不动：隧道断掉时靠「原默认路由仍在、只是 metric 更高」
 // 自动回落到本地线路，不会整机断网。
 func (t *Tunnel) Run(ctx context.Context) error {
+	// 内部 ctx：读循环挂掉时取消它，把正在跑的会话一起叫停。
+	//
+	// 不让 readPump 自己 return 就完事的原因：控制连接还在收发心跳，面板显示在线、
+	// 延迟也正常，而上行早就停止搬运了 —— 用户看到的是「一连上但什么都打不开」。
+	runCtx, cancelRead := context.WithCancel(ctx)
+	defer cancelRead()
+
 	// 唯一的网卡读循环：整个 Tunnel 生命周期只起这一次
-	go t.readPump(ctx)
+	go t.readPump(runCtx, cancelRead)
 
 	attempt := 0
 	for {
+		// 读循环挂掉要优先处理，不能让「控制连接还在线」掩盖上行停摆
+		if rerr := t.takeReadError(); rerr != nil {
+			if t.RebuildDevice != nil {
+				t.log.Warn("网卡读取失败（上行搬运已停），自动重建设备并重连", "err", rerr)
+				go t.RebuildDevice()
+				return nil
+			}
+			t.log.Error("网卡读取失败且无法重建设备，隧道退出", "err", rerr)
+			return rerr
+		}
 		if ctx.Err() != nil {
 			return nil
 		}
-		connected, err := t.session(ctx)
+		connected, err := t.session(runCtx)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -283,6 +307,9 @@ func (t *Tunnel) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-runCtx.Done():
+			// 读循环挂了：回到循环顶部走错误处理，不要在这里当成一次普通断线
+			continue
 		case <-t.wake:
 			// 网络出口刚迁移完（watcher 通知），立刻重试而不是干等退避计时
 		case <-time.After(Backoff(attempt)):
@@ -293,20 +320,43 @@ func (t *Tunnel) Run(ctx context.Context) error {
 	}
 }
 
+// takeReadError 非阻塞取读循环的致命错误（没有就返回 nil）。
+func (t *Tunnel) takeReadError() error {
+	select {
+	case err := <-t.readErr:
+		return err
+	default:
+		return nil
+	}
+}
+
 // readPump 是全局唯一的网卡读循环。
 //
 // 它不属于任何会话：读到包就塞进 pktCh，由当前会话取走。这样会话怎么重拨都不会
-// 积累旧 reader，也不会有旧会话抢走新会话的首包。读失败就停下 —— 设备坏了，
-// 重拨 TCP 也救不了，交给 App 的完整重连（RebuildDevice）。
-func (t *Tunnel) readPump(ctx context.Context) {
+// 积累旧 reader，也不会有旧会话抢走新会话的首包。读失败要上报 —— 设备坏了，重拨
+// TCP 救不了，得靠 App 的完整重连（RebuildDevice）。
+func (t *Tunnel) readPump(ctx context.Context, onFatal context.CancelFunc) {
 	buf := make([]byte, readBufferSize)
+	report := func(err error) {
+		// 带缓冲 1 且只塞一次：读循环随后就退出，不会再写
+		select {
+		case t.readErr <- err:
+		default:
+		}
+		// 叫停会话循环，让 Run 立刻看到这条错误（否则它会一直等到连接出问题）
+		onFatal()
+	}
 	for {
 		n, err := t.dev.Read(buf)
 		if err != nil {
 			if ctx.Err() != nil {
+				return // 外层取消：正常收尾，不当作故障上报
+			}
+			// 我们自己的 Close 是正常收尾（比如用户断开），不触发重连
+			if errors.Is(err, ErrDeviceClosed) {
 				return
 			}
-			t.log.Error("读网卡失败，上行搬运停止", "err", err)
+			report(err)
 			return
 		}
 		if n <= 0 {
