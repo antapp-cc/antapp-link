@@ -49,7 +49,21 @@ type App struct {
 	checker *update.Checker
 	pending *update.Manifest
 
+	// pendingRestore 是「网络还原失败、还欠一次还原」的现场。
+	//
+	// 没有它的话，Disconnect 在 Restore 之前就把 snapshot/cfg 清空了，失败后第二次
+	// 调用命中「没有运行中的连接」直接返回 nil —— 用户以为断干净了，实际上路由和
+	// DNS 还指着已经拆掉的隧道，解析全超时。有它之后重复断开会真的重试。
+	pendingRestore *pendingRestoreState
+
 	orderTrace *OrderTracer
+}
+
+// pendingRestoreState 是一次没做完的网络还原。
+type pendingRestoreState struct {
+	snap     Snapshot
+	cfg      NetConfig
+	noNetCfg bool
 }
 
 type Option func(*App)
@@ -642,8 +656,29 @@ func (a *App) Disconnect() error {
 		// 起来，用户直接断网。这与 Connect 在 connecting 时的处理保持一致。
 		return errors.New("正在断开，请稍候")
 	case !a.running && a.dev == nil:
+		// 没有运行中的连接。但上次还原可能失败过（路由/DNS 没撤干净）——
+		// 那种时候必须重试，不能因为「看起来没连」就假装成功，否则用户点几次
+		// 断开都拿不到真正的结果，网络也永远留着隧道残留。
+		pending := a.pendingRestore
+		if pending == nil {
+			a.mu.Unlock()
+			return nil
+		}
+		a.disconnecting = true
 		a.mu.Unlock()
-		return nil
+
+		err := a.restoreNetwork(pending.snap, pending.cfg, pending.noNetCfg)
+		a.mu.Lock()
+		a.disconnecting = false
+		if err == nil {
+			a.pendingRestore = nil
+			a.lastError = ""
+			a.log.Info("待还原的网络配置已补还原完成")
+		} else {
+			a.lastError = err.Error()
+		}
+		a.mu.Unlock()
+		return err
 	}
 	a.disconnecting = true
 	cancel, dev, watcher := a.cancel, a.dev, a.watcher
@@ -660,40 +695,47 @@ func (a *App) Disconnect() error {
 	a.snapshot, a.cfg = Snapshot{}, NetConfig{}
 	a.mu.Unlock()
 
-	restoreErr := func() error {
-		if cancel != nil {
-			cancel()
-		}
-		if dev != nil {
-			// 给搬运 goroutine 一点时间退出，免得一边还原网络一边往里写包
-			time.Sleep(150 * time.Millisecond)
-			_ = dev.Close()
-		}
+	// 停掉搬运协程
+	if cancel != nil {
+		cancel()
+	}
+	if dev != nil {
+		// 给搬运 goroutine 一点时间退出，免得一边还原网络一边往里写包
+		time.Sleep(150 * time.Millisecond)
+		_ = dev.Close()
+	}
 
-		// 联调模式本来就没动过路由和 DNS，没什么可还原的
-		if noNetCfg {
-			a.log.Info("已断开")
-			return nil
-		}
-
-		if err := snap.Restore(cfg); err != nil {
-			// 还原失败就留着 state.json，让下次启动继续尝试自愈
-			return fmt.Errorf("还原网络配置失败: %w", err)
-		}
-		if err := RemoveSnapshot(a.statePath); err != nil {
-			a.log.Warn("删除状态文件失败", "err", err)
-		}
-		a.log.Info("已断开")
-		return nil
-	}()
+	restoreErr := a.restoreNetwork(snap, cfg, noNetCfg)
 
 	a.mu.Lock()
 	a.disconnecting = false
 	if restoreErr != nil {
+		// 保留现场：下一次 Disconnect 会拿它重试，而不是当成「已经断开」
+		a.pendingRestore = &pendingRestoreState{snap: snap, cfg: cfg, noNetCfg: noNetCfg}
 		a.lastError = restoreErr.Error()
+	} else {
+		a.pendingRestore = nil
 	}
 	a.mu.Unlock()
 	return restoreErr
+}
+
+// restoreNetwork 把接管过的网络还回去。失败时调用方负责保留现场以便重试。
+func (a *App) restoreNetwork(snap Snapshot, cfg NetConfig, noNetCfg bool) error {
+	// 联调模式本来就没动过路由和 DNS，没什么可还原的
+	if noNetCfg {
+		a.log.Info("已断开")
+		return nil
+	}
+	if err := snap.Restore(cfg); err != nil {
+		// 留着 state.json：下次启动自愈还会再试一次
+		return fmt.Errorf("还原网络配置失败: %w", err)
+	}
+	if err := RemoveSnapshot(a.statePath); err != nil {
+		a.log.Warn("删除状态文件失败", "err", err)
+	}
+	a.log.Info("已断开")
+	return nil
 }
 
 // probeTimeout 是探测服务端的预算。probeServer 内部不再压更短的硬编码超时，所以它就是

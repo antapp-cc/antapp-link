@@ -46,6 +46,13 @@ type sessionWatcher struct {
 	lastGw  netip.Addr // 上次认定的默认网关（去抖：没变就不动）
 	lastIdx uint32     // 上次认定的默认网卡
 
+	// pending 是「配置已经改到系统上、但快照还没写进磁盘」的现场。
+	//
+	// 有它才能让重试安全：写盘失败后如果走完整迁移流程重新读网卡 DNS，读到的是
+	// 已经被我们改成隧道网关的值，会被当成用户原值存进快照 —— 断开时把物理网卡
+	// DNS 恢复到一个已经拆掉的隧道地址，用户解析全超时。所以重试只重做写盘这一步。
+	pending *Snapshot
+
 	events chan struct{} // 回调 → 对账循环的通知（带缓冲，风暴合并）
 
 	stop   chan struct{}
@@ -180,6 +187,28 @@ func (w *sessionWatcher) reconcile() {
 		return // 出口没变
 	}
 
+	// 上一次迁移已经把配置改到系统上，只是快照没写进磁盘：这次只补写盘，不重跑迁移。
+	//
+	// 必须在这里短路：走完整流程会重新读新网卡的 DNS，而它此刻已经是隧道网关，
+	// 于是把「我们自己的值」当成用户原值保存下来 —— 断开时物理网卡 DNS 被恢复成
+	// 一个不可用的隧道地址，用户表现为解析全超时。
+	if w.pending != nil && w.pending.DefaultIfIndex == int(ifIndex) &&
+		w.pending.DefaultGateway == gw.Unmap().String() {
+		pending := *w.pending
+		if w.update != nil {
+			if err := w.update(pending); err != nil {
+				logf("迁移现场仍写不进磁盘（%v），保留待提交状态，下次事件再试", err)
+				return
+			}
+		}
+		w.snap = pending
+		w.pending = nil
+		w.lastGw = gw.Unmap()
+		w.lastIdx = ifIndex
+		logf("上次迁移的现场已补写入磁盘")
+		return
+	}
+
 	oldSnap := w.snap
 	oldGw, _ := netip.ParseAddr(oldSnap.DefaultGateway)
 
@@ -269,13 +298,22 @@ func (w *sessionWatcher) reconcile() {
 	}
 
 	// 4) 新网卡接管：DNS、绕行、国内分流、动态 MTU
+	//
+	// DNS 和云服绕行是「隧道能不能用」的前提，失败必须算迁移失败 —— 只靠后面的
+	// 快照写盘成功就把出口标记提交掉的话，对账发现接口与网关没变就直接返回，
+	// 这两个配置永远不会被补修，隧道一直连不上。
+	dnsApplied := true
 	if err := setAdapterDNS(newDef.LUID, w.cfg.DNS); err != nil {
-		logf("迁移 DNS 到 %s 失败: %v", newDef.Name, err)
+		dnsApplied = false
+		logf("迁移 DNS 到 %s 失败（待补修）: %v", newDef.Name, err)
 	}
+	routeApplied := true
 	if serverNextHop != "" {
 		if nextHop, err := netip.ParseAddr(serverNextHop); err == nil {
-			if rerr := newDef.LUID.AddRoute(netip.PrefixFrom(w.srv, 32), nextHop, 1); rerr != nil {
-				logf("给新出口加云服绕行路由失败（隧道可能连不上）: %v", rerr)
+			if rerr := newDef.LUID.AddRoute(netip.PrefixFrom(w.srv, 32), nextHop, 1); rerr != nil &&
+				!errors.Is(rerr, windows.ERROR_OBJECT_ALREADY_EXISTS) {
+				routeApplied = false
+				logf("给新出口加云服绕行路由失败（隧道可能连不上，待补修）: %v", rerr)
 			}
 		}
 	}
@@ -291,19 +329,30 @@ func (w *sessionWatcher) reconcile() {
 
 	// 6) 提交现场 + 唤醒隧道立刻重连
 	//
-	// 只有落盘成功才算提交：写盘失败时保留 lastGw/lastIdx 不动，下次出口事件会重新
-	// 走一遍迁移并重试写盘 —— 否则磁盘上会永远留着迁移前的旧现场，强杀后恢复错网卡。
+	// 只有「关键配置都写上 + 快照落盘成功」才算提交。任一条件不满足就保留待提交
+	// 状态（pending），下一轮事件会重试同一份现场 —— 重试只补写盘/补配置，不会重新
+	// 读网卡 DNS（那已经被我们改过了）。
 	snap := newSnapshot(gw.Unmap().String(), int(ifIndex), serverNextHop,
 		w.srv.String(), []IfaceDNS{{Name: newDef.Name, Index: int(newDef.Index), DNS: newDNSStrings}}, w.cfg)
+	if !dnsApplied || !routeApplied {
+		w.pending = &snap
+		logf("网络出口已切换，但关键配置没写全：保留待提交状态，下次事件会补修")
+		if w.kick != nil {
+			w.kick()
+		}
+		return
+	}
 	if w.update != nil {
 		if err := w.update(snap); err != nil {
-			logf("网络出口迁移已生效，但现场写盘失败（%v）：保留旧提交点，下次事件会重试", err)
+			w.pending = &snap
+			logf("网络出口迁移已生效，但现场写盘失败（%v）：保留待提交状态，下次事件会重试", err)
 			if w.kick != nil {
 				w.kick()
 			}
 			return
 		}
 	}
+	w.pending = nil
 	w.snap = snap
 	w.lastGw = gw.Unmap()
 	w.lastIdx = ifIndex

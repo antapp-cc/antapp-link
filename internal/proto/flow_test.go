@@ -177,8 +177,41 @@ func TestFlowTableAvoidsDeadSlots(t *testing.T) {
 	}
 }
 
-// 映射指向的槽死掉后必须迁移到活槽。
+// 满表回退也必须避开死槽。
 //
+// 原来的满表分支直接 `Slot(payload, n)` 纯哈希，不看 alive：这批新流会落到已经断开的
+// 成员槽上，尽管健康成员还有空位 —— 那些流持续丢包。复审第三轮问题五把容量缩小到 1
+// 来触发同一分支复现过。
+func TestFlowTableFullAvoidsDeadSlots(t *testing.T) {
+	ft := NewFlowTable()
+	ft.max = 1 // 逼迫所有新流走满表回退
+	ft.lastN = 4
+
+	onlySlot1Alive := func(k int) bool { return k == 1 }
+	for i := 0; i < 50; i++ {
+		p := buildTCP([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, uint16(40000+i), 443)
+		if s := ft.Slot(p, 4, onlySlot1Alive); s != 1 {
+			t.Fatalf("第 %d 条流在满表回退时被分到死槽 %d（只有槽 1 活）", i, s)
+		}
+	}
+}
+
+// 满表回退对同一个包必须稳定：否则同一条内层流会在外层连接之间跳，TCP 乱序。
+func TestFlowTableFullFallbackStablePerFlow(t *testing.T) {
+	ft := NewFlowTable()
+	ft.max = 1
+	ft.lastN = 4
+	alive := func(int) bool { return true }
+
+	p := buildTCP([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 41000, 443)
+	first := ft.Slot(p, 4, alive)
+	for i := 0; i < 10; i++ {
+		if got := ft.Slot(p, 4, alive); got != first {
+			t.Fatalf("同一个包在满表回退下换了槽：%d → %d", first, got)
+		}
+	}
+}
+
 // 原来命中映射就直接返回、不管那个槽是否还活着：流会持续往死槽发、被 flushBatch
 // 整批丢掉，直到原槽被补拨回来（实测能黑几十秒，用户看到的是「显示已连接、延迟
 // 也在跳，但这条流就是不动」）。迁移只发生一次（迁完映射立刻更新），内层 TCP 的

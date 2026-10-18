@@ -86,9 +86,11 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 		delete(t.m, key)
 		// 落到下面重新选槽
 	}
-	// 表满：新流不插入，退回哈希。老流的映射绝不能动 —— 那会让内层 TCP 乱序。
+	// 表满：新流不插入（老流的映射绝不能动 —— 那会让内层 TCP 乱序），但仍必须
+	// 在**活槽**里选。直接纯哈希会把这批新流分到已经断开的成员槽上：那条流失效，
+	// 而健康成员明明还有空位。这正是复审第三轮问题五复现的那条。
 	if len(t.m) >= t.max {
-		return Slot(payload, n)
+		return hashToAlive(payload, n, alive)
 	}
 
 	counts := make([]int, n)
@@ -116,4 +118,24 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 	}
 	t.m[key] = best
 	return best
+}
+
+// hashToAlive 用纯哈希定一个起点，再沿环找到第一个活槽。
+//
+// 只靠哈希不够：它会落在断开的成员槽上（尽管还有健康成员）。但也**不能**随便挑
+// 一个活槽 —— 必须让「同一个包 + 同一存活集合」永远落在同一个槽，否则同一条内层
+// 流会在不同外层连接之间跳，TCP 直接乱序。
+func hashToAlive(payload []byte, n int, alive func(int) bool) int {
+	h := Slot(payload, n)
+	if alive == nil || alive(h) {
+		return h
+	}
+	for i := 0; i < n-1; i++ {
+		c := ((h-1+i)%(n-1) + 1)
+		if alive(c) {
+			return c
+		}
+	}
+	// 一个活槽都没有：保持旧行为（纯哈希），等成员补拨
+	return h
 }

@@ -117,14 +117,27 @@ func handleRelayConn(conn net.Conn, target string, log *slog.Logger) {
 	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = io.Copy(upstream, conn)
-		_ = upstream.Close()
+		// 客户端只是关掉了写方向（请求发完了），要等应答。这里把半关闭传给
+		// upstream，而不是整条关掉 —— 整条关会把服务端还没发完的应答截断，
+		// 客户端拿到空应答（复审第三轮问题六用本地 TCP 对照复现过）。
+		closeWrite(upstream)
 		done <- struct{}{}
 	}()
 	go func() {
 		_, _ = io.Copy(conn, upstream)
-		_ = conn.Close()
+		closeWrite(conn)
 		done <- struct{}{}
 	}()
 	<-done
 	<-done
+}
+
+// closeWrite 只关写方向，让另一方向还能继续收。
+// 不是 *net.TCPConn 时退回整条关闭（至少不会挂住）。
+func closeWrite(c net.Conn) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+		return
+	}
+	_ = c.Close()
 }
