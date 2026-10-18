@@ -11,7 +11,7 @@ TUNNEL_PORT=""
 FORWARD_RANGE=""
 NETWORK=""
 MODE=""
-VERSION=""
+RELEASE_TAG=""
 ASSUME_YES=0
 
 usage() {
@@ -39,7 +39,7 @@ while [[ $# -gt 0 ]]; do
     --version)
       v="${2:-}"
       [[ "$v" =~ ^v?[0-9] ]] || die "--version 需要形如 v0.4.4 的标签"
-      VERSION="$v"
+      RELEASE_TAG="$v"
       shift 2
       ;;
     --forward)
@@ -177,9 +177,9 @@ if command -v apt-get >/dev/null; then
 fi
 
 url="https://github.com/antapp-cc/antapp-link/releases/latest/download/antapp-linkd"
-if [[ -n "$VERSION" ]]; then
-  url="https://github.com/antapp-cc/antapp-link/releases/download/$VERSION/antapp-linkd"
-  log "指定版本：$VERSION"
+if [[ -n "$RELEASE_TAG" ]]; then
+  url="https://github.com/antapp-cc/antapp-link/releases/download/$RELEASE_TAG/antapp-linkd"
+  log "指定版本：$RELEASE_TAG"
 fi
 downloaded=0
 if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
