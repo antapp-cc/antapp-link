@@ -460,7 +460,15 @@ func (a *App) watchHealth(ctx context.Context) {
 			return
 		}
 		if time.Now().After(deadline) {
-			a.log.Warn("等待隧道建立超时，跳过出网自检", "waited", 30*time.Second)
+			// 等不到握手就是连接失败。此时网络已经被接管（路由指向隧道），必须还原 ——
+			// 直接返回会把用户留在一个「隧道没通、路由还指着隧道」的断网状态里。
+			a.log.Error("等待隧道建立超时，判定连接失败并还原网络", "waited", 30*time.Second)
+			a.mu.Lock()
+			a.lastError = "隧道 30 秒内未建立"
+			a.mu.Unlock()
+			if derr := a.Disconnect(); derr != nil {
+				a.log.Error("还原网络失败，状态文件已保留，下次启动会重试", "err", derr)
+			}
 			return
 		}
 		select {
