@@ -880,9 +880,10 @@ func (a *App) CheckUpdate(ctx context.Context, quiet bool) (*update.Manifest, er
 	m, errs := a.checker.Check(ctx)
 	if m == nil {
 		if len(errs) > 0 && len(errs) == len(a.checker.Sources) {
-			// 一条就够：几个更新源同时挂通常是本地出网问题，逐条打只会在日志里刷屏
-			a.log.Warn("更新检查失败（更新源不可达），本次跳过",
-				"sources", len(errs), "err", errs[0])
+			// 只给一句结论，不贴原始错误：GitHub 的下载链接是 Azure Blob 带 SAS
+			// 签名的 URL，一长串 `?sp=r&sig=...` 对用户毫无意义，还把日志区撑爆。
+			// 看 sources 数量就能判断是本地出网还是某个源单独挂了。
+			a.log.Warn("更新检查失败（更新源不可达），本次跳过", "sources", len(errs))
 			return nil, fmt.Errorf("所有更新源都不可用：%v", errs[0])
 		}
 		if !quiet {
