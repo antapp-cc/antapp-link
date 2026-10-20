@@ -150,6 +150,10 @@ type Tunnel struct {
 	// 面板显示在线、延迟也正常，但上行早就停止搬运了 —— 直到别的方向偶然报错才重连。
 	// 带缓冲 1：读循环挂掉后塞一次就退出，不会阻塞。
 	readErr chan error
+
+	// pktDrops 是「上行队列满、网卡读到的包被丢弃」的次数。
+	// 正常情况下它一直是 0；涨起来说明下游处理跟不上，是"越用越慢/没网"的第一现场。
+	pktDrops atomic.Int64
 }
 
 func NewTunnel(inv pki.Invite, dev Device, logger *slog.Logger) *Tunnel {
@@ -368,10 +372,20 @@ func (t *Tunnel) readPump(ctx context.Context, onFatal context.CancelFunc) {
 		}
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
+		// 非阻塞投递：pktCh 满了宁可丢这个包，也不能把网卡读循环卡住。
+		//
+		// 阻塞的话，下游一旦慢下来（写超时、调度抖动、高流量积累），readPump 就停在
+		// 这里不再读网卡 —— Wintun 的 ring 很快被内核填满，之后上行发包全部失败，
+		// 表现就是「用着用着突然没网、断了重连才恢复」。IP 层本就尽力而为，丢一个包
+		// 让内层 TCP 重传，比整条上行停摆好得多。
 		select {
 		case t.pktCh <- pkt:
 		case <-ctx.Done():
 			return
+		default:
+			if n := t.pktDrops.Add(1); n == 1 || n%1000 == 0 {
+				t.log.Warn("上行队列已满，丢弃网卡读到的包（内层 TCP 会重传）", "drops", n)
+			}
 		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -36,6 +37,10 @@ type WintunDevice struct {
 	closing  bool
 	inflight int
 	drained  chan struct{}
+
+	// writeDrops 是「发送 ring 满、下行包被丢弃」的次数。
+	// 它长期为 0 才正常；涨起来说明下行消费跟不上（对端丢 ACK、链路拥堵）。
+	writeDrops atomic.Int64
 }
 
 // OpenDevice 打开虚拟网卡。
@@ -156,6 +161,14 @@ func (d *WintunDevice) Write(p []byte) (int, error) {
 			return 0, fmt.Errorf("写网卡: %w", err)
 		}
 		time.Sleep(time.Millisecond)
+	}
+	// 64 次重试（约 64ms）都拿不到发送 slot：ring 被打满了。
+	//
+	// 这里仍然返回成功，让内层 TCP 重传 —— 返回错误会把整条隧道断掉，代价比丢包大。
+	// 但必须计数并告警：这是「下行持续堵塞」的第一现场，静默丢掉的话用户只会看到
+	// 「用着用着没网」，而日志里一点线索都没有。
+	if n := d.writeDrops.Add(1); n == 1 || n%500 == 0 {
+		logf("网卡发送缓冲已满，丢弃下行包（内层 TCP 会重传）：累计 %d 次", n)
 	}
 	return len(p), nil
 }

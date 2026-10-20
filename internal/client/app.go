@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -387,6 +388,12 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 			a.log.Warn("隧道循环退出", connLogAttrs(err, nil)...)
 		}
 	}()
+	// 定期把运行状态写进日志，给「用着用着没网」留现场。
+	//
+	// 这类故障（20G 上下、不固定阈值）通常是某类资源随流量累积：goroutine 泄漏、
+	// 内存增长、上行队列积压。等用户报「没网」时，单看那一刻什么都判断不了 ——
+	// 所以每 10 分钟落一条，事后翻日志就能看出是哪一项在单调上涨。
+	go a.watchRunStats(ctx, tunnel)
 	a.log.Info("已连接", "server", inv.Server, "tunnel_ip", cfg.TunnelIP)
 
 	// 只有真接管了网络才自检：联调模式没动用户网络，出不去也不该由我们背
@@ -855,6 +862,30 @@ func (a *App) UpdateInvite(inv pki.Invite, source string) error {
 	// 日志随配置文件切会话：pinode.antapp → logs\pinode.log，新会话清空重来
 	SwitchLogSession(source)
 	return nil
+}
+
+// watchRunStats 每 10 分钟记录一次运行状态，供「用着用着没网」定位用。
+//
+// 只记可能单调上涨的量：goroutine 数、堆内存、上行队列丢弃次数、累计流量。正常情况
+// 下它们应该长期持平（流量除外）；哪一项一直涨，问题就在那一块。
+func (a *App) watchRunStats(ctx context.Context, tun *Tunnel) {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			a.log.Info("运行状态",
+				"goroutines", runtime.NumGoroutine(),
+				"heap_mb", m.HeapAlloc/1024/1024,
+				"rx_mb", tun.Stats.RxBytes.Load()/1024/1024,
+				"tx_mb", tun.Stats.TxBytes.Load()/1024/1024,
+				"pkt_drops", tun.pktDrops.Load())
+		}
+	}
 }
 
 // CurrentInvite 返回当前生效的连接码（未导入时为零值）。给界面比对候选用。
