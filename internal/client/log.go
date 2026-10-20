@@ -204,13 +204,62 @@ func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
 	b.WriteString(r.Message)
 	r.Attrs(func(a slog.Attr) bool {
 		b.WriteString("  ")
-		b.WriteString(a.Key)
+		b.WriteString(attrKeyLabel(a.Key))
 		b.WriteString("=")
 		b.WriteString(a.Value.String())
 		return true
 	})
 	h.buf.addLine(b.String())
 	return nil
+}
+
+// attrKeyLabel 把 slog 的英文 key 换成中文。
+//
+// 界面是给用户看的，`err=`、`reason=`、`slot=` 这些字面对他们没有意义。日志文件
+// 那边保持原样（英文 key 好 grep），只有界面缓冲区走这个映射。
+// 翻不出来的保持原样 —— 宁可露出一个陌生单词，也不要编一个错误的名字。
+func attrKeyLabel(key string) string {
+	if label, ok := attrKeyLabels[key]; ok {
+		return label
+	}
+	return key
+}
+
+var attrKeyLabels = map[string]string{
+	"err":       "错误",
+	"reason":    "原因",
+	"local":     "本端",
+	"remote":    "对端",
+	"member":    "成员",
+	"slot":      "槽位",
+	"live":      "存活",
+	"drops":     "累计丢弃",
+	"sources":   "更新源数",
+	"goroutine": "协程数",
+	"heap_mb":   "堆MB",
+	"rx_mb":     "接收MB",
+	"tx_mb":     "发送MB",
+	"pkt_drops": "上行丢弃",
+	"attempt":   "第几次",
+	"retry_in":  "重试间隔",
+	"waited":    "已等",
+	"version":   "版本",
+	"current":   "当前",
+	"latest":    "最新",
+	"bytes":     "字节",
+	"path":      "路径",
+	"file":      "文件",
+	"target":    "目标",
+	"port":      "端口",
+	"client":    "客户端",
+	"tunnel_ip": "隧道IP",
+	"udp_port":  "UDP端口",
+	"members":   "连接数",
+	"server":    "服务端",
+	"new":       "新",
+	"sid":       "会话号",
+	"ms":        "毫秒",
+	"port_test": "端口测试",
 }
 
 // WithAttrs / WithGroup 在本项目里用不到（都是直接 slog.Info/Warn/Error），
