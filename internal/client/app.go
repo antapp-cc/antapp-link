@@ -309,7 +309,10 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 		if errors.Is(probeErr, context.Canceled) {
 			return errConnectCanceled
 		}
-		return fmt.Errorf("连接服务端失败：%v", probeErr)
+		// 直接透传原因，不再包一层"连接服务端失败"：调用方打日志时标题已经是
+		// 「连接失败」，再包一层就变成「连接失败 错误=连接服务端失败：连接被拒绝」，
+		// 同一个意思说两遍，还把行撑过宽度上限。
+		return probeErr
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -655,19 +658,21 @@ func (a *App) healthCheck(ctx context.Context) error {
 		len(dnsServers), len(probeDomains), humanReason(lastErr))
 }
 
-// humanReason 把底层错误翻成一句中文，认不出来就兜底「原因不明」。
+// humanReason 把底层错误翻成一个短中文短语。
 //
 // 往界面上写的错误必须是中文：`connectex: No connection could be made because the
 // target machine actively refused it.` 这种原文对用户毫无意义，只会让人以为程序出错。
-// 需要原文的人可以翻日志里的调试条目。
+//
+// 兜底也刻意用短词而不是「原因不明（详细错误见调试日志）」：日志区一行只有约 54 个
+// 字符宽（中文算两格），长句子会被折成两行，反而更乱。原始错误在日志文件里能查到。
 func humanReason(err error) string {
 	if err == nil {
-		return "原因不明"
+		return "连接失败"
 	}
 	if r := connBrokenReason(err); r != "" {
 		return r
 	}
-	return "原因不明（详细错误见调试日志）"
+	return "连接失败"
 }
 
 func probeTCP(ctx context.Context, addr string, timeout time.Duration) error {
