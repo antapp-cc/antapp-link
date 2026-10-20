@@ -166,8 +166,18 @@ func NewTunnel(inv pki.Invite, dev Device, logger *slog.Logger) *Tunnel {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// pktCh 缓冲要够深。
+	//
+	// 这里是"网卡读"和"会话发送"之间唯一的缓冲。发送侧是单协程，每轮都要等
+	// flushBatch 的 TLS 写完成（几毫秒）；缓冲只有 64 个包（约 96 KB）时，在 100 Mbps
+	// 链路上只够撑 7 毫秒 —— 一次抖动就溢出，读循环只能丢包。实测连接建立后 30 秒
+	// 就能丢到 100 个，而且流量越大丢得越凶。
+	//
+	// 2048 个包约 3 MB，在 100 Mbps 下能吸收 240 ms 的抖动，足以覆盖 TLS 写的抖动和
+	// 调度延迟。丢包本就是最后的保护手段，不该在正常负载下频繁触发。
+	const pktQueueDepth = 2048
 	return &Tunnel{inv: inv, dev: dev, log: logger, wake: make(chan struct{}, 1),
-		pktCh: make(chan []byte, 64), readErr: make(chan error, 1)}
+		pktCh: make(chan []byte, pktQueueDepth), readErr: make(chan error, 1)}
 }
 
 // Kick 唤醒重连循环。非阻塞：正在连接时通知被丢弃，无害。
