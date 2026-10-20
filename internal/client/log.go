@@ -209,16 +209,11 @@ func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
 		b.WriteString(a.Value.String())
 		return true
 	})
-	// 长消息（比如带完整错误原因的）会在界面上折行。折出来的第二行如果顶格，
-	// 就正好撞在时间戳那一列上，一屏文字看着眼花。这里把后续行缩进到消息列 ——
-	// 时间戳 14 字符 + 两个空格 + 级别符号 + 两个空格 = 19。
-	line := strings.ReplaceAll(b.String(), "\n", "\n"+continuationIndent)
-	h.buf.addLine(line)
+	// 一条日志就是一行：底层错误里偶尔带 \n，换成空格，别让它在界面里冒出顶格的续行。
+	// 长度超过控件宽度的部分由控件自己折，我们不再手动插换行。
+	h.buf.addLine(strings.ReplaceAll(b.String(), "\n", " "))
 	return nil
 }
-
-// continuationIndent 让折行后的内容对齐到消息列（时间戳+级别之后）。
-const continuationIndent = "                   "
 
 // attrKeyLabel 把 slog 的英文 key 换成中文。
 //
