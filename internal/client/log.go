@@ -197,10 +197,12 @@ func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 
 	var b strings.Builder
+	// 前缀压到 16 个宽度单位：时间戳 14 + 空格 + 级别符号 + 空格。
+	// 原来级别符号两侧各两个空格，一个点占掉 5 格，太浪费 —— 这些宽度留给消息更实在。
 	b.WriteString(r.Time.Format("01-02 15:04:05"))
-	b.WriteString("  ")
+	b.WriteString(" ")
 	b.WriteString(levelTag(r.Level))
-	b.WriteString("  ")
+	b.WriteString(" ")
 	b.WriteString(r.Message)
 	r.Attrs(func(a slog.Attr) bool {
 		b.WriteString("  ")
@@ -220,7 +222,7 @@ func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
 //
 // 实测客户区 529px、9pt Consolas 约 7px/字符、前缀 19 字符占 133px，扣掉滚动条后
 // 约 54 单位，加上前缀 19 就是 73。
-const logLineMaxUnits = 73
+const logLineMaxUnits = 76
 
 // ellipsisUnits 是截断标记 … 的显示宽度。
 const ellipsisUnits = 2
@@ -310,15 +312,15 @@ func (h *teeHandler) WithGroup(name string) slog.Handler {
 
 // levelTag 用符号而不是「信息/警告/错误」四个字：每条都印一遍的话，
 // 那两个字占了时间戳之后最醒目的位置，而绝大多数行都是「信息」，纯属噪声。
-// 符号在 Consolas 里都有，宽度也稳定。
+// 用 ASCII 符号（. ! x）而不是 ·▲×：后者在等宽字体里占两格宽度，而日志区一行只有
 func levelTag(l slog.Level) string {
 	switch {
 	case l >= slog.LevelError:
-		return "×"
+		return "x"
 	case l >= slog.LevelWarn:
-		return "▲"
+		return "!"
 	default:
-		return "·"
+		return "."
 	}
 }
 
