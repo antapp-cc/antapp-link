@@ -430,6 +430,31 @@ func (t *Tunnel) readPump(ctx context.Context, onFatal context.CancelFunc) {
 	}
 }
 
+// socketBufferBytes 是单条连接的收发缓冲目标值。
+//
+// 按跨境链路的带宽延迟积定的：100 Mbps × 200 ms RTT ≈ 2.5 MB。缓冲小于这个数，
+// TCP 窗口就撑不满，吞吐会被 RTT 卡死 —— 表现是「带宽明明够，但单线程下载只有几 MB/s」。
+// 取 4 MB 留一倍余量。
+//
+// 实际能不能调到由内核限制决定（Linux 受 net.core.rmem_max / wmem_max 约束，服务端
+// 安装脚本已把它们提到 16 MB），调不上就按系统默认跑，不影响功能。
+const socketBufferBytes = 4 << 20
+
+// tuneTCPBuffers 调大这条 TCP 连接的收发缓冲。
+//
+// OpenVPN 用 --sndbuf / --rcvbuf 解决同一个问题：高延迟链路上内核默认缓冲装不下
+// 在途数据，窗口打不满，吞吐上不去。Go 里对应 SetReadBuffer / SetWriteBuffer。
+//
+// 设置失败不当错误：不同平台对上限的处理不一致，调不上只是回到默认值。
+func tuneTCPBuffers(conn net.Conn) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcp.SetReadBuffer(socketBufferBytes)
+	_ = tcp.SetWriteBuffer(socketBufferBytes)
+}
+
 // session 建立一次完整会话并在其上搬运数据，返回是否成功握过手。
 func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	tlsCfg, err := pki.ClientTLSConfig(t.inv)
@@ -448,6 +473,7 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("连接 %s: %w", t.inv.Server, err)
 	}
+	tuneTCPBuffers(raw)
 	conn := tls.Client(raw, tlsCfg)
 
 	if err := conn.HandshakeContext(hctx); err != nil {
@@ -832,6 +858,7 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 	if err != nil {
 		return fmt.Errorf("成员连接 %d 拨号: %w", k, err)
 	}
+	tuneTCPBuffers(raw)
 	conn := tls.Client(raw, sess.tlsCfg)
 	// 握手失败、被拒、读循环退出、ctx 结束都收口到这一处：不关连接就会漏 fd，
 	// 读循环也会永远卡在 ReadFrame 上

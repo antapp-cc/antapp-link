@@ -58,6 +58,13 @@ func (t *TUN) Configure(ip string, prefix, mtu int) error {
 	if err := runIP("link", "set", "dev", t.name, "mtu", strconv.Itoa(mtu)); err != nil {
 		return err
 	}
+	// txqueuelen 是「内核塞给 TUN、等我们读走」的队列长度，默认 500 个包。
+	// 隧道带宽高、或者我们这边读得慢一拍时，这个队列会先满，内核就开始丢下行包 ——
+	// 丢在内核里，我们一行日志都看不到，只表现为客户端那边「加载不出来」。
+	// 对应 OpenVPN 的 --txqueuelen。2000 个包约 3 MB，够吸收读循环的抖动。
+	if err := runIP("link", "set", "dev", t.name, "txqueuelen", "2000"); err != nil {
+		return err
+	}
 	return runIP("link", "set", "dev", t.name, "up")
 }
 

@@ -307,8 +307,25 @@ func (s *Server) pumpTun(ctx context.Context) {
 	}
 }
 
+// socketBufferBytes 是单条连接的收发缓冲目标值，和客户端同一套理由：
+// 跨境链路带宽延迟积约 2.5 MB，内核默认缓冲装不下，窗口撑不满吞吐就上不去。
+// 上限由安装脚本设置的 net.core.rmem_max / wmem_max（16 MB）兜着。
+const socketBufferBytes = 4 << 20
+
+// tuneTCPBuffers 调大这条 TCP 连接的收发缓冲，对应 OpenVPN 的 --sndbuf / --rcvbuf。
+// 调不上不是错误：回到系统默认值，功能不受影响。
+func tuneTCPBuffers(conn net.Conn) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcp.SetReadBuffer(socketBufferBytes)
+	_ = tcp.SetWriteBuffer(socketBufferBytes)
+}
+
 func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	defer raw.Close()
+	tuneTCPBuffers(raw)
 
 	tlsConn := tls.Server(raw, s.tlsCfg)
 	_ = tlsConn.SetDeadline(time.Now().Add(handshakeTimeout))
