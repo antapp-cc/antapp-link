@@ -205,16 +205,20 @@ func (u *UI) build() error {
 	}
 	u.txtLog.SetTextColor(walk.RGB(0x00, 0x00, 0x00))
 
-	// 日志区不自动折行。
+	// 日志区强行单行显示，跟 OpenVPN 一样。
 	//
 	// 普通 Edit 控件默认按窗口宽度折行，折出来的续行是顶格的 —— 正好压在时间戳那一列
-	// 上，一屏文字看着发花。
+	// 上，一屏文字看着发花。OpenVPN 的做法是压根不折：每条日志一行，超出的往右延伸，
+	// 底部一条横向滚动条让需要的人自己拖。
 	//
-	// 这里只做一件事：EM_SETTARGETDEVICE(lParam 非 0) 告诉控件不要按窗口宽度折行。
-	// 换行改由 log.go 的 wrapToMessageColumn 负责，它会把续行缩进到消息列。
-	//
-	// 不要加 WS_HSCROLL / ES_AUTOHSCROLL：那两个会在底部常驻一条横向滚动条，占掉一行
-	// 高度，而且内容明明没超宽时也一直在，看着很碍眼。宽度已经由折行逻辑预留了余量。
+	// 三样缺一不可：WS_HSCROLL（滚动条）、ES_AUTOHSCROLL（滚动而不是折行）、
+	// EM_SETTARGETDEVICE(lParam 非 0，明确告诉控件不要按窗口宽度折行)。
+	const esAutoHScroll = 0x0080
+	logHwnd := u.txtLog.Handle()
+	win.SetWindowLong(logHwnd, win.GWL_STYLE,
+		win.GetWindowLong(logHwnd, win.GWL_STYLE)|win.WS_HSCROLL|esAutoHScroll)
+	win.SetWindowPos(logHwnd, 0, 0, 0, 0, 0,
+		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER)
 	u.txtLog.SendMessage(emSetTargetDevice, 0, 1)
 
 	// 关窗口只是收进托盘，不是退出 —— 否则隧道会跟着一起断

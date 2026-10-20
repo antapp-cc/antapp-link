@@ -411,8 +411,10 @@ func (t *Tunnel) readPump(ctx context.Context, onFatal context.CancelFunc) {
 		case <-ctx.Done():
 			return
 		default:
-			if n := t.pktDrops.Add(1); n == 1 || n%1000 == 0 {
-				t.log.Warn("上行队列已满，丢弃网卡读到的包（内层 TCP 会重传）", "drops", n)
+			// 丢一两个包是常态（调度抖动），持续丢才说明下游真的跟不上。
+			// 阈值取 100：一次突发就能丢几十个，报到用户面前必须是「一直在丢」。
+			if n := t.pktDrops.Add(1); n == 100 || n%1000 == 0 {
+				t.log.Warn(fmt.Sprintf("上行拥塞，累计丢弃 %d 个包", n))
 			}
 		}
 	}
@@ -1010,9 +1012,8 @@ func maintainMembers(ctx context.Context, t *Tunnel, sess *clientSession) {
 						t.log.Debug("成员连接补拨失败", connLogAttrs(err, nil,
 							"member", k, "retry_in", memberRetryDelay(attempt+1))...)
 					} else if attempt == 3 || attempt%10 == 0 {
-						t.log.Warn("成员连接一直补不上，上行数据正在被丢弃",
-							connLogAttrs(err, nil, "member", k, "attempts", attempt+1,
-								"live", sess.liveCount(), "target", sess.members)...)
+						t.log.Warn(fmt.Sprintf("成员补不上，上行在丢（成员 %d，已试 %d 次，连接 %d/%d）",
+							k, attempt+1, sess.liveCount(), sess.members))
 					}
 					if attempt < 10 {
 						attempt++
@@ -1107,19 +1108,16 @@ func (s *clientSession) watchDataPath(ctx context.Context) {
 				lowMemberSamples = 0
 			}
 
-			// 连续两个采样（60 秒）才报，避免短暂波动吵人；之后每 5 分钟提醒一次
+			// 连续两个采样（60 秒）才报，避免短暂波动吵人；之后每 5 分钟提醒一次。
+			// 只带两个关键数字：成员存活比和空槽丢弃数。收发量状态栏一直显示着，
+			// 再写进日志会让这一行折成三截。
 			if noRxSamples == 2 || (noRxSamples > 2 && noRxSamples%10 == 0) {
-				s.log.Warn("数据面单向：有上行但一直收不到下行",
-					"members", fmt.Sprintf("%d/%d", live, s.members),
-					"empty_slot_drops", s.emptySlotDrops.Load(),
-					"member_drops", s.memberDrops.Load(),
-					"tx_mb", tx/1024/1024, "rx_mb", rx/1024/1024)
+				s.log.Warn(fmt.Sprintf("数据面单向：有上行无下行（连接 %d/%d，丢 %d 批）",
+					live, s.members, s.emptySlotDrops.Load()))
 			}
 			if lowMemberSamples == 2 || (lowMemberSamples > 2 && lowMemberSamples%20 == 0) {
-				s.log.Warn("成员连接持续不足，上行数据正在被丢弃",
-					"members", fmt.Sprintf("%d/%d", live, s.members),
-					"empty_slot_drops", s.emptySlotDrops.Load(),
-					"member_drops", s.memberDrops.Load())
+				s.log.Warn(fmt.Sprintf("成员不足，上行在丢（连接 %d/%d，丢 %d 批）",
+					live, s.members, s.emptySlotDrops.Load()))
 			}
 
 			lastTx, lastRx = tx, rx
