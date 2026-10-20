@@ -16,11 +16,11 @@ ASSUME_YES=0
 
 usage() {
   cat <<'EOF'
-用法: bash install.sh [--mode tcp|udp] [--version v0.4.6] [--forward 31400-31409] [--tunnel-port 62233] [--network 10.10.0.0/24] [--yes]
+用法: bash install.sh [--mode tcp|udp] [--version v0.4.7] [--forward 31400-31409] [--tunnel-port 62233] [--network 10.10.0.0/24] [--yes]
 不带参数时全部用默认值。
 --mode     数据通道模式：tcp（默认，N 条 TCP 并联）或 udp（单条控制 + 加密 UDP 数据面）。
            不传则保留配置里已有的值（新装即 tcp）。
---version  指定 antapp-linkd 的 release 标签（如 v0.4.6）。不传则取 latest。
+--version  指定 antapp-linkd 的 release 标签（如 v0.4.7）。不传则取 latest。
 --yes      已装过时不再询问，直接重装。
 EOF
 }
@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --version)
       v="${2:-}"
-      [[ "$v" =~ ^v?[0-9] ]] || die "--version 需要形如 v0.4.6 的标签"
+      [[ "$v" =~ ^v?[0-9] ]] || die "--version 需要形如 v0.4.7 的标签"
       RELEASE_TAG="$v"
       shift 2
       ;;
