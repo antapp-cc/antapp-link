@@ -309,7 +309,7 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 		if errors.Is(probeErr, context.Canceled) {
 			return errConnectCanceled
 		}
-		return fmt.Errorf("连接服务端失败，未改动网络: %w", probeErr)
+		return fmt.Errorf("连接服务端失败：%v", probeErr)
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -586,13 +586,10 @@ func (a *App) probeServer(inv pki.Invite, ctx context.Context) error {
 	d := net.Dialer{}
 	raw, err := d.DialContext(ctx, "tcp", inv.Server)
 	if err != nil {
-		// 翻成一句中文再往外抛。直接把 %w 拼进去的话，用户会在界面上看到
-		// 「connectex: No connection could be made because the target machine
-		// actively refused it.」—— 我们的日志本来就该说人话。
-		if reason := connBrokenReason(err); reason != "" {
-			return fmt.Errorf("连接 %s 失败：%s", inv.Server, reason)
-		}
-		return fmt.Errorf("连接 %s 失败：原因不明（详细错误见调试日志）: %w", inv.Server, err)
+		// 只返回原因，不拼地址：调用方会加上「连接服务端失败」，状态栏也已经显示
+		// 服务端地址了。带上地址这条日志就超出一行，界面里折成两截，还得靠缩进
+		// 区分续行 —— 一行能说完的事别拆成两行。
+		return fmt.Errorf("%s", humanReason(err))
 	}
 	defer raw.Close()
 
