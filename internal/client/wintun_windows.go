@@ -5,6 +5,7 @@ package client
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,19 +58,44 @@ func OpenDevice() (*WintunDevice, error) {
 	if err != nil {
 		adapter, err = wintun.CreateAdapter(AdapterName, tunnelType, nil)
 		if err != nil {
-			return nil, fmt.Errorf("创建虚拟网卡 %q（需要管理员权限，且 wintun.dll 必须与 exe 同架构）: %w",
-				AdapterName, err)
+			return nil, fmt.Errorf("创建虚拟网卡 %q 失败：%s（需要管理员权限，且 wintun.dll 必须与 exe 同架构）",
+				AdapterName, wintunReason(err))
 		}
 	}
 	session, err := adapter.StartSession(ringCapacity)
 	if err != nil {
 		_ = adapter.Close()
-		return nil, fmt.Errorf("启动网卡会话: %w", err)
+		return nil, fmt.Errorf("启动网卡会话失败：%s", wintunReason(err))
 	}
 	return &WintunDevice{
 		adapter: adapter, session: session,
 		closed: make(chan struct{}), drained: make(chan struct{}),
 	}, nil
+}
+
+// wintunReason 把 Wintun/Windows 的英文错误翻成一句中文。
+//
+// 这些错误平时见不到，但一旦出现用户看到的就是一整句英文，既看不懂也不知道该做什么。
+// 翻不出来时给「原因不明」并保留原文进日志文件，别编一个听起来对但会误导的理由。
+func wintunReason(err error) string {
+	if err == nil {
+		return "原因不明"
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "initialization has already been completed"),
+		strings.Contains(msg, "already initialized"):
+		return "网卡会话已初始化过（上一个进程可能还没退干净，退出后重启程序即可）"
+	case strings.Contains(msg, "cannot find"), strings.Contains(msg, "not found"):
+		return "找不到虚拟网卡驱动（wintun.dll 可能缺失或架构不符）"
+	case strings.Contains(msg, "access is denied"), strings.Contains(msg, "拒绝访问"):
+		return "没有权限操作虚拟网卡（需要以管理员身份运行）"
+	case strings.Contains(msg, "already exists"):
+		return "同名虚拟网卡已存在（可能被别的进程占用）"
+	case strings.Contains(msg, "handle is invalid"), strings.Contains(msg, "invalid handle"):
+		return "网卡句柄已失效（驱动可能被系统重置）"
+	}
+	return "原因不明（详细错误见日志文件）"
 }
 
 // Read 取一个 IP 包。ring 空时等读事件，不能忙等 —— 忙等会吃满一个核。
