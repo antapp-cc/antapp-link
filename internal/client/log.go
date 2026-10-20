@@ -211,8 +211,42 @@ func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
 	})
 	// 一条日志就是一行：底层错误里偶尔带 \n，换成空格。日志区已经关掉自动折行
 	// （见 ui_windows.go），超长内容由横向滚动条承担 —— 和 OpenVPN 一样。
-	h.buf.addLine(strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(b.String()))
+	line := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(b.String())
+	h.buf.addLine(fitLogLine(line))
 	return nil
+}
+
+// logLineMaxUnits 是界面日志区一行能容纳的显示宽度（ASCII=1，中文=2）。
+//
+// 实测客户区 529px、9pt Consolas 约 7px/字符、前缀 19 字符占 133px，扣掉滚动条后
+// 约 54 单位，加上前缀 19 就是 73。
+const logLineMaxUnits = 73
+
+// ellipsisUnits 是截断标记 … 的显示宽度。
+const ellipsisUnits = 2
+
+// fitLogLine 保证一行放得下，超出部分截断并以 … 结尾。
+//
+// 为什么不靠控件自己处理：给 Edit 控件加 WS_HSCROLL + ES_AUTOHSCROLL + 发
+// EM_SETTARGETDEVICE 之后，样式确认是生效的，但实测超宽内容它仍然会折行，而且
+// 折出来的续行顶格，正好压在日期时间那一列上 —— 用户反复提的就是这个问题。
+//
+// 所以从数据层保证：界面只展示放得下的部分。完整内容在日志文件里
+// （file handler 不经过这里），需要时去看文件。
+func fitLogLine(s string) string {
+	width := 0
+	for i, r := range s {
+		w := 1
+		if r > 127 {
+			w = 2
+		}
+		// 截断用的 … 自己占 2 格（中文宽度），必须提前预留，否则截出来还是超
+		if width+w+ellipsisUnits > logLineMaxUnits {
+			return s[:i] + "…"
+		}
+		width += w
+	}
+	return s
 }
 
 // attrKeyLabel 把 slog 的英文 key 换成中文。

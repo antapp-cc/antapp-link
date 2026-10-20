@@ -195,7 +195,7 @@ func sessionEndInfo(err error) (slog.Level, string) {
 	switch {
 	case strings.Contains(msg, "EOF"):
 		// 对端干净关闭：典型为云服重启或部署新版本
-		return slog.LevelInfo, "服务端关闭了连接（常见原因：云服重启或部署新版本）"
+		return slog.LevelInfo, "服务端关闭（云服重启/部署新版）"
 	case strings.Contains(msg, "unreachable"):
 		return slog.LevelWarn, "网络不可达（本机网络变动或出口中断）"
 	case strings.Contains(msg, "refused"):
