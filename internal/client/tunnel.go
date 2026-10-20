@@ -994,9 +994,18 @@ func maintainMembers(ctx context.Context, t *Tunnel, sess *clientSession) {
 					if ctx.Err() != nil {
 						return
 					}
-					// 补拨失败原本是完全静默的，出问题时看不出卡在哪一步
-					t.log.Debug("成员连接补拨失败", connLogAttrs(err, nil,
-						"member", k, "retry_in", memberRetryDelay(attempt+1))...)
+					// 前几次留 Debug：刚建连时成员还在建，失败一两次是正常的。
+					// 但持续补不上就必须 Warn —— 那种状态下控制连接还活着、面板显示
+					// 「已连接」，而上行数据全被 emptySlotDrops 丢掉，用户只觉得
+					// 「突然没网」，日志里却一条线索都没有。
+					if attempt < 3 {
+						t.log.Debug("成员连接补拨失败", connLogAttrs(err, nil,
+							"member", k, "retry_in", memberRetryDelay(attempt+1))...)
+					} else if attempt == 3 || attempt%10 == 0 {
+						t.log.Warn("成员连接一直补不上，上行数据正在被丢弃",
+							connLogAttrs(err, nil, "member", k, "attempts", attempt+1,
+								"live", sess.liveCount(), "target", sess.members)...)
+					}
 					if attempt < 10 {
 						attempt++
 					}
@@ -1032,6 +1041,7 @@ func (s *clientSession) run(ctx context.Context) error {
 	go func() { errCh <- s.pumpFromTunnel(ctx) }()
 	go func() { errCh <- s.pumpFromDevice(ctx) }()
 	go func() { errCh <- s.heartbeat(ctx) }()
+	go s.watchDataPath(ctx)
 	if s.members > 1 {
 		s.log.Info(fmt.Sprintf("多连接模式：目标 %d 条，启动成员维护", s.members))
 		go maintainMembers(ctx, s.tunnel, s)
@@ -1048,6 +1058,65 @@ func (s *clientSession) run(ctx context.Context) error {
 
 // touchCtrl 记下控制连接最近一次收到帧的时间（心跳判死的唯一依据）。
 func (s *clientSession) touchCtrl() { s.ctrlSeen.Store(time.Now().UnixNano()) }
+
+// watchDataPath 定期检查「数据面还在不在动」。
+//
+// 控制连接活着不代表数据面通：控制走 slot 0、业务数据走成员连接，成员全挂时面板
+// 照样显示「已连接」，而所有上行都被 emptySlotDrops 丢掉 —— 用户看到的就是「用着
+// 用着突然没网，断开重连才好」，日志里却一条线索都没有（成员补拨失败只记 Debug）。
+//
+// 这里只观察、不改行为，把两种可疑状态写进日志：
+//   - 有上行却长时间收不到任何下行（下行那条路断了）
+//   - 成员连接持续不足（上行正在被丢）
+func (s *clientSession) watchDataPath(ctx context.Context) {
+	const sample = 30 * time.Second
+	ticker := time.NewTicker(sample)
+	defer ticker.Stop()
+
+	var lastTx, lastRx uint64
+	var noRxSamples, lowMemberSamples int
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tx, rx := s.stats.TxBytes.Load(), s.stats.RxBytes.Load()
+			live := s.liveCount()
+
+			// TxBytes 只统计业务包（心跳走 TypePing 不计入），所以「有上行没下行」
+			// 是一个干净的信号：用户在发包，但对端一个字节都没回来。
+			if tx > lastTx && rx == lastRx {
+				noRxSamples++
+			} else {
+				noRxSamples = 0
+			}
+
+			if s.members > 1 && live < s.members {
+				lowMemberSamples++
+			} else {
+				lowMemberSamples = 0
+			}
+
+			// 连续两个采样（60 秒）才报，避免短暂波动吵人；之后每 5 分钟提醒一次
+			if noRxSamples == 2 || (noRxSamples > 2 && noRxSamples%10 == 0) {
+				s.log.Warn("数据面单向：有上行但一直收不到下行",
+					"members", fmt.Sprintf("%d/%d", live, s.members),
+					"empty_slot_drops", s.emptySlotDrops.Load(),
+					"member_drops", s.memberDrops.Load(),
+					"tx_mb", tx/1024/1024, "rx_mb", rx/1024/1024)
+			}
+			if lowMemberSamples == 2 || (lowMemberSamples > 2 && lowMemberSamples%20 == 0) {
+				s.log.Warn("成员连接持续不足，上行数据正在被丢弃",
+					"members", fmt.Sprintf("%d/%d", live, s.members),
+					"empty_slot_drops", s.emptySlotDrops.Load(),
+					"member_drops", s.memberDrops.Load())
+			}
+
+			lastTx, lastRx = tx, rx
+		}
+	}
+}
 
 // pumpFromTunnel：隧道来的 IP 包写进网卡，交给 Windows 内核处理。
 func (s *clientSession) pumpFromTunnel(ctx context.Context) error {
