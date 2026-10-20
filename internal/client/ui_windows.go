@@ -37,6 +37,13 @@ var appIconGray []byte
 var appIconGreen []byte
 
 // UI 是主窗口加托盘。托盘用 walk 自带的 NotifyIcon，跟主窗口共用同一个消息循环 ——
+// emSetTargetDevice 让多行 Edit 控件不要按窗口宽度折行。
+//
+// wParam=0 表示「用屏幕 DC」，lParam 非 0 表示「目标宽度只有这么多个字符」——
+// 于是控件不再自己折行，超出部分往右延伸，由横向滚动条承担。这正是日志区要的：
+// 折行出来的续行会顶格压在时间戳列上。
+const emSetTargetDevice = 0x0448
+
 // 换成独立的托盘库就得处理两个消息循环抢主线程的问题。
 //
 // 窗口布局照用户已经在 Pi 节点机上用惯的那个 OpenVPN 客户端来：
@@ -197,6 +204,20 @@ func (u *UI) build() error {
 		u.txtLog.SetBackground(bg)
 	}
 	u.txtLog.SetTextColor(walk.RGB(0x00, 0x00, 0x00))
+
+	// 日志区不自动折行。
+	//
+	// 普通 Edit 控件默认按窗口宽度折行，折出来的续行是顶格的 —— 正好压在时间戳那一列
+	// 上，一屏文字看着发花。用户要的是「任何信息都不占用日期」。
+	//
+	// 两步：加横向滚动条，再用 EM_SETTARGETDEVICE(lParam 非 0) 告诉控件不要按窗口宽度
+	// 折行。之后一条日志就是一行，超出的往右延伸，日期列永远干净。
+	logHwnd := u.txtLog.Handle()
+	win.SetWindowLong(logHwnd, win.GWL_STYLE,
+		win.GetWindowLong(logHwnd, win.GWL_STYLE)|win.WS_HSCROLL)
+	win.SetWindowPos(logHwnd, 0, 0, 0, 0, 0,
+		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER)
+	u.txtLog.SendMessage(emSetTargetDevice, 0, 1)
 
 	// 关窗口只是收进托盘，不是退出 —— 否则隧道会跟着一起断
 	u.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
