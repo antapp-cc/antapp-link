@@ -809,30 +809,47 @@ func (a *App) Shutdown() error {
 }
 
 type AppStatus struct {
-	Running       bool
-	Online        bool
-	Connecting    bool
-	Disconnecting bool
-	TunnelIP      string
-	Server        string
-	RTT           time.Duration
-	RxBytes       uint64
-	TxBytes       uint64
-	LastError     string
+	Running bool
+	Online  bool
+	// DataPathBroken 表示「控制连接在、但 UDP 数据面已经不通」。
+	//
+	// 单独一个字段而不是悄悄把 Online 置 false：那会让人以为掉线了，其实只是数据面
+	// 坏了。UI 要显示成「数据通道异常」，用户才知道该刷新连接码还是查防火墙。
+	DataPathBroken bool
+	Connecting     bool
+	Disconnecting  bool
+	TunnelIP       string
+	Server         string
+	RTT            time.Duration
+	RxBytes        uint64
+	TxBytes        uint64
+	LastError      string
 }
 
 func (a *App) Status() AppStatus {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	tunnel := a.tunnel
+	connected := tunnel != nil && tunnel.Stats.Connected.Load()
+	// UDP 模式下控制走 TCP，光看 Connected 会一直显示在线而业务包早就发不出去了。
+	// 数据面不健康时明确报出来，别让它假装正常。
+	dataPathBroken := false
+	if connected && tunnel != nil {
+		if enabled, healthy := tunnel.UDPState(); enabled && !healthy {
+			dataPathBroken = true
+		}
+	}
+
 	st := AppStatus{
-		Running:       a.running,
-		Online:        a.tunnel != nil && a.tunnel.Stats.Connected.Load(),
-		Connecting:    a.connecting,
-		Disconnecting: a.disconnecting,
-		Server:        a.inv.Server,
-		TunnelIP:      a.cfg.TunnelIP,
-		LastError:     a.lastError,
+		Running:        a.running,
+		Online:         connected && !dataPathBroken,
+		DataPathBroken: dataPathBroken,
+		Connecting:     a.connecting,
+		Disconnecting:  a.disconnecting,
+		Server:         a.inv.Server,
+		TunnelIP:       a.cfg.TunnelIP,
+		LastError:      a.lastError,
 	}
 	if a.tunnel != nil {
 		st.RTT = a.tunnel.Stats.RTT()

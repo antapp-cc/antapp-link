@@ -154,6 +154,12 @@ type Tunnel struct {
 	// pktDrops 是「上行队列满、网卡读到的包被丢弃」的次数。
 	// 正常情况下它一直是 0；涨起来说明下游处理跟不上，是"越用越慢/没网"的第一现场。
 	pktDrops atomic.Int64
+
+	// udpCh 指向当前会话的 UDP 数据通道（UDP 模式才有），会话结束清空。
+	//
+	// 存在的理由：界面要能区分「控制连接在、数据面已经不通」。UDP 模式下控制走 TCP，
+	// 光看 Stats.Connected 会一直显示「已连接」，而业务包早就发不出去了。
+	udpCh atomic.Pointer[udpChannel]
 }
 
 func NewTunnel(inv pki.Invite, dev Device, logger *slog.Logger) *Tunnel {
@@ -322,6 +328,23 @@ func (t *Tunnel) Run(ctx context.Context) error {
 			attempt++
 		}
 	}
+}
+
+// UDPState 报告 UDP 数据面的状态。
+//
+// enabled=false 表示这条隧道走的是 TCP 成员连接（healthy 无意义）。
+// enabled=true 时 healthy 反映 UDP 心跳是否还在 udpDeadAfter 内 —— 控制连接再好，
+// 只要它 false，业务包就已经发不出去了，界面不能继续报「已连接」。
+func (t *Tunnel) UDPState() (enabled, healthy bool) {
+	u := t.udpCh.Load()
+	if u == nil {
+		return false, false
+	}
+	if u.isClosed() {
+		return true, false
+	}
+	idle := time.Since(time.Unix(0, u.lastRx.Load()))
+	return true, idle < udpDeadAfter
 }
 
 // takeReadError 非阻塞取读循环的致命错误（没有就返回 nil）。
@@ -493,7 +516,12 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 				t.inv.Mode, uerr)
 		}
 		sess.udp = u
-		defer u.close()
+		// 让界面能查数据面状态；会话结束时清掉，别让下一个会话看到旧通道
+		t.udpCh.Store(u)
+		defer func() {
+			t.udpCh.Store(nil)
+			u.close()
+		}()
 		t.log.Info("UDP 数据通道已启用（控制仍走 TCP）",
 			"local_port", u.conn.LocalAddr().(*net.UDPAddr).Port)
 	}

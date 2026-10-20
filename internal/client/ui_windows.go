@@ -604,6 +604,10 @@ func (u *UI) refresh() {
 		state = "当前状态: 未连接"
 	case st.Online:
 		state = "当前状态: 已连接"
+	case st.DataPathBroken:
+		// 控制连接还在、UDP 数据面不通。这里必须说清楚是「数据通道」的问题，
+		// 否则用户只会看到「已连接却打不开网页」—— 那就是当初把控制改成 UDP 的初衷。
+		state = "当前状态: 数据通道异常（UDP 不通）"
 	default:
 		state = "当前状态: 连接中…"
 	}
