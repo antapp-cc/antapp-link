@@ -586,12 +586,21 @@ func (a *App) probeServer(inv pki.Invite, ctx context.Context) error {
 	d := net.Dialer{}
 	raw, err := d.DialContext(ctx, "tcp", inv.Server)
 	if err != nil {
-		return fmt.Errorf("连接 %s: %w", inv.Server, err)
+		// 翻成一句中文再往外抛。直接把 %w 拼进去的话，用户会在界面上看到
+		// 「connectex: No connection could be made because the target machine
+		// actively refused it.」—— 我们的日志本来就该说人话。
+		if reason := connBrokenReason(err); reason != "" {
+			return fmt.Errorf("连接 %s 失败：%s", inv.Server, reason)
+		}
+		return fmt.Errorf("连接 %s 失败：原因不明（详细错误见调试日志）: %w", inv.Server, err)
 	}
 	defer raw.Close()
 
 	conn := tls.Client(raw, tlsCfg)
 	if err := conn.HandshakeContext(ctx); err != nil {
+		if reason := connBrokenReason(err); reason != "" {
+			return fmt.Errorf("TLS 握手失败：%s", reason)
+		}
 		return fmt.Errorf("TLS 握手失败（证书或网络问题）: %w", err)
 	}
 	return nil
@@ -612,7 +621,7 @@ func (a *App) healthCheck(ctx context.Context) error {
 	// 是把好好的隧道断掉、再还原用户网络。宁宽勿紧。
 	tunnelAddr := net.JoinHostPort(inv.Gateway, tunnelPortOf(inv))
 	if err := probeTCP(ctx, tunnelAddr, 15*time.Second); err != nil {
-		return fmt.Errorf("隧道内不通（%s）: %w", tunnelAddr, err)
+		return fmt.Errorf("隧道内不通（%s）：%s", tunnelAddr, humanReason(err))
 	}
 
 	// 第二级：用下发的 DNS 真解析一次。这正是整套方案存在的理由 ——
@@ -645,8 +654,23 @@ func (a *App) healthCheck(ctx context.Context) error {
 			lastErr = err
 		}
 	}
-	return fmt.Errorf("DNS 解析失败（试过 %d 个服务器 × %d 个域名）: %w",
-		len(dnsServers), len(probeDomains), lastErr)
+	return fmt.Errorf("DNS 解析失败（试过 %d 个服务器 × %d 个域名）：%s",
+		len(dnsServers), len(probeDomains), humanReason(lastErr))
+}
+
+// humanReason 把底层错误翻成一句中文，认不出来就兜底「原因不明」。
+//
+// 往界面上写的错误必须是中文：`connectex: No connection could be made because the
+// target machine actively refused it.` 这种原文对用户毫无意义，只会让人以为程序出错。
+// 需要原文的人可以翻日志里的调试条目。
+func humanReason(err error) string {
+	if err == nil {
+		return "原因不明"
+	}
+	if r := connBrokenReason(err); r != "" {
+		return r
+	}
+	return "原因不明（详细错误见调试日志）"
 }
 
 func probeTCP(ctx context.Context, addr string, timeout time.Duration) error {

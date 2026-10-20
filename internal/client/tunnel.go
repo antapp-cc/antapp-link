@@ -250,11 +250,16 @@ func connBrokenReason(err error) string {
 func connLogAttrs(err error, conn net.Conn, attrs ...any) []any {
 	reason := connBrokenReason(err)
 	out := append([]any{}, attrs...)
+	if reason == "" {
+		// 认不出来也给它一句中文，别让界面上直接出现英文原文。
+		// 原始错误仍附在后面：真排查的人需要它，普通用户看前面的中文就够了。
+		reason = "原因不明"
+	}
 	out = append(out, "reason", reason)
 	if conn != nil {
 		out = append(out, "local", conn.LocalAddr(), "remote", conn.RemoteAddr())
 	}
-	if reason == "" {
+	if connBrokenReason(err) == "" {
 		out = append(out, "err", err)
 	}
 	return out
