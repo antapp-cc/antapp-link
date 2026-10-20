@@ -487,15 +487,14 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	if err := json.Unmarshal(payload, &ack); err != nil {
 		return false, fmt.Errorf("解析 HELLO_ACK: %w", err)
 	}
-	// 一条说完建连结果。sid / gateway / mtu 不再往界面写：sid 是 32 位 hex，
-	// 用户看不懂，排查时有日志文件里的 Debug 明细；gateway 和 mtu 由服务端配置决定，
-	// 出问题时 `antapp-linkd status` 更权威。
+	// 一条说完建连结果，且必须能在一行放得下（日志区一行约 73 个宽度单位，
+	// 中文算两格）。所以只留服务端地址和并行数：
+	//   - 隧道 IP 在状态栏左下角一直显示着，日志里重复一遍就会超宽被折开
+	//   - gateway / mtu 由服务端配置决定，`antapp-linkd status` 更权威
+	//   - sid 是 32 位 hex，用户看不懂
 	connLine := fmt.Sprintf("已连接 %s", t.inv.Server)
-	if ack.TunnelIP != "" {
-		connLine += "  隧道IP=" + ack.TunnelIP
-	}
 	if ack.Members > 1 {
-		connLine += fmt.Sprintf("  %d 条并行连接", ack.Members)
+		connLine += fmt.Sprintf("（%d 条并行连接）", ack.Members)
 	}
 	t.log.Info(connLine)
 	t.Stats.Connected.Store(true)
