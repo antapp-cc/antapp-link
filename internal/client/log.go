@@ -211,7 +211,7 @@ func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
 	})
 	// 一条日志就是一行：底层错误里偶尔带 \n，换成空格。日志区已经关掉自动折行
 	// （见 ui_windows.go），超长内容由横向滚动条承担 —— 和 OpenVPN 一样。
-	h.buf.addLine(strings.ReplaceAll(b.String(), "\n", " "))
+	h.buf.addLine(strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(b.String()))
 	return nil
 }
 

@@ -883,11 +883,9 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 	}
 	sess.slots[k] = conn
 	sess.mu.Unlock()
-	// 只在整个会话凑齐时打一条。三条「成员连接已就位 member=1/2/3」对用户没有意义，
-	// 他关心的是「几条都连上了没有」。
-	if live := sess.liveCount(); live >= sess.members {
-		t.log.Info(fmt.Sprintf("%d 条连接全部就位", live))
-	}
+	// 逐条报「就位」而不是只在凑齐时报一条：哪一条卡住了、补了几次才上来，
+	// 都要能一眼看出来。现在日志区是单行模式，一条一行不会挤。
+	t.log.Info(fmt.Sprintf("连接已就位 %d/%d", sess.liveCount(), sess.members))
 
 	// 这条连接要自己保活（理由见 memberPingInterval）：会话收尾或写不动时退出
 	go sess.memberHeartbeat(ctx, k, conn)
