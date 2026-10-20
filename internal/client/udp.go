@@ -106,10 +106,11 @@ func startUDPChannel(ctx context.Context, inv pki.Invite, state tls.ConnectionSt
 	// 「连上了但打不开网页」，比直接退回 TCP 难排查得多。
 	//
 	// 发一个保活包，等服务端回一个空的加密包（readLoop 收到空负载会回 ACK）。
-	// 收不到就判定这条通道不可用 —— 调用方在 uerr != nil 时本来就会走 TCP 数据面。
+	// 收不到就判定这条通道不可用，并且不会退回 TCP —— 调用方拿到错误后直接让这次连接失败。
+	// UDP 模式下偷偷改用 TCP 会把「端口没放行」伪装成一切正常，让故障无法定位。
 	if perr := c.probe(ctx, 5*time.Second); perr != nil {
 		c.close()
-		return nil, fmt.Errorf("UDP 通道验证失败（已退回 TCP 数据通道）: %w", perr)
+		return nil, fmt.Errorf("UDP 通道验证失败: %w", perr)
 	}
 	return c, nil
 }

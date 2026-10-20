@@ -569,8 +569,9 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 			t.udpCh.Store(nil)
 			u.close()
 		}()
-		t.log.Info("UDP 数据通道已启用（控制仍走 TCP）",
-			"local_port", u.conn.LocalAddr().(*net.UDPAddr).Port)
+		// 一条一行：加上 local_port 属性会超过日志区 75 格宽度，被截成省略号反而看不到端口
+		t.log.Info(fmt.Sprintf("UDP 通道已启用（本地端口 %d）",
+			u.conn.LocalAddr().(*net.UDPAddr).Port))
 	}
 
 	cancel() // 建连结束：后面的读循环与保活只受外层 ctx 约束
