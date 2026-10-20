@@ -397,7 +397,9 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 	// 内存增长、上行队列积压。等用户报「没网」时，单看那一刻什么都判断不了 ——
 	// 所以每 10 分钟落一条，事后翻日志就能看出是哪一项在单调上涨。
 	go a.watchRunStats(ctx, tunnel)
-	a.log.Info("已连接", "server", inv.Server, "tunnel_ip", cfg.TunnelIP)
+	// 这里不再打「已连接」：此刻隧道循环刚启动，TLS 握手和 HELLO_ACK 都还没完成。
+	// 真正的连接结果由 tunnel.session 在握手成功后打一条，避免同一件事报两遍
+	// （而且先报一次乐观的「已连接」，握手失败了还要再报一次失败，看着自相矛盾）。
 
 	// 只有真接管了网络才自检：联调模式没动用户网络，出不去也不该由我们背
 	if noNetCfg || snap == nil {

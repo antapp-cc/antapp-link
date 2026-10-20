@@ -487,18 +487,23 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	if err := json.Unmarshal(payload, &ack); err != nil {
 		return false, fmt.Errorf("解析 HELLO_ACK: %w", err)
 	}
-	t.log.Info("隧道已建立",
-		"server", t.inv.Server, "tunnel_ip", ack.TunnelIP, "gateway", ack.Gateway, "mtu", ack.MTU,
-		"sid", sid, "want_members", wantMembers, "ack_members", ack.Members)
+	// 一条说完建连结果。sid / gateway / mtu 不再往界面写：sid 是 32 位 hex，
+	// 用户看不懂，排查时有日志文件里的 Debug 明细；gateway 和 mtu 由服务端配置决定，
+	// 出问题时 `antapp-linkd status` 更权威。
+	connLine := fmt.Sprintf("已连接 %s", t.inv.Server)
+	if ack.TunnelIP != "" {
+		connLine += "  隧道IP=" + ack.TunnelIP
+	}
+	if ack.Members > 1 {
+		connLine += fmt.Sprintf("  %d 条并行连接", ack.Members)
+	}
+	t.log.Info(connLine)
 	t.Stats.Connected.Store(true)
 	defer t.Stats.Connected.Store(false)
 
 	sess := newClientSession(t, conn, sid, tlsCfg, ack)
 	defer sess.closeAll()
 	sess.trace = t.Trace
-	if sess.members > 1 {
-		t.log.Info(fmt.Sprintf("多连接并发已启用：%d 条并行连接（含控制连接）", sess.members))
-	}
 
 	// UDP 模式：数据包改走 UDP。控制连接继续跑心跳与保活，并负责把本地 UDP 端口报给
 	// 服务端（服务端按 TCP 远端 IP + 这个端口认人，不接受 UDP 包里自称的地址）。
@@ -877,7 +882,11 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 	}
 	sess.slots[k] = conn
 	sess.mu.Unlock()
-	t.log.Info("成员连接已就位", "member", k, "live", sess.liveCount())
+	// 只在整个会话凑齐时打一条。三条「成员连接已就位 member=1/2/3」对用户没有意义，
+	// 他关心的是「几条都连上了没有」。
+	if live := sess.liveCount(); live >= sess.members {
+		t.log.Info(fmt.Sprintf("%d 条连接全部就位", live))
+	}
 
 	// 这条连接要自己保活（理由见 memberPingInterval）：会话收尾或写不动时退出
 	go sess.memberHeartbeat(ctx, k, conn)
@@ -1043,7 +1052,8 @@ func (s *clientSession) run(ctx context.Context) error {
 	go func() { errCh <- s.heartbeat(ctx) }()
 	go s.watchDataPath(ctx)
 	if s.members > 1 {
-		s.log.Info(fmt.Sprintf("多连接模式：目标 %d 条，启动成员维护", s.members))
+		// 不单独打「多连接模式：目标 N 条，启动成员维护」—— 上面「已连接 … N 条并行连接」
+		// 已经说过了，用户不需要知道内部有个维护协程。
 		go maintainMembers(ctx, s.tunnel, s)
 	}
 
