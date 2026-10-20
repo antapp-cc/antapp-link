@@ -197,9 +197,13 @@ func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 
 	var b strings.Builder
-	// 前缀压到 16 个宽度单位：时间戳 14 + 空格 + 级别符号 + 空格。
-	// 原来级别符号两侧各两个空格，一个点占掉 5 格，太浪费 —— 这些宽度留给消息更实在。
-	b.WriteString(r.Time.Format("01-02 15:04:05"))
+	// 前缀压到 11 个宽度单位：时分秒 8 + 空格 + 级别符号 + 空格。
+	//
+	// 去掉日期是权衡后的选择：界面看的是「刚刚发生了什么」，跨天的历史在日志文件里
+	// （file handler 用的是完整的 01-02 15:04:05）。而秒和级别符号一个都不能丢 ——
+	// 「连接已就位 2/4 → 3/4 → 4/4」全在同一秒内，没秒就看不出顺序；级别符号是用户
+	// 唯一能一眼发现异常的标记。
+	b.WriteString(r.Time.Format("15:04:05"))
 	b.WriteString(" ")
 	b.WriteString(levelTag(r.Level))
 	b.WriteString(" ")
@@ -221,8 +225,8 @@ func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
 // logLineMaxUnits 是界面日志区一行能容纳的显示宽度（ASCII=1，中文=2）。
 //
 // 实测客户区 529px、9pt Consolas 约 7px/字符、前缀 19 字符占 133px，扣掉滚动条后
-// 约 54 单位，加上前缀 19 就是 73。
-const logLineMaxUnits = 76
+// 约 54 单位，加上前缀 11 就是 65 —— 但实测还有余量，取 82。
+const logLineMaxUnits = 82
 
 // ellipsisUnits 是截断标记 … 的显示宽度。
 const ellipsisUnits = 2
