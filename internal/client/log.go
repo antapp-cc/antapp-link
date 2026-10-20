@@ -209,10 +209,85 @@ func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
 		b.WriteString(a.Value.String())
 		return true
 	})
-	// 一条日志就是一行：底层错误里偶尔带 \n，换成空格，别让它在界面里冒出顶格的续行。
-	// 长度超过控件宽度的部分由控件自己折，我们不再手动插换行。
-	h.buf.addLine(strings.ReplaceAll(b.String(), "\n", " "))
+	// 长消息折行，续行缩进到消息列。
+	//
+	// 日志区已经关掉了控件自动折行（见 ui_windows.go 的 EM_SETTARGETDEVICE），所以
+	// 这里的换行是唯一来源 —— 折出来的每一行都带着缩进，全部落在时间戳右侧的区域里，
+	// 不会有内容压在日期列上。
+	h.buf.addLine(wrapToMessageColumn(b.String()))
 	return nil
+}
+
+// continuationIndent 让折行后的内容对齐到消息列。
+// 时间戳 14 字符 + 两个空格 + 级别符号 1 + 两个空格 = 19。
+const continuationIndent = "                   "
+
+// maxLineUnits 是一行能容纳的显示宽度（ASCII=1，非 ASCII=2）。
+//
+// 实测：日志区客户区宽 529px、9pt Consolas 每字符约 7px、前缀 19 字符占 133px，
+// 扣掉滚动条还剩约 379px ≈ 54 单位。加上前缀 19，整行按 73 单位折。
+// 中文按 2 单位算（实际约 1.7），宁可折早一点，也不要有一行溢出到横向滚动。
+const maxLineUnits = 73
+
+// wrapToMessageColumn 把一行按显示宽度折开，续行缩进到消息列。
+//
+// 折行点尽量选在空格或标点后面：否则会把 IP、端口、文件名从中间切开（「103.1」换到
+// 下一行变成「42.86.145」），反而更难读。找不到合适的断点才硬切。
+func wrapToMessageColumn(line string) string {
+	indentWidth := len(continuationIndent)
+
+	var b strings.Builder
+	var cur []rune
+	width := 0
+	unitWidth := func(r rune) int {
+		if r > 127 {
+			return 2
+		}
+		return 1
+	}
+
+	for _, r := range line {
+		if r == '\n' {
+			b.WriteString(string(cur))
+			b.WriteString("\n" + continuationIndent)
+			cur, width = cur[:0], indentWidth
+			continue
+		}
+		if width+unitWidth(r) > maxLineUnits && len(cur) > 0 {
+			// 在后半段里找最后一个可断点，避免断得太靠前把行填得很短
+			cut := len(cur)
+			for i := len(cur) - 1; i > len(cur)/2; i-- {
+				if isBreakAfter(cur[i]) {
+					cut = i + 1
+					break
+				}
+			}
+			b.WriteString(string(cur[:cut]))
+			b.WriteString("\n" + continuationIndent)
+			rest := append([]rune{}, cur[cut:]...)
+			cur = rest
+			width = indentWidth
+			for _, rr := range rest {
+				width += unitWidth(rr)
+			}
+		}
+		cur = append(cur, r)
+		width += unitWidth(r)
+	}
+	b.WriteString(string(cur))
+	return b.String()
+}
+
+// isBreakAfter 判断是否适合在它后面断行。
+//
+// 只认空格和中文标点。`=`、`:`、`/` 这些不能断：在「隧道IP=」后面换行会把值
+// 甩到下一行，「103.142.86.145:62233」也会被切成两截。
+func isBreakAfter(r rune) bool {
+	switch r {
+	case ' ', '，', '：', '、', '。', '；', '）':
+		return true
+	}
+	return false
 }
 
 // attrKeyLabel 把 slog 的英文 key 换成中文。

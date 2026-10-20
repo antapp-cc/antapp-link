@@ -210,11 +210,15 @@ func (u *UI) build() error {
 	// 普通 Edit 控件默认按窗口宽度折行，折出来的续行是顶格的 —— 正好压在时间戳那一列
 	// 上，一屏文字看着发花。用户要的是「任何信息都不占用日期」。
 	//
-	// 两步：加横向滚动条，再用 EM_SETTARGETDEVICE(lParam 非 0) 告诉控件不要按窗口宽度
-	// 折行。之后一条日志就是一行，超出的往右延伸，日期列永远干净。
+	// 三个东西缺一不可：
+	//   - WS_HSCROLL：给控件配一条横向滚动条，否则内容往右伸出窗口就看不到了；
+	//   - ES_AUTOHSCROLL：让控件在输入/显示超宽内容时横向滚动，而不是自己折行；
+	//   - EM_SETTARGETDEVICE(lParam 非 0)：明确告诉控件不要按窗口宽度折行。
+	// 只加前两个时控件仍然会折行（walk 建控件时带的就是 ES_MULTILINE 的默认折行行为）。
+	const esAutoHScroll = 0x0080
 	logHwnd := u.txtLog.Handle()
 	win.SetWindowLong(logHwnd, win.GWL_STYLE,
-		win.GetWindowLong(logHwnd, win.GWL_STYLE)|win.WS_HSCROLL)
+		win.GetWindowLong(logHwnd, win.GWL_STYLE)|win.WS_HSCROLL|esAutoHScroll)
 	win.SetWindowPos(logHwnd, 0, 0, 0, 0, 0,
 		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER)
 	u.txtLog.SendMessage(emSetTargetDevice, 0, 1)
