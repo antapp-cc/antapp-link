@@ -208,19 +208,13 @@ func (u *UI) build() error {
 	// 日志区不自动折行。
 	//
 	// 普通 Edit 控件默认按窗口宽度折行，折出来的续行是顶格的 —— 正好压在时间戳那一列
-	// 上，一屏文字看着发花。用户要的是「任何信息都不占用日期」。
+	// 上，一屏文字看着发花。
 	//
-	// 三个东西缺一不可：
-	//   - WS_HSCROLL：给控件配一条横向滚动条，否则内容往右伸出窗口就看不到了；
-	//   - ES_AUTOHSCROLL：让控件在输入/显示超宽内容时横向滚动，而不是自己折行；
-	//   - EM_SETTARGETDEVICE(lParam 非 0)：明确告诉控件不要按窗口宽度折行。
-	// 只加前两个时控件仍然会折行（walk 建控件时带的就是 ES_MULTILINE 的默认折行行为）。
-	const esAutoHScroll = 0x0080
-	logHwnd := u.txtLog.Handle()
-	win.SetWindowLong(logHwnd, win.GWL_STYLE,
-		win.GetWindowLong(logHwnd, win.GWL_STYLE)|win.WS_HSCROLL|esAutoHScroll)
-	win.SetWindowPos(logHwnd, 0, 0, 0, 0, 0,
-		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER)
+	// 这里只做一件事：EM_SETTARGETDEVICE(lParam 非 0) 告诉控件不要按窗口宽度折行。
+	// 换行改由 log.go 的 wrapToMessageColumn 负责，它会把续行缩进到消息列。
+	//
+	// 不要加 WS_HSCROLL / ES_AUTOHSCROLL：那两个会在底部常驻一条横向滚动条，占掉一行
+	// 高度，而且内容明明没超宽时也一直在，看着很碍眼。宽度已经由折行逻辑预留了余量。
 	u.txtLog.SendMessage(emSetTargetDevice, 0, 1)
 
 	// 关窗口只是收进托盘，不是退出 —— 否则隧道会跟着一起断
