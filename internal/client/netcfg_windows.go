@@ -119,6 +119,9 @@ func refreshSplitRoutesFor(gw string, ifIndex int, table []string) {
 //
 // cfg 同时提供云服地址（算绕行路由用）和隧道网关（要一并记进快照，供自愈用）。
 func Capture(cfg NetConfig) (Snapshot, error) {
+	if err := validateIPv4Only(cfg); err != nil {
+		return Snapshot{}, err
+	}
 	srv, err := resolveIPv4(cfg.ServerIP)
 	if err != nil {
 		return Snapshot{}, err
@@ -320,6 +323,9 @@ func (s *Snapshot) Apply(cfg NetConfig) error {
 }
 
 func (s *Snapshot) applyOnce(cfg NetConfig) error {
+	if err := validateIPv4Only(cfg); err != nil {
+		return err
+	}
 	if err := configureAdapterLUID(cfg); err != nil {
 		return err
 	}

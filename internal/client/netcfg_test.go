@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -314,6 +315,67 @@ func TestSplitOwnershipOnlyMatchesInstalledRoutes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.own.ownsRoute(tc.guid, tc.ifIndex, tc.nextHop, tc.metric, tc.dest); got != tc.want {
 				t.Errorf("ownsRoute = %v，期望 %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// 当前版本只接管 IPv4，IPv6 的隧道地址或网关必须在入口就拒绝。
+//
+// 不拒绝的后果不是「IPv6 不能用」这么简单：/1 路由、MSS clamp、dnsmasq 都只处理
+// IPv4，配置里混进 IPv6 会让写入一半成功一半失败，还原时还可能把宿主的 IPv6
+// 配置留在半改状态 —— 那比直接报错难查得多。
+func TestValidateIPv4OnlyRejectsIPv6(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     NetConfig
+		wantErr bool
+	}{
+		{
+			name: "全 IPv4 通过",
+			cfg:  NetConfig{ServerIP: "103.143.239.213", TunnelIP: "10.10.0.2", Gateway: "192.168.1.1"},
+		},
+		{
+			name:    "IPv6 隧道地址要拒绝",
+			cfg:     NetConfig{ServerIP: "103.143.239.213", TunnelIP: "fd00::2"},
+			wantErr: true,
+		},
+		{
+			name:    "IPv6 网关要拒绝",
+			cfg:     NetConfig{ServerIP: "103.143.239.213", TunnelIP: "10.10.0.2", Gateway: "fe80::1"},
+			wantErr: true,
+		},
+		{
+			name:    "IPv6 服务端要拒绝",
+			cfg:     NetConfig{ServerIP: "2001:db8::1", TunnelIP: "10.10.0.2"},
+			wantErr: true,
+		},
+		{
+			// 云服在直连网段时不加绕行路由，网关本来就是空的
+			name: "空网关是合法的",
+			cfg:  NetConfig{ServerIP: "103.143.239.213", TunnelIP: "10.10.0.2"},
+		},
+		{
+			// 域名交给 resolveIPv4 报它自己的错，这里不该误报
+			name: "域名跳过校验",
+			cfg:  NetConfig{ServerIP: "example.com:62233", TunnelIP: "10.10.0.2"},
+		},
+		{
+			name: "带端口的服务端地址",
+			cfg:  NetConfig{ServerIP: "103.143.239.213:62233", TunnelIP: "10.10.0.2"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateIPv4Only(tc.cfg)
+			if tc.wantErr && err == nil {
+				t.Fatal("该拒绝却通过了")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("不该拒绝: %v", err)
+			}
+			if tc.wantErr && err != nil && !strings.Contains(err.Error(), "只接管 IPv4") {
+				t.Errorf("错误信息没说清原因: %v", err)
 			}
 		})
 	}

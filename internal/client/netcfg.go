@@ -184,6 +184,39 @@ func BuildNetConfig(inv pki.Invite) NetConfig {
 	}
 }
 
+// validateIPv4Only 在接管或还原前确认这次配置全在 IPv4 范围内。
+//
+// 当前版本只接管 IPv4：`/1` 路由、服务端的 MSS clamp、dnsmasq 中继都只处理 IPv4，
+// filter-AAAA 也不等于接管了 IPv6。传进来 IPv6 的隧道地址或网关时如果不明确拒绝，
+// 后面的写入会一半成功一半失败，还原时还可能把宿主的 IPv6 配置留在半改状态 ——
+// 那比直接拒绝难查得多。宁可在这里报清楚「当前版本只接管 IPv4」。
+//
+// 空值跳过：Gateway 在「云服就在直连网段」时是空的，那是合法情况。
+// 域名之类解析不了的值也跳过，交给 resolveIPv4 报它自己的错。
+func validateIPv4Only(cfg NetConfig) error {
+	for _, f := range []struct{ name, val string }{
+		{"服务端地址", cfg.ServerIP},
+		{"隧道地址", cfg.TunnelIP},
+		{"默认网关", cfg.Gateway},
+	} {
+		host := strings.TrimSpace(f.val)
+		if host == "" {
+			continue
+		}
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		a, err := netip.ParseAddr(host)
+		if err != nil {
+			continue
+		}
+		if a.Is6() {
+			return fmt.Errorf("%s 是 IPv6（%s），当前版本只接管 IPv4", f.name, f.val)
+		}
+	}
+	return nil
+}
+
 // splitRouteMetric 是国内直连路由的 route metric。还原时按
 // 「下一跳 = 原默认网关 且 metric = 此值」整批扫除，网段表更新过也能清干净。
 const splitRouteMetric = 5
