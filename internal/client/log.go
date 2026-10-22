@@ -300,6 +300,14 @@ var attrKeyLabels = map[string]string{
 	"sid":       "会话号",
 	"ms":        "毫秒",
 	"port_test": "端口测试",
+	// 下面这几个漏了很久：watchRunStats 打的是 "goroutines"（复数），
+	// 而表里只有 "goroutine"，于是「运行状态」那行一直显示英文 goroutines=25。
+	"goroutines":  "协程数",
+	"captured_at": "记录于",
+	"did_resume":  "会话复用",
+	"len":         "长度",
+	"max":         "上限",
+	"idle":        "空闲",
 }
 
 // WithAttrs / WithGroup 在本项目里用不到（都是直接 slog.Info/Warn/Error），
