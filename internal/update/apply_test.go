@@ -12,14 +12,28 @@ import (
 )
 
 // stubExecutable 把「当前程序在哪」指到临时目录里的假程序，免得测试删到别处。
+// 顺带把生命周期日志也指到临时目录：这些用例都会经过 Apply/cleanup 的日志点。
 func stubExecutable(t *testing.T, path string) {
 	t.Helper()
 	prev := executablePath
 	executablePath = func() (string, error) { return path, nil }
 	t.Cleanup(func() { executablePath = prev })
+
+	prevPath := lifecyclePathFn
+	lifecyclePathFn = func() string { return filepath.Join(t.TempDir(), "lifecycle.log") }
+	t.Cleanup(func() { lifecyclePathFn = prevPath })
+}
+
+// stubLifecycle 把生命周期日志指到临时目录，测试不去污染真实用户目录。
+func stubLifecycle(t *testing.T) {
+	t.Helper()
+	prev := lifecyclePathFn
+	lifecyclePathFn = func() string { return filepath.Join(t.TempDir(), "lifecycle.log") }
+	t.Cleanup(func() { lifecyclePathFn = prev })
 }
 
 func TestCleanupOldAfterHealthyRemovesBackup(t *testing.T) {
+	stubLifecycle(t)
 	self := filepath.Join(t.TempDir(), "app.exe")
 	if err := os.WriteFile(self, []byte("new"), 0o755); err != nil {
 		t.Fatal(err)
@@ -29,6 +43,10 @@ func TestCleanupOldAfterHealthyRemovesBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 	stubExecutable(t, self)
+	prevStarted := processStarted
+	t.Cleanup(func() { processStarted = prevStarted })
+	// 已经跑够观察窗口：这时调用方才算真的确认了健康
+	processStarted = time.Now().Add(-minHealthyUptime - time.Second)
 
 	CleanupOldAfterHealthy()
 
@@ -42,6 +60,7 @@ func TestCleanupOldAfterHealthyRemovesBackup(t *testing.T) {
 
 // 新版还没证明自己活得下来之前，回滚副本必须留着。
 func TestCleanupOldWaitsForHealthyUptime(t *testing.T) {
+	stubLifecycle(t)
 	self := filepath.Join(t.TempDir(), "app.exe")
 	backup := self + ".old"
 	if err := os.WriteFile(backup, []byte("old"), 0o755); err != nil {
@@ -177,5 +196,71 @@ func TestSwapExeRemovesStaleBackup(t *testing.T) {
 	backup, err := os.ReadFile(self + ".old")
 	if err != nil || string(backup) != "old" {
 		t.Errorf("备份应该是这一次的旧版，实际 %q (err=%v)", backup, err)
+	}
+}
+
+// 第 7 项：调用方报「健康」时可能只是控制连接刚握上手，数据面还没被验证。
+// 删 .old 必须等到进程跑够观察窗口，不能立即执行。
+func TestCleanupOldAfterHealthyDefersUntilUptime(t *testing.T) {
+	stubLifecycle(t)
+	self := filepath.Join(t.TempDir(), "app.exe")
+	backup := self + ".old"
+	if err := os.WriteFile(self, []byte("new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backup, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stubExecutable(t, self)
+
+	prevStarted := processStarted
+	prevSchedule := scheduleCleanup
+	t.Cleanup(func() {
+		processStarted = prevStarted
+		scheduleCleanup = prevSchedule
+	})
+
+	processStarted = time.Now()
+	var scheduled time.Duration
+	scheduleCleanup = func(d time.Duration, _ func()) { scheduled = d }
+
+	CleanupOldAfterHealthy()
+
+	if _, err := os.Stat(backup); err != nil {
+		t.Error("启动早期确认的「健康」不足以删回滚副本")
+	}
+	if scheduled <= 0 {
+		t.Fatal("应该延迟清理，而不是立刻删或永远不删")
+	}
+	if scheduled > minHealthyUptime {
+		t.Errorf("延迟 %v 超过了观察窗口 %v", scheduled, minHealthyUptime)
+	}
+}
+
+func TestCleanupOldAfterHealthyRemovesWhenAlreadyMature(t *testing.T) {
+	stubLifecycle(t)
+	self := filepath.Join(t.TempDir(), "app.exe")
+	backup := self + ".old"
+	if err := os.WriteFile(backup, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stubExecutable(t, self)
+
+	prevStarted := processStarted
+	prevSchedule := scheduleCleanup
+	t.Cleanup(func() {
+		processStarted = prevStarted
+		scheduleCleanup = prevSchedule
+	})
+
+	processStarted = time.Now().Add(-minHealthyUptime - time.Second)
+	scheduleCleanup = func(time.Duration, func()) {
+		t.Error("已经跑够窗口就不该再调度")
+	}
+
+	CleanupOldAfterHealthy()
+
+	if _, err := os.Stat(backup); !os.IsNotExist(err) {
+		t.Errorf("跑够窗口后应清掉回滚副本，实际 err=%v", err)
 	}
 }

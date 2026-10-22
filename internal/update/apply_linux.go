@@ -20,11 +20,17 @@ func Apply(newBinary string) error {
 	if err != nil {
 		return fmt.Errorf("%w: 取当前程序路径: %v", ErrNotApplied, err)
 	}
+	recordLifecycle(LifecycleEvent{
+		Event:  EventUpdateStart,
+		Detail: fmt.Sprintf("替换 %s", self),
+	})
 	if err := installBinary(self, newBinary); err != nil {
 		// installBinary 的失败都在 rename 之前，目标文件没动过 —— 带上 ErrNotApplied，
 		// 让调用方别把这一版锁掉
+		recordLifecycle(LifecycleEvent{Event: EventUpdateFailed, Detail: "替换二进制失败", Err: err.Error()})
 		return fmt.Errorf("%w: 替换 %s 失败: %v", ErrNotApplied, self, err)
 	}
+	recordLifecycle(LifecycleEvent{Event: EventUpdateSwapped, Detail: "新二进制已写入程序路径"})
 	return nil
 }
 
