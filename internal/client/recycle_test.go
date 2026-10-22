@@ -140,3 +140,19 @@ func contains(s, sub string) bool {
 		return false
 	})()
 }
+
+// 定期重建的等待必须比常规退避短：常规 Backoff 的 10 秒起步是为
+// 「对端刚崩、内核还在收尾」设计的，主动断开不会撞上那种情况，
+// 干等 10 秒只是白白拉低 uptime（对外部节点来说端口是关的）。
+func TestRecycleDelayShorterThanBackoff(t *testing.T) {
+	if recycleDelay >= Backoff(0) {
+		t.Fatalf("定期重建的等待 %v 不该 >= 常规退避 %v", recycleDelay, Backoff(0))
+	}
+	if recycleDelay <= 0 {
+		t.Fatalf("等待时间必须为正值，实际 %v", recycleDelay)
+	}
+	// 3 秒是实测够完成 TLS 握手 + JOIN 的量级，别退化成毫秒级导致重连必然失败
+	if recycleDelay < time.Second {
+		t.Fatalf("等待太短，重连会赶在 TCP 收尾前失败：%v", recycleDelay)
+	}
+}

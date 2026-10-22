@@ -318,6 +318,16 @@ func (t *Tunnel) Run(ctx context.Context) error {
 			// 成功握手过就重置退避，避免一次偶发断线让后续重连一直等 3 分钟
 			attempt = 0
 		}
+		// 定期重建用短退避。
+		//
+		// Backoff 的 10 秒起步是为「对端刚崩、内核里还有收尾的 TCP 状态」设计的，
+		// 主动断开不会撞上那种情况：本地 close 立刻发 FIN/RST，3 秒够走完 TLS 握手
+		// 和 JOIN。干等 10 秒只是白白拉低 uptime —— 对外部 Pi 节点来说这段时间
+		// 转发端口是关的，入站连接会失败重试。
+		retryIn := Backoff(attempt)
+		if errors.Is(err, errScheduledRecycle) {
+			retryIn = recycleDelay
+		}
 		if err != nil {
 			// 适配器被外力干掉（系统停用/移除/驱动重置）时，重拨 TCP 救不了 ——
 			// 必须重建整个设备与网络配置。交给 App 的完整重连，本循环随之退出。
@@ -328,7 +338,7 @@ func (t *Tunnel) Run(ctx context.Context) error {
 			}
 			lvl, reason := sessionEndInfo(err)
 			// 同样不摆英文原文：认得出原因就只给中文，认不出才附 err 当线索
-			args := []any{"reason", reason, "retry_in", Backoff(attempt)}
+			args := []any{"reason", reason, "retry_in", retryIn}
 			if reason == "" {
 				args = append(args, "err", err)
 			}
@@ -342,7 +352,7 @@ func (t *Tunnel) Run(ctx context.Context) error {
 			continue
 		case <-t.wake:
 			// 网络出口刚迁移完（watcher 通知），立刻重试而不是干等退避计时
-		case <-time.After(Backoff(attempt)):
+		case <-time.After(retryIn):
 		}
 		if attempt < 10 {
 			attempt++
@@ -1148,6 +1158,13 @@ var (
 
 	// recycleRetry 是「太忙、推迟」之后重新检查的间隔。
 	recycleRetry = 10 * time.Minute
+
+	// recycleDelay 是定期重建后到重连之间的等待，比 Backoff 的 10 秒起步短得多。
+	//
+	// 主动断开的 TCP 会立刻发 FIN/RST，不存在「对端还在收尾」的情况；3 秒够完成
+	// TLS 握手 + JOIN。缩短它的意义在于 uptime：对外部 Pi 节点来说，这段时间
+	// 转发端口是关的，入站连接会失败重试。8 小时断 3 秒 ≈ 99.99%，断 10 秒 ≈ 99.97%。
+	recycleDelay = 3 * time.Second
 )
 
 // recycleAt 到点返回 errScheduledRecycle，让上层把会话重建一次。
