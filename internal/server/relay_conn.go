@@ -66,6 +66,19 @@ func (c *relayConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// CloseWrite 转发半关闭。
+//
+// 必须显式转发：relayConn 嵌的是 net.Conn 接口，而 CloseWrite 不在该接口的方法集里，
+// 嵌进来的接口不会自动带上它。不转发的话 handleRelayConn 里的 closeWrite() 类型断言
+// 失败、退回整条 Close —— 服务端还没发完的应答被截断，客户端拿到空响应。这正是
+// 那段代码注释里说要避免的情况，套一层 conn 就把这个保证丢了。
+func (c *relayConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.Close()
+}
+
 // relayStats 是转发器的运行计数，写进状态文件供 status 展示。
 //
 // 存在的理由：这次的「goroutine 从 28 涨到 138」是靠手工数 ss 才发现的。
