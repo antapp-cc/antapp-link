@@ -44,11 +44,11 @@ function Build-Target {
 # 版本号必须注入：服务端的自动更新就是拿它跟清单里的 version 比，注入失效会让它
 # 永远自认旧版、每小时更新重启一次。
 Build-Target -Goos 'linux' -Goarch 'amd64' -Out 'antapp-linkd' -Pkg './cmd/antapp-linkd' `
-    -Ldflags "-s -w -X github.com/antapp-cc/antapp-link/internal/server.Version=$Version"
+    -Ldflags "-s -w -X github.com/antapp-cc/antapp-link/internal/version.Version=$Version"
 
 # 客户端：GUI 子系统，双击不弹控制台黑框；wintun.dll 已内嵌
 Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-link.exe' -Pkg './cmd/antapp-link' `
-    -Ldflags "-s -w -H windowsgui -X github.com/antapp-cc/antapp-link/internal/client.Version=$Version"
+    -Ldflags "-s -w -H windowsgui -X github.com/antapp-cc/antapp-link/internal/version.Version=$Version"
 
 # 代码签名：蚁巢证书（装在本机证书库），客户端和安装器都要签，时间戳保证证书过期后签名仍有效。
 #
@@ -93,7 +93,7 @@ Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') (Join-Path $setupAssets 'RE
 
 # 安装程序：内嵌了客户端，分发只带这一个文件
 Build-Target -Goos 'windows' -Goarch 'amd64' -Out 'antapp-setup.exe' -Pkg './cmd/antapp-setup' `
-    -Ldflags "-s -w -H windowsgui -X github.com/antapp-cc/antapp-link/internal/setup.Version=$Version"
+    -Ldflags "-s -w -H windowsgui -X github.com/antapp-cc/antapp-link/internal/version.Version=$Version"
 
 Invoke-Sign 'antapp-setup.exe'
 
