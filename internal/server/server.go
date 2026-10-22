@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,7 +44,85 @@ const (
 	memberIdleTimeout = 120 * time.Second
 	readBufferSize    = 65535
 	protoVersion      = 1
+
+	// handshakeMaxConcurrent 是同时在做的外层 TLS 握手上限。relay 的 256 条上限
+	// 管的是转发连接，隧道监听这条路径上没有任何限制 —— 半开握手洪峰会吃光 fd，
+	// 而 accept 循环看起来还一切正常。
+	handshakeMaxConcurrent = 64
+	// handshakeQueueWait 是名额满后允许排队的时间。超过就直接断开：这些连接还没
+	// 完成 TLS、没有任何可信身份，无限排队只会把 fd 占得更久。
+	handshakeQueueWait = 5 * time.Second
+	// tunDropRefreshEvery 是重新执行 ip -s link 的间隔。每 5 秒 fork 一次没必要，
+	// 丢包是趋势指标，30 秒的粒度足够，也避免在 fd 紧张时雪上加霜。
+	tunDropRefreshEvery = 30 * time.Second
 )
+
+// handshakeLimiter 给外层 TLS 握手加一个有界闸门。
+type handshakeLimiter struct {
+	slots chan struct{}
+	wait  time.Duration
+
+	inFlight atomic.Int64
+	peak     atomic.Int64
+	refused  atomic.Uint64
+}
+
+func newHandshakeLimiter(max int, wait time.Duration) *handshakeLimiter {
+	return &handshakeLimiter{slots: make(chan struct{}, max), wait: wait}
+}
+
+// acquire 拿一个握手名额。拿不到返回 (nil, false)，调用方负责关掉连接。
+func (l *handshakeLimiter) acquire(ctx context.Context) (func(), bool) {
+	select {
+	case l.slots <- struct{}{}:
+		return l.granted(), true
+	default:
+	}
+
+	timer := time.NewTimer(l.wait)
+	defer timer.Stop()
+	select {
+	case l.slots <- struct{}{}:
+		return l.granted(), true
+	case <-timer.C:
+		l.refused.Add(1)
+		return nil, false
+	case <-ctx.Done():
+		l.refused.Add(1)
+		return nil, false
+	}
+}
+
+// granted 记一次占用并返回幂等的释放函数：重复调用释放会让上限悄悄变宽。
+func (l *handshakeLimiter) granted() func() {
+	n := l.inFlight.Add(1)
+	for {
+		peak := l.peak.Load()
+		if n <= peak || l.peak.CompareAndSwap(peak, n) {
+			break
+		}
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			<-l.slots
+			l.inFlight.Add(-1)
+		})
+	}
+}
+
+func (l *handshakeLimiter) snapshot() (inFlight, peak int, refused uint64) {
+	return int(l.inFlight.Load()), int(l.peak.Load()), l.refused.Load()
+}
+
+// newInstanceID 生成本次进程的随机 ID，用来确认状态是这一次启动写的。
+func newInstanceID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
 
 type helloPayload struct {
 	Version int    `json:"version"`
@@ -85,6 +165,10 @@ type Server struct {
 
 	// udp 是 UDP 数据通道的多路复用器（mode=udp 时才有）。控制仍走 TCP，数据包走它。
 	udp *udpMux
+
+	hs         *handshakeLimiter
+	instanceID string
+	startedAt  time.Time
 }
 
 // relayState 是端口转发器的启动结果：就绪，或一句能被 status 展示的失败原因。
@@ -117,7 +201,11 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	defer ln.Close()
 
 	s := &Server{cfg: cfg, tun: tun, tlsCfg: tlsCfg, log: logger, joins: newJoinGuard(),
-		fatal: make(chan error, 1)}
+		fatal:      make(chan error, 1),
+		hs:         newHandshakeLimiter(handshakeMaxConcurrent, handshakeQueueWait),
+		instanceID: newInstanceID(),
+		startedAt:  time.Now(),
+	}
 
 	// UDP 数据通道：与 TCP 共用同一个端口号（不同协议，不冲突）。控制连接仍走 TCP，
 	// 数据包改走这里。设计见 docs/superpowers/specs/2026-10-17-udp-data-channel-design.md
@@ -330,6 +418,19 @@ func tuneTCPBuffers(conn net.Conn) {
 func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	defer raw.Close()
 	tuneTCPBuffers(raw)
+
+	// 先占握手名额再开始 TLS：名额满且排队超时就断开。这里的连接还没被认证，
+	// 不值得为它继续占着 fd 等一个可能永远不来的 ClientHello。
+	release, ok := s.hs.acquire(ctx)
+	if !ok {
+		inFlight, _, refused := s.hs.snapshot()
+		s.log.Warn("TLS 握手并发已满，拒绝连接（防止半开握手吃光资源）",
+			"max", cap(s.hs.slots), "wait", s.hs.wait,
+			"in_flight", inFlight, "refused_total", refused,
+			"remote", raw.RemoteAddr())
+		return
+	}
+	defer release()
 
 	tlsConn := tls.Server(raw, s.tlsCfg)
 	_ = tlsConn.SetDeadline(time.Now().Add(handshakeTimeout))
@@ -804,6 +905,13 @@ func (s *Server) currentSession() *session {
 func (s *Server) reportStatus(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+
+	// 丢包读取有 2 秒预算，没必要每 5 秒跑一次外部命令；上一次的值在刷新间隔内复用。
+	var (
+		lastTunCheck time.Time
+		tunRx, tunTx uint64
+		tunKnown     bool
+	)
 	for {
 		st := Status{
 			Listen:     s.cfg.Listen,
@@ -811,6 +919,29 @@ func (s *Server) reportStatus(ctx context.Context) {
 			ServerIP:   s.cfg.Tunnel.ServerIP,
 			ClientIP:   s.cfg.Tunnel.ClientIP,
 			Goroutines: runtime.NumGoroutine(),
+			PID:        os.Getpid(),
+			InstanceID: s.instanceID,
+			StartedAt:  s.startedAt.Format(time.RFC3339),
+		}
+		if used, limit, err := readProcFDUsage("/proc"); err == nil {
+			st.FDUsed, st.FDLimit, st.FDKnown = used, limit, true
+		} else {
+			// 读不到就写 known=false：显示成「0 个 fd」会让人以为一切正常
+			s.log.Debug("读 fd 用量失败", "err", err)
+		}
+		if time.Since(lastTunCheck) >= tunDropRefreshEvery {
+			rx, tx, err := readTunDrops(ctx, s.cfg.Tunnel.Device)
+			lastTunCheck = time.Now()
+			if err == nil {
+				tunRx, tunTx, tunKnown = rx, tx, true
+			} else {
+				tunKnown = false
+				s.log.Debug("读 TUN 丢包计数失败", "err", err)
+			}
+		}
+		st.TUNRxDropped, st.TUNTxDropped, st.TUNDropsKnown = tunRx, tunTx, tunKnown
+		if inFlight, peak, refused := s.hs.snapshot(); inFlight > 0 || peak > 0 || refused > 0 {
+			st.HandshakeInFlight, st.HandshakePeak, st.HandshakeRefused = inFlight, peak, refused
 		}
 		if rs := s.relay.Load(); rs != nil {
 			st.ForwardReady = rs.ready

@@ -1,9 +1,16 @@
 package server
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -41,6 +48,31 @@ type Status struct {
 	Goroutines int `json:"goroutines,omitempty"`
 	// UDPActive 表示当前会话走的是 UDP 数据通道（mode=udp 且客户端已上报端口）。
 	UDPActive bool `json:"udp_active,omitempty"`
+
+	// PID / InstanceID / StartedAt 标明状态是「哪一次启动」写的。
+	// 只看 UpdatedAt 的秒级时间戳，重启前后两个进程可能落在同一秒里，分不出来。
+	PID        int    `json:"pid,omitempty"`
+	InstanceID string `json:"instance_id,omitempty"`
+	StartedAt  string `json:"started_at,omitempty"`
+
+	// 外层 TLS 握手并发。被拒次数异常增长说明有人在用半开握手冲服务端。
+	HandshakeInFlight int    `json:"handshake_in_flight,omitempty"`
+	HandshakePeak     int    `json:"handshake_peak,omitempty"`
+	HandshakeRefused  uint64 `json:"handshake_refused,omitempty"`
+
+	// 文件描述符预算。LimitNPROC=infinity 是进程数上限，不能拿它替代 fd 预算：
+	// 端口转发、TLS 握手、/proc 读取都吃 fd，耗尽后 accept 会持续 EMFILE。
+	// FDKnown=false 表示这次没读到，而不是「用了 0 个」。
+	FDUsed  int   `json:"fd_used"`
+	FDLimit int64 `json:"fd_limit,omitempty"`
+	FDKnown bool  `json:"fd_known,omitempty"`
+
+	// TUN 丢包：ip -s link 的 dropped 列。txqueuelen=2000 只是待测缓冲，
+	// 各层（TUN、槽位队列、转发器）的丢包要分开看才知道是谁在丢。
+	// TUNDropsKnown=false 表示这次没读到，不代表丢包为 0。
+	TUNRxDropped  uint64 `json:"tun_rx_dropped,omitempty"`
+	TUNTxDropped  uint64 `json:"tun_tx_dropped,omitempty"`
+	TUNDropsKnown bool   `json:"tun_drops_known,omitempty"`
 }
 
 // reportStatus 每 5 秒刷新一次状态文件，超过这个阈值就说明写它的进程已经不在了。
@@ -92,4 +124,121 @@ func ReadStatus() (Status, error) {
 		return Status{}, err
 	}
 	return st, nil
+}
+
+// stateCommandBudget 是读状态用的外部命令预算。状态读取失败必须能被区分出来，
+// 不能让「读不到」静静变成 0（那会显示成「一切健康」）。
+const stateCommandBudget = 2 * time.Second
+
+// runCommand 在预算内跑一条命令。超时/失败都返回 error，由调用方把 known 置 false；
+// 空输出是合法的「真的是 0」，不能和失败混为一谈。
+func runCommand(ctx context.Context, budget time.Duration, name string, args ...string) ([]byte, error) {
+	cctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, name, args...).Output()
+	if cctx.Err() == context.DeadlineExceeded {
+		return out, fmt.Errorf("%s 超时（预算 %v）", name, budget)
+	}
+	return out, err
+}
+
+// parseMaxOpenFiles 从 /proc/self/limits 的文本里取 soft 上限。
+// "unlimited" 记为 -1；没有这一行说明格式不对，不假装解析成功。
+func parseMaxOpenFiles(r io.Reader) (int64, bool) {
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		if !strings.HasPrefix(sc.Text(), "Max open files") {
+			continue
+		}
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 4 {
+			return 0, false
+		}
+		soft := fields[3]
+		if strings.EqualFold(soft, "unlimited") {
+			return -1, true
+		}
+		n, err := strconv.ParseInt(soft, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	}
+	return 0, false
+}
+
+// readProcFDUsage 数当前进程打开的 fd，并取 limits 里的 soft 上限。
+//
+// 目录本身在读取时也占一个 fd，所以结果可能比「稳定态」多 1；对容量预警没有影响。
+func readProcFDUsage(procRoot string) (used int, limit int64, err error) {
+	entries, err := os.ReadDir(filepath.Join(procRoot, "self", "fd"))
+	if err != nil {
+		return 0, 0, err
+	}
+	raw, err := os.ReadFile(filepath.Join(procRoot, "self", "limits"))
+	if err != nil {
+		return 0, 0, err
+	}
+	limit, ok := parseMaxOpenFiles(strings.NewReader(string(raw)))
+	if !ok {
+		return 0, 0, fmt.Errorf("%s 里没有 Max open files 行", filepath.Join(procRoot, "self", "limits"))
+	}
+	return len(entries), limit, nil
+}
+
+// runStateCommand 留成变量，测试才能用假输出验证解析，而不依赖机器上真有 ip 命令。
+var runStateCommand = runCommand
+
+// readTunDrops 读 TUN 网卡的丢包计数（ip -s link 的 dropped 列）。
+func readTunDrops(ctx context.Context, device string) (rx, tx uint64, err error) {
+	out, err := runStateCommand(ctx, stateCommandBudget, "ip", "-s", "link", "show", "dev", device)
+	if err != nil {
+		return 0, 0, fmt.Errorf("读 %s 的丢包计数: %w", device, err)
+	}
+	rx, tx, ok := parseIPLinkDrops(string(out))
+	if !ok {
+		return 0, 0, fmt.Errorf("%s 的 ip -s link 输出里没有 RX/TX 统计", device)
+	}
+	return rx, tx, nil
+}
+
+// parseIPLinkDrops 解析 ip -s link 的统计块：RX/TX 标题行的下一行，
+// 第 4 个字段是 dropped。标题行和数字行缺一都算读不到。
+func parseIPLinkDrops(out string) (rx, tx uint64, ok bool) {
+	var (
+		seenRX, seenTX bool
+		want           byte
+	)
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "RX:") {
+			want = 'r'
+			continue
+		}
+		if strings.HasPrefix(line, "TX:") {
+			want = 't'
+			continue
+		}
+		if want == 0 {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			want = 0
+			continue
+		}
+		dropped, err := strconv.ParseUint(fields[3], 10, 64)
+		if err != nil {
+			want = 0
+			continue
+		}
+		if want == 'r' {
+			rx, seenRX = dropped, true
+		} else {
+			tx, seenTX = dropped, true
+		}
+		want = 0
+	}
+	return rx, tx, seenRX && seenTX
 }

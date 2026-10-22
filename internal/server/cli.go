@@ -401,6 +401,15 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 	running := statusErr == nil && st.Fresh()
 	if running {
 		fmt.Fprintf(stdout, "\n隧道进程    : 运行中（状态更新于 %s）\n", st.UpdatedAt)
+		if st.PID > 0 {
+			fmt.Fprintf(stdout, "进程        : PID %d，启动于 %s（实例 %s）\n",
+				st.PID, st.StartedAt, st.InstanceID)
+		}
+		fmt.Fprintln(stdout, fdUsageLine(st))
+		fmt.Fprintln(stdout, tunDropsLine(st))
+		if line := handshakeLine(st); line != "" {
+			fmt.Fprintln(stdout, line)
+		}
 		if st.Client != "" {
 			fmt.Fprintf(stdout, "已接入节点  : %s（自 %s）\n", st.Client, st.ConnectedAt)
 			if st.Members > 1 {
@@ -464,4 +473,35 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 	// 而不是让它挂到拨号超时。不写这一句，运维看到端口开着会以为转发是好的。
 	fmt.Fprintln(stdout, "  注意：节点机未接入时，外部连接会被立即关闭（不挂超时）")
 	return 0
+}
+
+// fdUsageLine 报 fd 预算。读不到时明说未知：写 «0 个» 会让人以为一切正常。
+func fdUsageLine(st Status) string {
+	if !st.FDKnown {
+		return "文件描述符  : 未知（读不到 /proc/self/fd 或 limits）"
+	}
+	limit := strconv.FormatInt(st.FDLimit, 10)
+	if st.FDLimit < 0 {
+		limit = "unlimited"
+	}
+	return fmt.Sprintf("文件描述符  : %d / %s（LimitNPROC 再大也替代不了 fd 预算）", st.FDUsed, limit)
+}
+
+// tunDropsLine 报网卡各层的丢包。txqueuelen=2000 只是待测缓冲，
+// 真正卡没卡死要看这里的 dropped 在不在涨。
+func tunDropsLine(st Status) string {
+	if !st.TUNDropsKnown {
+		return "TUN 丢包    : 未知（这次没读到 ip -s link）"
+	}
+	return fmt.Sprintf("TUN 丢包    : 收 %d / 发 %d（ip -s link 的 dropped）",
+		st.TUNRxDropped, st.TUNTxDropped)
+}
+
+// handshakeLine 只在有数据时显示：服务端没被握手冲击过就别占一行。
+func handshakeLine(st Status) string {
+	if st.HandshakeInFlight == 0 && st.HandshakePeak == 0 && st.HandshakeRefused == 0 {
+		return ""
+	}
+	return fmt.Sprintf("TLS 握手    : 当前 %d，峰值 %d，拒绝 %d 次（并发上限 %d）",
+		st.HandshakeInFlight, st.HandshakePeak, st.HandshakeRefused, handshakeMaxConcurrent)
 }
