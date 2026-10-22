@@ -308,6 +308,11 @@ var attrKeyLabels = map[string]string{
 	"len":         "长度",
 	"max":         "上限",
 	"idle":        "空闲",
+	// 丢包分类：一个总数涨上去分不清是哪一层丢的，四类必须分开读。
+	"drop_pktch":  "队列满",
+	"drop_empty":  "空槽",
+	"drop_queue":  "槽队列",
+	"drop_member": "摘槽",
 }
 
 // WithAttrs / WithGroup 在本项目里用不到（都是直接 slog.Info/Warn/Error），

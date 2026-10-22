@@ -108,7 +108,7 @@ func TestEnqueueDropsWhenFullWithoutBlocking(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("队列满时 enqueue 阻塞了调用方")
 	}
-	dropped := sess.slotQueueDrops[1].Load()
+	dropped := sess.tunnel.Drops.SlotQueueFull.Load()
 	if dropped == 0 {
 		t.Fatal("队列满了却没有记录丢弃次数")
 	}

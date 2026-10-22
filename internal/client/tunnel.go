@@ -120,11 +120,30 @@ func Backoff(attempt int) time.Duration {
 	return d
 }
 
+// DropStats 按原因分类的上行丢包计数。
+//
+// 以前只有一个 pktDrops，涨上去分不清是网卡读循环跟不上、目标槽是空的、还是某条
+// 成员连接的写队列满了 —— 三种原因的修法完全不同。Codex 分析第 14 节也指出，
+// 按原因分类是定位「线路问题 vs 本机问题 vs 应用问题」的前提。
+type DropStats struct {
+	// PktChFull 是网卡读到的包进不了 pktCh（读循环比分发快，下行处理跟不上）。
+	PktChFull atomic.Int64
+	// EmptySlot 是批次的目标槽是空的（成员断了或正在补拨）。
+	EmptySlot atomic.Int64
+	// SlotQueueFull 是槽位在、但该槽的写队列满（那条成员写不动）。
+	SlotQueueFull atomic.Int64
+	// MemberDrop 是成员连接被摘掉的次数（含主动摘除与对端断开）。
+	MemberDrop atomic.Int64
+}
+
 type Tunnel struct {
 	inv   pki.Invite
 	dev   Device
 	log   *slog.Logger
 	Stats Stats
+
+	// Drops 是上行丢包的分原因计数，长期持平才算健康。
+	Drops DropStats
 
 	// RebuildDevice 在适配器被外力干掉时由重连循环调用（App 注入完整重连）。
 	// 它会 cancel 本循环，所以调用后循环直接退出；nil 则退回普通退避重试。
@@ -152,10 +171,6 @@ type Tunnel struct {
 	// 面板显示在线、延迟也正常，但上行早就停止搬运了 —— 直到别的方向偶然报错才重连。
 	// 带缓冲 1：读循环挂掉后塞一次就退出，不会阻塞。
 	readErr chan error
-
-	// pktDrops 是「上行队列满、网卡读到的包被丢弃」的次数。
-	// 正常情况下它一直是 0；涨起来说明下游处理跟不上，是"越用越慢/没网"的第一现场。
-	pktDrops atomic.Int64
 
 	// udpCh 指向当前会话的 UDP 数据通道（UDP 模式才有），会话结束清空。
 	//
@@ -209,6 +224,9 @@ func sessionEndInfo(err error) (slog.Level, string) {
 		return slog.LevelWarn, "连接被拒绝（服务端未运行或端口未放行）"
 	case strings.Contains(msg, "timeout"):
 		return slog.LevelWarn, "网络超时"
+	case strings.Contains(msg, "UDP 数据通道"):
+		// 数据面失效但控制连接还在：会话不等用户发包就会重建
+		return slog.LevelWarn, "UDP 数据通道失效（正在重建）"
 	case strings.Contains(msg, "reset"):
 		return slog.LevelWarn, "连接被重置"
 	default:
@@ -440,7 +458,7 @@ func (t *Tunnel) readPump(ctx context.Context, onFatal context.CancelFunc) {
 		default:
 			// 丢一两个包是常态（调度抖动），持续丢才说明下游真的跟不上。
 			// 阈值取 100：一次突发就能丢几十个，报到用户面前必须是「一直在丢」。
-			if n := t.pktDrops.Add(1); n == 100 || n%1000 == 0 {
+			if n := t.Drops.PktChFull.Add(1); n == 100 || n%1000 == 0 {
 				t.log.Warn(fmt.Sprintf("上行拥塞，累计丢弃 %d 个包", n))
 			}
 		}
@@ -665,7 +683,6 @@ func newClientSession(t *Tunnel, conn net.Conn, sid string, tlsCfg *tls.Config, 
 	for i := range sess.slotTx {
 		sess.slotTx[i] = make(chan []byte, slotTxLen)
 	}
-	sess.slotQueueDrops = make([]atomic.Int64, n)
 	sess.slots[0] = conn
 	return sess
 }
@@ -683,7 +700,7 @@ func (s *clientSession) enqueue(k int, batch []byte) {
 		return
 	}
 	if k < 0 || k >= len(s.slotTx) {
-		s.emptySlotDrops.Add(1)
+		s.tunnel.Drops.EmptySlot.Add(1)
 		return
 	}
 	// 批缓冲由 pumpFromDevice 复用，投递后马上会被覆盖，所以必须在这里拷一份。
@@ -692,7 +709,7 @@ func (s *clientSession) enqueue(k int, batch []byte) {
 	select {
 	case s.slotTx[k] <- cp:
 	default:
-		n := s.slotQueueDrops[k].Add(1)
+		n := s.tunnel.Drops.SlotQueueFull.Add(1)
 		if n == 100 || n%1000 == 0 {
 			s.log.Warn(fmt.Sprintf("槽位写队列满，上行在丢（槽 %d，丢 %d 批）", k, n))
 		}
@@ -737,14 +754,6 @@ type clientSession struct {
 	trace   *OrderTracer    // 联调顺序追踪（nil = 关闭）
 	ctx     context.Context // 会话上下文（run 里赋值），收尾时用来判断写失败是否预期内
 
-	// memberDrops 是本会话成员连接被摘掉的次数（含主动摘除与对端断开）。
-	// 日志里带上它，用户一眼能看出「这一晚掉了几次」，不用数滚动条。
-	memberDrops atomic.Int32
-
-	// emptySlotDrops 是「所有成员槽都不可用、上行批次被迫丢弃」的批次数。
-	// 正常情况下它一直是 0；涨起来就说明成员全断了在等补拨，业务正在黑洞。
-	emptySlotDrops atomic.Int64
-
 	// closed 是本会话的关闭信号：run 返回后由 closeAll 关闭，让还阻塞在设备读上、
 	// 或正要往旧连接写包的 goroutine 能自己退出。设备跨会话复用、不能靠关设备来收尾。
 	closed    chan struct{}
@@ -760,10 +769,6 @@ type clientSession struct {
 	// （单次写超时 20 秒），其他健康成员的上行也发不出去，64 个包的 pktCh 随即填满
 	// 开始丢包。服务端早就是每槽独立 writer（sc.writeLoop），客户端一直缺这一层。
 	slotTx []chan []byte
-
-	// slotQueueDrops 记录每槽因写队列满被丢掉的批数。和 emptySlotDrops 分开：
-	// 那个是「槽位空」，这个是「槽位在但写不动」，排障时是两回事。
-	slotQueueDrops []atomic.Int64
 
 	// flow 决定上行包走哪个槽：已有流固定不变（保序），新流分给当前承载流数最少的槽。
 	// 纯哈希做不到均衡，一条大流会把某条成员连接塞到写超时被摘掉。
@@ -1056,7 +1061,7 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 				// 否则同一件事会打两条（一条信息一条警告），读起来像两个故障。
 				t.log.Debug("成员连接已摘除", "member", k)
 			} else {
-				n := sess.memberDrops.Add(1)
+				n := sess.tunnel.Drops.MemberDrop.Add(1)
 				t.log.Warn("成员连接断开", "member", k, "reason", reason,
 					"drops", n, "live", sess.liveCount())
 			}
@@ -1204,6 +1209,8 @@ func (s *clientSession) run(ctx context.Context) error {
 	go func() { errCh <- s.pumpFromDevice(ctx) }()
 	go func() { errCh <- s.heartbeat(ctx) }()
 	go s.watchDataPath(ctx)
+	// UDP 模式下数据面可能先于控制连接失效：主动盯通道关闭，别等下一个上行包撞上去
+	go s.watchUDP(ctx, errCh)
 	// 到点主动结束会话，交给 Run 重开一次。只在真出错（到点）时投递：ctx 正常取消
 	// 时它返回 nil，把 nil 塞进 errCh 会被当成「某个协程正常收尾」，进而让 Run 走上
 	// 「runCtx 已取消 → 立即重连」那条路，形成无退避的重连风暴。
@@ -1358,11 +1365,11 @@ func (s *clientSession) watchDataPath(ctx context.Context) {
 			// 再写进日志会让这一行折成三截。
 			if noRxSamples == 2 || (noRxSamples > 2 && noRxSamples%10 == 0) {
 				s.log.Warn(fmt.Sprintf("数据面单向：有上行无下行（连接 %d/%d，丢 %d 批）",
-					live, s.members, s.emptySlotDrops.Load()))
+					live, s.members, s.tunnel.Drops.EmptySlot.Load()))
 			}
 			if lowMemberSamples == 2 || (lowMemberSamples > 2 && lowMemberSamples%20 == 0) {
 				s.log.Warn(fmt.Sprintf("成员不足，上行在丢（连接 %d/%d，丢 %d 批）",
-					live, s.members, s.emptySlotDrops.Load()))
+					live, s.members, s.tunnel.Drops.EmptySlot.Load()))
 			}
 
 			lastTx, lastRx = tx, rx
@@ -1496,7 +1503,7 @@ func flushBatch(s *clientSession, k int, batch []byte) error {
 		// 文案要短到一行放得下：原来那条约 90 宽度，界面上被截成「内层 TCP 会重传）…」，
 		// 关键的两个数字（几条连上、丢了多少批）反而看不见。和 watchDataPath 里
 		// 同类告警用同一句话，两个场景看起来才是一回事。
-		n := s.emptySlotDrops.Add(1)
+		n := s.tunnel.Drops.EmptySlot.Add(1)
 		if n == 200 || (n > 200 && n%1000 == 0) {
 			s.log.Warn(fmt.Sprintf("成员不足，上行在丢（连接 %d/%d，丢 %d 批）",
 				s.liveCount(), s.members, n))
@@ -1522,7 +1529,7 @@ func flushBatch(s *clientSession, k int, batch []byte) error {
 			// dropSlot 会关连接、读循环随后也会失败，但那边按 reason=="本端关闭"
 			// 降级成 Debug，所以断开这件事只在这里 Warn 一次。
 			s.dropSlot(actual, conn)
-			n := s.memberDrops.Add(1)
+			n := s.tunnel.Drops.MemberDrop.Add(1)
 			s.log.Warn("成员连接写不动，已摘除", "slot", actual,
 				"reason", connBrokenReason(werr), "drops", n)
 			return nil

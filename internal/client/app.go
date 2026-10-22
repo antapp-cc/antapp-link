@@ -911,8 +911,11 @@ func (a *App) UpdateInvite(inv pki.Invite, source string) error {
 
 // watchRunStats 每 10 分钟记录一次运行状态，供「用着用着没网」定位用。
 //
-// 只记可能单调上涨的量：goroutine 数、堆内存、上行队列丢弃次数、累计流量。正常情况
-// 下它们应该长期持平（流量除外）；哪一项一直涨，问题就在那一块。
+// 只记可能单调上涨的量：goroutine 数、堆内存、上行丢包、累计流量。正常情况下它们
+// 应该长期持平（流量除外）；哪一项一直涨，问题就在那一块。
+//
+// 丢包按原因分开报：一个总数涨上去分不清是网卡读循环跟不上、目标槽是空的、还是
+// 某条成员连接的写队列满了 —— 三种原因的修法完全不同。
 func (a *App) watchRunStats(ctx context.Context, tun *Tunnel) {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
@@ -927,8 +930,21 @@ func (a *App) watchRunStats(ctx context.Context, tun *Tunnel) {
 				"goroutines", runtime.NumGoroutine(),
 				"heap_mb", m.HeapAlloc/1024/1024,
 				"rx_mb", tun.Stats.RxBytes.Load()/1024/1024,
-				"tx_mb", tun.Stats.TxBytes.Load()/1024/1024,
-				"pkt_drops", tun.pktDrops.Load())
+				"tx_mb", tun.Stats.TxBytes.Load()/1024/1024)
+
+			// 四个分类挤在「运行状态」那行会有 88 宽度，界面上被截断，所以单独一条；
+			// 全为 0 时不打 —— 正常情况下它们本来就该一直是 0，没必要十分钟刷一次。
+			dPkt := tun.Drops.PktChFull.Load()
+			dEmpty := tun.Drops.EmptySlot.Load()
+			dQueue := tun.Drops.SlotQueueFull.Load()
+			dMember := tun.Drops.MemberDrop.Load()
+			if dPkt > 0 || dEmpty > 0 || dQueue > 0 || dMember > 0 {
+				a.log.Info("丢包统计",
+					"drop_pktch", dPkt,
+					"drop_empty", dEmpty,
+					"drop_queue", dQueue,
+					"drop_member", dMember)
+			}
 		}
 	}
 }
