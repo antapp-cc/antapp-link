@@ -1394,10 +1394,14 @@ func flushBatch(s *clientSession, k int, batch []byte) error {
 		// 用户会以为出了故障（已经有人这么问过）。
 		//
 		// 持续丢到 200 批以上才 Warn —— 那说明成员是真的补不上，不是启动瞬间。
+		//
+		// 文案要短到一行放得下：原来那条约 90 宽度，界面上被截成「内层 TCP 会重传）…」，
+		// 关键的两个数字（几条连上、丢了多少批）反而看不见。和 watchDataPath 里
+		// 同类告警用同一句话，两个场景看起来才是一回事。
 		n := s.emptySlotDrops.Add(1)
 		if n == 200 || (n > 200 && n%1000 == 0) {
-			s.log.Warn("成员槽长时间不可用，上行数据持续丢弃（内层 TCP 会重传）",
-				"slot", k, "dropped_batches", n)
+			s.log.Warn(fmt.Sprintf("成员不足，上行在丢（连接 %d/%d，丢 %d 批）",
+				s.liveCount(), s.members, n))
 		}
 		return nil
 	}
