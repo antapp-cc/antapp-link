@@ -99,7 +99,10 @@ $guide = @"
 
   1. 到 https://github.com/$Repo/releases/new 新建 Release
   2. Tag 填：$tag      （必须和 latest.json 里的 url 一致）
-  3. 标题随便写，比如：AntApp Link $Version
+  3. 标题必须写成：AntApp Link $Version
+     Release 列表直接显示这个标题，历史版本全是 "AntApp Link X.Y.Z" 的格式；
+     只写版本号会在列表里显得和别的格格不入（0.4.9 / 0.4.10 就这样翻过一次车）。
+     gh CLI 用法：gh release create $tag --title "AntApp Link $Version" ...
   4. 把下面五个文件作为附件传上去（文件名不要改）：
        antapp-link.exe
        antapp-linkd
