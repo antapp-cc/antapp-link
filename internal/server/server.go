@@ -685,7 +685,7 @@ func (s *Server) serveSession(ctx context.Context, sess *session) {
 			case proto.TypeUDPPort:
 				// 客户端上报自己的 UDP 数据口：从这里开始，数据包改走 UDP。
 				if s.udp == nil {
-					s.log.Warn("收到 UDP 端口上报但没有 UDP 通道（服务端不是 udp 模式），忽略",
+					s.log.Warn("收到 UDP 端口上报，但服务端不是 udp 模式，已忽略",
 						"client", sess.name)
 					continue
 				}

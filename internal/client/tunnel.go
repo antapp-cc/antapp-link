@@ -332,7 +332,7 @@ func (t *Tunnel) Run(ctx context.Context) error {
 			// 适配器被外力干掉（系统停用/移除/驱动重置）时，重拨 TCP 救不了 ——
 			// 必须重建整个设备与网络配置。交给 App 的完整重连，本循环随之退出。
 			if errors.Is(err, ErrAdapterDead) && t.RebuildDevice != nil {
-				t.log.Warn("虚拟网卡已失效（可能被系统或其他软件停用），自动重建设备并重连……")
+				t.log.Warn("虚拟网卡失效（被停用或移除），自动重建设备")
 				go t.RebuildDevice()
 				return nil
 			}
