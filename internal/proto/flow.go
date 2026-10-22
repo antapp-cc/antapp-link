@@ -18,13 +18,18 @@ import (
 //
 // 已知限制：表只增不减，到 maxFlows 之后新流一律退回纯哈希。老条目不能随便淘汰 ——
 // 淘汰谁就等于让那条流换槽、内层 TCP 乱序；要按最后活跃时间淘汰，也得先能确定那条流
-// 已经结束。所以在内层短连接极多的长会话里，均衡能力会逐渐退化。另外新流选槽是
-// O(表大小) 且持全局锁，端口扫描式的负载下会成为热点。都属于后续工作。
+// 已经结束。所以在内层短连接极多的长会话里，均衡能力会逐渐退化。新流选槽仍持全局锁，
+// 高并发建流时是串行的，属于后续工作。
 type FlowTable struct {
 	mu    sync.Mutex
 	m     map[flowKey]int
 	max   int
 	lastN int
+	// counts[s] 是映射到槽 s 的流数。之所以要单独记：新流分配原先是遍历整张映射
+	// 数一遍，表接近上限后每条新流都是 O(表大小)，累计 O(N²)。计数只随单条映射
+	// 增减而变，选槽就只剩 O(槽数)；计数一旦漂移，某个槽会永远选不到，所以每条
+	// 改映射的路径都必须同步维护它。
+	counts []int
 }
 
 // maxFlows 是流表容量上限。每条约 40 字节，两万条约 800KB，对两端都不算负担。
@@ -64,6 +69,9 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 	// 成员数变了（正常一个会话内不会变，这是防御）：映射里指向已不存在槽的条目必须
 	// 处理，否则会越界。但**绝不能整表清空** —— 那会让还在有序传输的流换槽，内层 TCP
 	// 直接乱序。只删落在被移除槽上的那些：它们的包本来就已经发不出去（槽没了）。
+	//
+	// 计数只在槽集合变化时按映射重建：这一步仍是 O(表大小)，但成员补拨很少发生；平时
+	// 每次分配只碰单条计数，不再扫全表。
 	if t.lastN != n {
 		for k, s := range t.m {
 			if s >= n {
@@ -71,6 +79,16 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 			}
 		}
 		t.lastN = n
+		t.counts = growCounts(t.counts, n)
+		clear(t.counts)
+		for _, s := range t.m {
+			if s > 0 && s < n {
+				t.counts[s]++
+			}
+		}
+	} else if len(t.counts) < n {
+		// 零值或手工构造的表可能没走过上面的重建，补齐长度即可，计数全零也是对的。
+		t.counts = growCounts(t.counts, n)
 	}
 
 	if s, ok := t.m[key]; ok {
@@ -84,6 +102,7 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 			return s
 		}
 		delete(t.m, key)
+		t.counts[s]--
 		// 落到下面重新选槽
 	}
 	// 表满：新流不插入（老流的映射绝不能动 —— 那会让内层 TCP 乱序），但仍必须
@@ -93,18 +112,12 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 		return hashToAlive(payload, n, alive)
 	}
 
-	counts := make([]int, n)
-	for _, s := range t.m {
-		if s > 0 && s < n {
-			counts[s]++
-		}
-	}
 	best := 0
 	for i := 1; i < n; i++ {
 		if alive != nil && !alive(i) {
 			continue
 		}
-		if best == 0 || counts[i] < counts[best] {
+		if best == 0 || t.counts[i] < t.counts[best] {
 			best = i
 		}
 	}
@@ -117,7 +130,16 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 		return Slot(payload, n)
 	}
 	t.m[key] = best
+	t.counts[best]++
 	return best
+}
+
+// growCounts 保证计数切片至少覆盖 n 个槽，已有计数原样保留。
+func growCounts(c []int, n int) []int {
+	if len(c) < n {
+		c = append(c, make([]int, n-len(c))...)
+	}
+	return c
 }
 
 // hashToAlive 用纯哈希定一个起点，再沿环找到第一个活槽。
