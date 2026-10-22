@@ -449,6 +449,17 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 	default:
 		fmt.Fprintln(stdout, "  转发器      : 尚未就绪（隧道进程刚启动，状态还没刷新）")
 	}
+	// 这批端口对公网开放，互联网扫描器会连上来且不发数据。它们会一直占着搬运
+	// 协程（实测同时挂过 25~36 条，服务端 goroutine 从 28 涨到 138），所以把在途
+	// 数摆出来 —— 异常增长时不用再手工数 ss。
+	if st.ForwardActive > 0 || st.ForwardRejected > 0 {
+		fmt.Fprintf(stdout, "  在途连接    : %d 条（本次启动累计 %d 条，超限拒绝 %d 条）\n",
+			st.ForwardActive, st.ForwardTotal, st.ForwardRejected)
+		if st.ForwardIdle > 0 {
+			fmt.Fprintf(stdout, "  静默清理    : 上轮清掉 %d 条（超过 %v 无数据）\n",
+				st.ForwardIdle, relayIdleTimeout)
+		}
+	}
 	// 「端口在监听」不等于「转发能用」：节点机没接入时转发器会立刻关掉外部连接，
 	// 而不是让它挂到拨号超时。不写这一句，运维看到端口开着会以为转发是好的。
 	fmt.Fprintln(stdout, "  注意：节点机未接入时，外部连接会被立即关闭（不挂超时）")

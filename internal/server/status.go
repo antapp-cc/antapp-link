@@ -29,6 +29,13 @@ type Status struct {
 	// ForwardKnown 区分「状态文件是旧版 daemon 写的」与「新版刚启动还没刷新」。
 	// 前者读出来是零值，不能据此替 daemon 宣称转发没起来。
 	ForwardKnown bool `json:"forward_known,omitempty"`
+	// 转发连接计数。这批端口对公网开放，扫描器连上后既不发送也不关闭，
+	// 会一直占着搬运协程（实测同时挂过 25~36 条）。把它们放进状态文件，
+	// 异常增长在 status 里就能看见，不必事后数 ss 才知道出了什么事。
+	ForwardActive   int `json:"forward_active,omitempty"`
+	ForwardTotal    int `json:"forward_total,omitempty"`
+	ForwardRejected int `json:"forward_rejected,omitempty"`
+	ForwardIdle     int `json:"forward_idle,omitempty"`
 	// Goroutines 是写状态那一刻的 goroutine 数。长期盯它有没有单调上涨，
 	// 比事后查 pprof 更容易发现「每次重连泄漏一点」这类问题。
 	Goroutines int `json:"goroutines,omitempty"`

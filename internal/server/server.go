@@ -79,6 +79,9 @@ type Server struct {
 	fatal chan error
 	// 端口转发监听结果，nil 表示还没跑起来；status 据此报真实可用性
 	relay atomic.Pointer[relayState]
+	// 转发器的在途连接计数。这批端口对公网开放，扫描器会一直挂上来，
+	// 光看 goroutine 数只能事后发现；把它写进状态文件才能当场看出异常。
+	relayStat atomic.Pointer[relayStats]
 
 	// udp 是 UDP 数据通道的多路复用器（mode=udp 时才有）。控制仍走 TCP，数据包走它。
 	udp *udpMux
@@ -146,7 +149,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	// relay 若还是 nil，ForwardKnown 就是 false —— status 子命令会把这当成「状态文件
 	// 来自旧版本」，而其实只是刚启动。
 	// tunnelUp 传进去：节点机不在线时转发器直接关连接，不去拨一个没人接的地址
-	stopRelay, err := startPortRelay(runCtx, cfg, logger, func() bool { return s.currentSession() != nil })
+	stopRelay, relayStat, err := startPortRelay(runCtx, cfg, logger, func() bool { return s.currentSession() != nil })
 	if err != nil {
 		// 不走 connLogAttrs：它把 "address already in use" 翻成人话后会把原始 err
 		// 吞掉，而这里的 err 带着失败的转发端口号，正是排障要看的东西。listen 字段
@@ -156,6 +159,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		s.relay.Store(&relayState{err: err.Error()})
 	} else {
 		s.relay.Store(&relayState{ready: true})
+		s.relayStat.Store(relayStat)
 		defer stopRelay()
 	}
 	go s.reportStatus(runCtx)
@@ -812,6 +816,13 @@ func (s *Server) reportStatus(ctx context.Context) {
 			st.ForwardReady = rs.ready
 			st.ForwardError = rs.err
 			st.ForwardKnown = true
+		}
+		if rstat := s.relayStat.Load(); rstat != nil {
+			active, total, rejected, idle := rstat.snapshot()
+			st.ForwardActive = active
+			st.ForwardTotal = total
+			st.ForwardRejected = rejected
+			st.ForwardIdle = idle
 		}
 		if sess := s.currentSession(); sess != nil {
 			st.Client = sess.name

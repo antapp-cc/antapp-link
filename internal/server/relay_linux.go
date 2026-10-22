@@ -22,10 +22,14 @@ import (
 // tunnelUp 报告隧道链路是否还在。节点机不在线时不拨号：拨号的目标地址在 tun 上，
 // 没人读网卡就是空转 SYN 重传，外部连接还要挂在云服等满拨号超时（实测节点机离线
 // 期间云服堆着 84 条 SYN-SENT、每秒几十个白跑的包）。
-func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp func() bool) (func(), error) {
+//
+// 返回的 *relayStats 让 reportStatus 把在途连接数写进状态文件：这批端口对公网开放，
+// 互联网扫描器会一直连上来且不发送数据，只看 goroutine 数才知道出了什么事。
+func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp func() bool) (func(), *relayStats, error) {
 	var (
 		listeners []net.Listener
-		active    = map[net.Conn]struct{}{}
+		active    = map[*relayConn]struct{}{}
+		st        = &relayStats{}
 		mu        sync.Mutex
 		stopped   bool
 	)
@@ -45,7 +49,7 @@ func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp 
 			_ = c.Close()
 		}
 	}
-	track := func(c net.Conn) bool {
+	track := func(c *relayConn) bool {
 		mu.Lock()
 		defer mu.Unlock()
 		if stopped {
@@ -54,14 +58,50 @@ func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp 
 		active[c] = struct{}{}
 		return true
 	}
-	untrack := func(c net.Conn) {
+	untrack := func(c *relayConn) {
 		mu.Lock()
 		delete(active, c)
 		mu.Unlock()
+		st.onClosed()
 	}
 	go func() {
 		<-ctx.Done()
 		stop()
+	}()
+
+	// 清扫静默连接。没有它，一条「连上但不发数据」的连接会永久占着两个搬运协程：
+	// handleRelayConn 的 <-done; <-done 没有任何超时，而扫描器正是连上就不动。
+	go func() {
+		t := time.NewTicker(relaySweepEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				now := time.Now()
+				// 先在锁内挑出目标，再出锁关闭：Close 会唤醒阻塞中的 io.Copy，
+				// 那条协程的 defer untrack 回来抢同一把锁，持锁关闭就自己和自己死锁。
+				mu.Lock()
+				var victims []*relayConn
+				for rc := range active {
+					if rc.idleFor(now) > relayIdleTimeout {
+						victims = append(victims, rc)
+					}
+				}
+				stillIdle := int64(len(victims))
+				mu.Unlock()
+
+				for _, rc := range victims {
+					_ = rc.Close()
+				}
+				st.setIdle(stillIdle)
+				if stillIdle > 0 {
+					log.Info("清理静默的转发连接",
+						"count", stillIdle, "idle_timeout", relayIdleTimeout)
+				}
+			}
+		}
 	}()
 
 	clientAddr := cfg.Tunnel.ClientIP
@@ -70,7 +110,7 @@ func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp 
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err != nil {
 			stop()
-			return nil, fmt.Errorf("监听转发端口 %d: %w", port, err)
+			return nil, nil, fmt.Errorf("监听转发端口 %d: %w", port, err)
 		}
 		mu.Lock()
 		listeners = append(listeners, ln)
@@ -81,24 +121,37 @@ func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp 
 				if err != nil {
 					return // 监听已关闭
 				}
+				st.onAccept()
 				if tunnelUp != nil && !tunnelUp() {
 					// 隧道不可用就别拨号：外部立刻拿到连接关闭，不必挂到超时
 					_ = conn.Close()
 					continue
 				}
+				mu.Lock()
+				full := len(active) >= relayMaxActive
+				mu.Unlock()
+				if full {
+					// 这些端口对公网开放，扫描器能把连接数推到很高。拒绝比让它
+					// 把 fd 和协程吃光好 —— 真节点会自己重试，晚几秒不影响共识。
+					st.onRejected()
+					_ = conn.Close()
+					continue
+				}
+				rc := newRelayConn(conn)
 				target := net.JoinHostPort(clientAddr, fmt.Sprint(port))
 				go func() {
-					if !track(conn) {
-						_ = conn.Close() // 已经在收尾了，别再搬
+					if !track(rc) {
+						_ = rc.Close() // 已经在收尾了，别再搬
 						return
 					}
-					defer untrack(conn)
-					handleRelayConn(conn, target, log)
+					st.onActive()
+					defer untrack(rc)
+					handleRelayConn(rc, target, log)
 				}()
 			}
 		}()
 	}
-	return stop, nil
+	return stop, st, nil
 }
 
 // handleRelayConn 双向搬运一条转发连接。任一方向出错即整条关闭。
