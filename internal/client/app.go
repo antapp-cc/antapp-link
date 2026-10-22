@@ -487,7 +487,33 @@ func (a *App) hotApplyRouteTable() {
 	if !running || gw == "" || ifIndex == 0 || refreshSplitRoutesHook == nil {
 		return
 	}
+
+	// 和还原/迁移互斥。用 TryLock 而不是 Lock：热重铺是后台定时任务，晚一轮
+	// 无所谓；如果阻塞等锁，一次正在进行的还原会让这个协程积压一堆待铺的表。
+	if !netTxnMu.TryLock() {
+		return
+	}
+	defer netTxnMu.Unlock()
+
+	// 排队期间网络可能已经被还原过 —— 此时再把分流路由铺回去，用户点了断开
+	// 却发现流量还在走隧道。代际变了就直接放弃。
+	epoch := netEpoch.Load()
+	if !a.stillRunning() {
+		return
+	}
 	refreshSplitRoutesHook(gw, ifIndex, table)
+	if netEpoch.Load() != epoch {
+		// 铺到一半被还原抢先了。还原自己也持锁，理论上到不了这里；留个提醒，
+		// 真出现说明锁序出了问题。
+		a.log.Warn("分流热重铺与本轮还原交叠，已放弃本轮")
+	}
+}
+
+// stillRunning 是 hotApplyRouteTable 在持锁后复查运行状态的入口。
+func (a *App) stillRunning() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.running
 }
 
 // watchHealth 在接管网络后确认「真的能出去」，失败就自动回退。
@@ -791,6 +817,12 @@ func (a *App) restoreNetwork(snap Snapshot, cfg NetConfig, noNetCfg bool) error 
 		a.log.Info("已断开")
 		return nil
 	}
+	// 还原是最不能被打断的一件事：它必须拿满锁，并且让还在排队的热重铺
+	// 醒来后发现代际已变、主动放弃。
+	netTxnMu.Lock()
+	defer netTxnMu.Unlock()
+	netEpoch.Add(1)
+
 	if err := snap.Restore(cfg); err != nil {
 		// 留着 state.json：下次启动自愈还会再试一次
 		return fmt.Errorf("还原网络配置失败: %w", err)

@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/antapp-cc/antapp-link/internal/pki"
@@ -220,6 +222,25 @@ func validateIPv4Only(cfg NetConfig) error {
 // splitRouteMetric 是国内直连路由的 route metric。还原时按
 // 「下一跳 = 原默认网关 且 metric = 此值」整批扫除，网段表更新过也能清干净。
 const splitRouteMetric = 5
+
+// netTxnMu 串行化所有网络变更：接管（Apply）、还原（Restore）、网卡迁移
+// （watcher.reconcile）、分流热重铺。
+//
+// 这几个操作改的都是同一批路由和 DNS。以前它们各自读快照、各自写，插入执行会留下
+// 半套配置：比如还原刚撤完走行路由，热重铺又把它们铺回来 —— 用户点了断开，流量却
+// 还在往隧道里走。
+//
+// 锁序：调用方先放掉自己的 a.mu / w.mu，再进这里。netTxnMu 永远是最内层，
+// 不在持它的时候去拿那两把锁。
+var netTxnMu sync.Mutex
+
+// netEpoch 是网络代际，每次还原自增。
+//
+// 光有锁不够：热重铺可能已经拿到锁、正在算要铺哪些前缀，此时还原插不进来，
+// 等热重铺写完才轮到还原 —— 那是安全的。但反过来，热重铺排队等着还原先跑完，
+// 醒来后必须知道「网络已经被还愿过了」，否则会把刚撤掉的路由重新铺上。
+// 它在真正写路由前比一次代际，变了就放弃这一轮。
+var netEpoch atomic.Uint64
 
 // splitOwnership 是本程序实际铺上的国内直连路由。
 //

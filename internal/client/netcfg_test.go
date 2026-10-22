@@ -380,3 +380,27 @@ func TestValidateIPv4OnlyRejectsIPv6(t *testing.T) {
 		})
 	}
 }
+
+// 网络事务锁绝不能被重入。
+//
+// reconcile / hotApplyRouteTable / restoreNetwork 都会拿这把锁。如果哪条路径
+// 在持锁时又调了另一个会拿锁的函数，就会把自己锁死 —— 那种死锁表现为「断开点了
+// 没反应、网络还原卡住」，比崩溃难查得多。这个用例把约束钉住。
+func TestNetTxnLockIsNotReentrant(t *testing.T) {
+	netTxnMu.Lock()
+	defer netTxnMu.Unlock()
+	if netTxnMu.TryLock() {
+		netTxnMu.Unlock()
+		t.Fatal("网络事务锁被重入：持锁期间不该还能拿到它")
+	}
+}
+
+// 还原必须让代际前进，否则排队中的热重铺无法判断「网络已经被撤了」。
+func TestNetEpochAdvances(t *testing.T) {
+	before := netEpoch.Load()
+	netEpoch.Add(1)
+	after := netEpoch.Load()
+	if after != before+1 {
+		t.Fatalf("代际没有前进：%d -> %d", before, after)
+	}
+}

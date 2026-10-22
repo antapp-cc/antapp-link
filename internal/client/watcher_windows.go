@@ -197,6 +197,14 @@ func (w *sessionWatcher) reconcile() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// 和还原/热重铺互斥。用 TryLock：迁移是"出口变了"触发的后台动作，
+	// 晚一轮无非是隧道继续走旧出口几秒钟；如果阻塞等，一次正在进行的还原
+	// 会把 watcher 卡住，期间再来事件就积压了。
+	if !netTxnMu.TryLock() {
+		return
+	}
+	defer netTxnMu.Unlock()
+
 	tunLUID := w.tunLUID()
 	gw, ifIndex, err := bestDefaultRoute(tunLUID)
 	if err != nil || gw.IsUnspecified() {
