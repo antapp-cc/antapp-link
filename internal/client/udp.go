@@ -47,6 +47,9 @@ type udpChannel struct {
 	lastRx atomic.Int64 // UnixNano，判活用
 	closed chan struct{}
 	once   sync.Once
+	// failErr 只在被动失效时写入；读取方必须先等到 closed 关闭（见 failCause），
+	// 所以靠 channel 的 happens-before 就够，不需要再加一把锁。
+	failErr error
 }
 
 // startUDPChannel 建 UDP socket、导出密钥、把本地端口报给服务端，然后起收发循环。
@@ -115,26 +118,57 @@ func startUDPChannel(ctx context.Context, inv pki.Invite, state tls.ConnectionSt
 	return c, nil
 }
 
-// probe 确认 UDP 双向都通：发一个保活包，等服务端的回包刷新 lastRx。
+// udpProbeRetryAt 是首次探测后重发认证空包的时刻（相对首次发送）。
+//
+// 只发一次的实测问题：家宽 NAT 映射刚建立、或服务端还没处理完 UDPPort 登记时，
+// 第一个包就丢了，客户端却立刻判整条 UDP 通道不可用。keepalive 是 15 秒一轮，
+// 覆盖不到这 5 秒的探测窗口 —— 一次普通丢包就够让这次连接失败。
+//
+// 250ms/750ms/1500ms 三档：前两档覆盖「包到了、服务端还没认人」这个窗口，最后一档
+// 再扛一次路径丢包。总预算仍是 5 秒，端口真没放行时不会拖得更久。
+//
+// var 而不是 const：测试把节奏压到毫秒级。
+var udpProbeRetryAt = []time.Duration{
+	250 * time.Millisecond,
+	750 * time.Millisecond,
+	1500 * time.Millisecond,
+}
+
+// probe 确认 UDP 双向都通：在总预算内发几次认证空包，等服务端的加密回包。
+//
+// 只有通过 GCM 认证的回包才算数 —— lastRx 只在 recvLoop 解包成功后刷新，
+// 任何明文/伪造的 UDP 输入都刷不亮它。否则「端口放行了但密钥不对」会被当成健康，
+// 业务包却全被对端丢掉。
 func (c *udpChannel) probe(ctx context.Context, timeout time.Duration) error {
-	start := c.lastRx.Load()
+	baseline := c.lastRx.Load()
+	start := time.Now()
+	deadline := start.Add(timeout)
+
 	if err := c.send(nil); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if c.lastRx.Load() != start {
+	next := 0
+	for {
+		if c.lastRx.Load() != baseline {
 			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("%s 内没收到服务端回包（UDP 端口可能没放行）", timeout)
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-c.closed:
 			return errors.New("UDP 通道已关闭")
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(10 * time.Millisecond):
+		}
+		if next < len(udpProbeRetryAt) && time.Since(start) >= udpProbeRetryAt[next] {
+			next++
+			if err := c.send(nil); err != nil {
+				return err
+			}
 		}
 	}
-	return fmt.Errorf("%s 内没收到服务端回包（UDP 端口可能没放行）", timeout)
 }
 
 // send 把一个 IP 包加密后发出去。并发安全：见 sendMu 的注释。
@@ -210,7 +244,8 @@ func (c *udpChannel) keepalive(ctx context.Context) {
 				// 业务包却一直往一个死掉的 UDP 路径里灌。
 				c.log.Warn("UDP 数据通道连续多个周期收不到回包，关闭并重建",
 					"idle", idle.Round(time.Second))
-				c.close()
+				c.fail(fmt.Errorf("UDP 数据通道连续 %s 收不到回包",
+					idle.Round(time.Second)))
 				return
 			}
 			_ = c.send(nil)
@@ -228,9 +263,58 @@ func (c *udpChannel) isClosed() bool {
 	}
 }
 
-func (c *udpChannel) close() {
+func (c *udpChannel) close() { c.fail(nil) }
+
+// fail 关闭通道并记下被动失效的原因。原因只为区分「故障」和「会话主动收尾」：
+// 后者调用 close()，会话监听方看到后什么都不做，绝不能借机重连。
+func (c *udpChannel) fail(cause error) {
 	c.once.Do(func() {
+		c.failErr = cause
 		close(c.closed)
 		_ = c.conn.Close()
 	})
+}
+
+// failCause 返回被动失效的原因；主动收尾或尚未关闭返回 nil。
+// 必须在 closed 已关闭之后调用（写入发生在 close(closed) 之前）。
+func (c *udpChannel) failCause() error {
+	select {
+	case <-c.closed:
+		return c.failErr
+	default:
+		return nil
+	}
+}
+
+// watchUDP 盯着当前 UDP 通道的失效信号，让会话不等业务包就结束并重建。
+//
+// 以前只有用户恰好发包、pumpFromDevice 的 send 失败才会结束会话：空闲的隧道
+// 控制连接心跳正常、面板显示「已连接」，数据面早就断了，直到用户下次上网才暴露。
+// keepalive 已经判定通道没救并关掉它，这里直接接住那个信号。
+//
+// 只认有原因的关闭：会话收尾时 session 的 defer 也会 close()，那不该触发重连。
+func (s *clientSession) watchUDP(ctx context.Context, errCh chan<- error) {
+	u := s.udp
+	if u == nil {
+		return
+	}
+	select {
+	case <-ctx.Done():
+		return
+	case <-u.closed:
+	}
+	// 收尾顺序是「run 先 cancel 再关通道」，但两个信号可能同时就绪；
+	// 再查一次 ctx，免得把主动收尾当成故障报上去。
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+	if cause := u.failCause(); cause != nil {
+		// run 可能已经因别的错误返回，errCh 没人收；非阻塞投递避免协程卡住
+		select {
+		case errCh <- cause:
+		default:
+		}
+	}
 }
