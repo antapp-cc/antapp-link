@@ -182,8 +182,62 @@ func BuildNetConfig(inv pki.Invite) NetConfig {
 		Gateway:     inv.Gateway,
 		Prefix:      inv.Prefix,
 		MTU:         inv.MTU,
-		DNS:         inv.DNS,
+		DNS:         resolveClientDNS(inv),
 	}
+}
+
+// defaultClientDNS 是接管期间给系统网卡配的 DNS。
+//
+// 连接码里带的是 10.10.0.1 —— 隧道内的 dnsmasq。用它意味着每个查询都要多走一趟
+// 跨境隧道，实测解析平均 578ms（223.5.5.5 只要 93ms），网页打开速度差 40%。
+//
+// Pi 自己的域名不依赖这个：.minepi.com 由 NRPT 强制指到隧道网关解析（那个作用域
+// 在国内所有递归上都会被污染，见 nrptNamespace 的注释）。所以系统 DNS 交给公共的
+// 更快，Pi 解析不受影响。
+var defaultClientDNS = []string{"223.5.5.5", "119.29.29.29"}
+
+// resolveClientDNS 决定接管时给系统配哪些 DNS。
+//
+// 默认用公共 DNS。想回到「全部走隧道」或者指定别的解析器，用环境变量覆盖：
+//
+//	ANTAPP_CLIENT_DNS=tunnel          用连接码里的地址（10.10.0.1）
+//	ANTAPP_CLIENT_DNS=1.1.1.1,8.8.8.8 指定一个列表
+func resolveClientDNS(inv pki.Invite) []string {
+	v := strings.TrimSpace(os.Getenv("ANTAPP_CLIENT_DNS"))
+	if v == "tunnel" {
+		return inv.DNS
+	}
+	if v != "" {
+		var out []string
+		for _, s := range strings.Split(v, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	if len(inv.DNS) > 0 && !isTunnelDNS(inv.DNS) {
+		// 连接码明确指定了别的解析器，尊重它
+		return inv.DNS
+	}
+	return defaultClientDNS
+}
+
+// isTunnelDNS 判断这组 DNS 是不是「只有隧道网关」。
+//
+// 只有这种情况才替换成公共 DNS：连接码如果已经写了具体的公共解析器，那是用户
+// 有意选的，不该被默认值覆盖。
+func isTunnelDNS(servers []string) bool {
+	if len(servers) != 1 {
+		return false
+	}
+	ip, err := netip.ParseAddr(strings.TrimSpace(servers[0]))
+	if err != nil {
+		return false
+	}
+	return ip.IsPrivate() || ip.IsLoopback()
 }
 
 // validateIPv4Only 在接管或还原前确认这次配置全在 IPv4 范围内。

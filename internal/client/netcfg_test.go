@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/antapp-cc/antapp-link/internal/pki"
 )
 
 func testSnapshot() Snapshot {
@@ -402,5 +404,69 @@ func TestNetEpochAdvances(t *testing.T) {
 	after := netEpoch.Load()
 	if after != before+1 {
 		t.Fatalf("代际没有前进：%d -> %d", before, after)
+	}
+}
+
+// 接管时默认用公共 DNS，而不是连接码里的隧道网关。
+//
+// 用 10.10.0.1 意味着每个查询都要多走一趟跨境隧道：实测解析平均 578ms，
+// 公共 DNS 只要 93ms，网页打开速度差 40%。Pi 的域名不依赖系统 DNS ——
+// .minepi.com 由 NRPT 强制走隧道网关。
+func TestResolveClientDNSPrefersPublic(t *testing.T) {
+	t.Setenv("ANTAPP_CLIENT_DNS", "")
+	inv := pki.Invite{DNS: []string{"10.10.0.1"}}
+	got := resolveClientDNS(inv)
+	if len(got) != 2 || got[0] != "223.5.5.5" {
+		t.Fatalf("默认应换成公共 DNS，实际 %v", got)
+	}
+}
+
+// 环境变量能把它切回隧道，方便 A/B 或出问题时回退。
+func TestResolveClientDNSTunnelOverride(t *testing.T) {
+	t.Setenv("ANTAPP_CLIENT_DNS", "tunnel")
+	inv := pki.Invite{DNS: []string{"10.10.0.1"}}
+	got := resolveClientDNS(inv)
+	if len(got) != 1 || got[0] != "10.10.0.1" {
+		t.Fatalf("tunnel 覆盖应保留连接码的地址，实际 %v", got)
+	}
+}
+
+// 自定义列表按逗号切，空项丢掉。
+func TestResolveClientDNSCustomList(t *testing.T) {
+	t.Setenv("ANTAPP_CLIENT_DNS", " 1.1.1.1 , ,8.8.8.8 ")
+	inv := pki.Invite{DNS: []string{"10.10.0.1"}}
+	got := resolveClientDNS(inv)
+	if len(got) != 2 || got[0] != "1.1.1.1" || got[1] != "8.8.8.8" {
+		t.Fatalf("自定义列表解析错，实际 %v", got)
+	}
+}
+
+// 连接码已经写了具体的公共解析器时，那是签发者有意选的，不该被默认值覆盖。
+func TestResolveClientDNSKeepsExplicitPublic(t *testing.T) {
+	t.Setenv("ANTAPP_CLIENT_DNS", "")
+	inv := pki.Invite{DNS: []string{"9.9.9.9"}}
+	got := resolveClientDNS(inv)
+	if len(got) != 1 || got[0] != "9.9.9.9" {
+		t.Fatalf("连接码指定的解析器应保留，实际 %v", got)
+	}
+}
+
+// 多个地址时不算「只有隧道网关」，原样保留。
+func TestIsTunnelDNS(t *testing.T) {
+	cases := []struct {
+		in   []string
+		want bool
+	}{
+		{[]string{"10.10.0.1"}, true},
+		{[]string{"127.0.0.1"}, true},
+		{[]string{"192.168.1.1"}, true},
+		{[]string{"223.5.5.5"}, false},
+		{[]string{"10.10.0.1", "223.5.5.5"}, false},
+		{[]string{}, false},
+	}
+	for _, c := range cases {
+		if got := isTunnelDNS(c.in); got != c.want {
+			t.Errorf("isTunnelDNS(%v) = %v, want %v", c.in, got, c.want)
+		}
 	}
 }
