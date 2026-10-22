@@ -201,7 +201,10 @@ func TestRunCommandHonoursBudget(t *testing.T) {
 
 func TestRunCommandReturnsOutput(t *testing.T) {
 	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
-	out, err := runCommand(context.Background(), time.Second,
+	// 预算给 5 秒而不是 1 秒：子进程是测试二进制自己，-race 下加载和初始化经常
+	// 超过 1 秒，那不是 runCommand 的问题。这里要验证的是「正常命令能拿到输出」，
+	// 超时行为由 TestRunCommandHonoursBudget 单独覆盖。
+	out, err := runCommand(context.Background(), 5*time.Second,
 		os.Args[0], "-test.run=TestHelperProcess", "--", "echo", "hello")
 	if err != nil {
 		t.Fatalf("正常命令不该失败: %v", err)
