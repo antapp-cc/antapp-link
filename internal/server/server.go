@@ -822,7 +822,7 @@ func (s *Server) reportStatus(ctx context.Context) {
 			st.ForwardActive = active
 			st.ForwardTotal = total
 			st.ForwardRejected = rejected
-			st.ForwardIdle = idle
+			st.ForwardSwept = idle
 		}
 		if sess := s.currentSession(); sess != nil {
 			st.Client = sess.name

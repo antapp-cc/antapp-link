@@ -35,7 +35,7 @@ type Status struct {
 	ForwardActive   int `json:"forward_active,omitempty"`
 	ForwardTotal    int `json:"forward_total,omitempty"`
 	ForwardRejected int `json:"forward_rejected,omitempty"`
-	ForwardIdle     int `json:"forward_idle,omitempty"`
+	ForwardSwept    int `json:"forward_swept,omitempty"`
 	// Goroutines 是写状态那一刻的 goroutine 数。长期盯它有没有单调上涨，
 	// 比事后查 pprof 更容易发现「每次重连泄漏一点」这类问题。
 	Goroutines int `json:"goroutines,omitempty"`

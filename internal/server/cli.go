@@ -455,9 +455,9 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 	if st.ForwardActive > 0 || st.ForwardRejected > 0 {
 		fmt.Fprintf(stdout, "  在途连接    : %d 条（本次启动累计 %d 条，超限拒绝 %d 条）\n",
 			st.ForwardActive, st.ForwardTotal, st.ForwardRejected)
-		if st.ForwardIdle > 0 {
+		if st.ForwardSwept > 0 {
 			fmt.Fprintf(stdout, "  静默清理    : 上轮清掉 %d 条（超过 %v 无数据）\n",
-				st.ForwardIdle, relayIdleTimeout)
+				st.ForwardSwept, relayIdleTimeout)
 		}
 	}
 	// 「端口在监听」不等于「转发能用」：节点机没接入时转发器会立刻关掉外部连接，

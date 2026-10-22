@@ -28,3 +28,4 @@ cloud-server-backup-20260928/
 *.antapp.bak
 # 独立审查/子代理留下的临时工作目录，不入库
 .review-*/
+dist-test/

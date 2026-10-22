@@ -49,14 +49,24 @@ func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp 
 			_ = c.Close()
 		}
 	}
-	track := func(c *relayConn) bool {
+	// track 把「检查是否已满」和「占用一个名额」放进同一把锁里完成。
+	//
+	// 分成两步（先读 len(active) 判断、再另行 track）会有竞态：并发 Accept 时
+	// 多个协程同时看到「还没满」，于是都放进来，在途数可能超过 relayMaxActive。
+	// 差几条本身影响不大，但上限失去意义就白设了。
+	//
+	// 返回值：ok 表示已占用；full 表示因达到上限被拒（调用方据此计入 rejected）。
+	track := func(c *relayConn) (ok, full bool) {
 		mu.Lock()
 		defer mu.Unlock()
 		if stopped {
-			return false
+			return false, false
+		}
+		if len(active) >= relayMaxActive {
+			return false, true
 		}
 		active[c] = struct{}{}
-		return true
+		return true, false
 	}
 	untrack := func(c *relayConn) {
 		mu.Lock()
@@ -95,7 +105,7 @@ func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp 
 				for _, rc := range victims {
 					_ = rc.Close()
 				}
-				st.setIdle(stillIdle)
+				st.setSwept(stillIdle)
 				if stillIdle > 0 {
 					log.Info("清理静默的转发连接",
 						"count", stillIdle, "idle_timeout", relayIdleTimeout)
@@ -127,21 +137,19 @@ func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp 
 					_ = conn.Close()
 					continue
 				}
-				mu.Lock()
-				full := len(active) >= relayMaxActive
-				mu.Unlock()
-				if full {
-					// 这些端口对公网开放，扫描器能把连接数推到很高。拒绝比让它
-					// 把 fd 和协程吃光好 —— 真节点会自己重试，晚几秒不影响共识。
-					st.onRejected()
-					_ = conn.Close()
-					continue
-				}
 				rc := newRelayConn(conn)
 				target := net.JoinHostPort(clientAddr, fmt.Sprint(port))
 				go func() {
-					if !track(rc) {
-						_ = rc.Close() // 已经在收尾了，别再搬
+					// 上限检查放进来和占用一起做（见 track 的注释），Accept 循环
+					// 因此不必为它单独取一次锁。
+					ok, full := track(rc)
+					if !ok {
+						// 这些端口对公网开放，扫描器能把连接数推得很高。拒绝比让它
+						// 把 fd 和协程吃光好 —— 真节点会自己重试，晚几秒不影响共识。
+						if full {
+							st.onRejected()
+						}
+						_ = rc.Close() // 已经被拒、或整台机已在收尾
 						return
 					}
 					st.onActive()

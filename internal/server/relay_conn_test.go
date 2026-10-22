@@ -132,9 +132,9 @@ func TestRelayStatsBalance(t *testing.T) {
 	s.onRejected()
 	s.onAccept()
 	s.onRejected()
-	s.setIdle(1)
-	active, total, rejected, idle := s.snapshot()
-	if active != 2 || total != 7 || rejected != 2 || idle != 1 {
-		t.Fatalf("期望 2/7/2/1，实际 %d/%d/%d/%d", active, total, rejected, idle)
+	s.setSwept(1)
+	active, total, rejected, swept := s.snapshot()
+	if active != 2 || total != 7 || rejected != 2 || swept != 1 {
+		t.Fatalf("期望 2/7/2/1，实际 %d/%d/%d/%d", active, total, rejected, swept)
 	}
 }

@@ -87,19 +87,19 @@ type relayStats struct {
 	active   atomic.Int64
 	total    atomic.Int64
 	rejected atomic.Int64
-	idle     atomic.Int64
+	swept    atomic.Int64
 }
 
 func (s *relayStats) onAccept()   { s.total.Add(1) }
 func (s *relayStats) onActive()   { s.active.Add(1) }
 func (s *relayStats) onClosed()   { s.active.Add(-1) }
 func (s *relayStats) onRejected() { s.rejected.Add(1) }
-func (s *relayStats) setIdle(n int64) {
-	s.idle.Store(n)
+func (s *relayStats) setSwept(n int64) {
+	s.swept.Store(n)
 }
 
 // snapshot 一次读出四个数，顺序：在途、累计、被拒、静默超时。
-func (s *relayStats) snapshot() (active, total, rejected, idle int) {
+func (s *relayStats) snapshot() (active, total, rejected, swept int) {
 	return int(s.active.Load()), int(s.total.Load()),
-		int(s.rejected.Load()), int(s.idle.Load())
+		int(s.rejected.Load()), int(s.swept.Load())
 }

@@ -1176,12 +1176,14 @@ func (s *clientSession) recycleAt(ctx context.Context) error {
 		}
 		busy := s.stats.TxBytes.Load() - tx0 + s.stats.RxBytes.Load() - rx0
 		if busy >= recycleBusyBytes {
+			// 推迟这条要单独打：它是唯一能解释「为什么本该 8 小时断一次却没断」的线索。
 			s.log.Info("正在传输数据，推迟自动重建连接")
 			timer.Reset(recycleRetry)
 			continue
 		}
 
-		s.log.Info("定期重建连接（重置连接状态），不是故障")
+		// 到点这里不打日志：返回后 Run 会打出「会话结束 reason=定期重建连接…」，
+		// 同一件事报两遍只会让人以为断了两次。
 		return errScheduledRecycle
 	}
 }
