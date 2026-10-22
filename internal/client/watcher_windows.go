@@ -121,6 +121,15 @@ func startSessionWatcher(ctx context.Context, snap Snapshot, cfg NetConfig,
 	}
 	w.unregs = append(w.unregs, cbi.Unregister)
 
+	// 接管后第一次拿到带所有权记录的现场时立刻落盘：state.json 是在 Apply 之前
+	// 写的，那时还不知道实际铺了哪些分流路由。崩溃自愈要靠这份记录才只清自己的，
+	// 没有它就退回形态扫描（可能碰到同形态的用户路由）。
+	if snap.Split != nil && update != nil {
+		if err := update(snap); err != nil {
+			logf("路由所有权记录写盘失败（崩溃自愈将退回形态扫描）: %v", err)
+		}
+	}
+
 	logf("出口守护已启动")
 	go w.loop(ctx)
 	return w, nil
@@ -279,10 +288,8 @@ func (w *sessionWatcher) reconcile() {
 	if err != nil || !ok {
 		// 抓不到新网卡也要把旧网卡的 DNS 还原：否则它会一直指着隧道网关，
 		// 用户切回那张网卡时解析全超时（这是迁移失败时唯一还有副作用的残留）。
-		for _, iface := range oldSnap.Interfaces {
-			if a, ok2, _ := adapterByName(iface.Name); ok2 {
-				_ = setAdapterDNS(a.LUID, iface.DNS)
-			}
+		for _, rerr := range restoreIfacesDNS(oldSnap.Interfaces) {
+			logf("迁移中止，还原旧网卡 DNS 未完成: %v", rerr)
 		}
 		return
 	}
@@ -292,42 +299,59 @@ func (w *sessionWatcher) reconcile() {
 	// 它身上的 DNS 已经是我们写进去的隧道网关 —— 直接读当前值会把「我们自己的值」
 	// 当成用户原值存进快照，断开时就把这张网卡的 DNS 永久指到一个已经拆掉的网关，
 	// 用户表现为解析全超时。换了网卡才读新网卡的当前值。
-	var newDNSStrings []string
+	// 认网卡用 GUID 而不是索引：索引会被系统复用，认错网卡就会把上一张的配置
+	// 记到新网卡名下。
+	var newIface IfaceDNS
 	reusedDNS := false
 	for _, iface := range oldSnap.Interfaces {
-		if uint32(iface.Index) == ifIndex {
-			newDNSStrings = iface.DNS
+		if iface.ref().sameAdapter(newDef.key()) {
+			newIface = iface
 			reusedDNS = true
 			break
 		}
 	}
 	if !reusedDNS {
-		newDNS := adapterDNS(newDef.LUID)
-		newDNSStrings = make([]string, 0, len(newDNS))
-		for _, a := range newDNS {
-			newDNSStrings = append(newDNSStrings, a.String())
-		}
+		newIface = captureIfaceDNS(newDef)
 	}
 
 	// 新现场齐了，才开始拆旧的。
 	// 1) 还原旧网卡的 DNS（用旧快照里记录的原值；网卡已消失则跳过）
 	for _, iface := range oldSnap.Interfaces {
-		if uint32(iface.Index) == ifIndex {
+		if iface.ref().sameAdapter(newDef.key()) {
 			continue
 		}
-		if a, ok, _ := adapterByName(iface.Name); ok {
-			_ = setAdapterDNS(a.LUID, iface.DNS) // 原值为空 = 清空回到自动获取
+		if a, ok, _ := adapterForIface(iface); ok {
+			if err := applyIfaceDNS(a.LUID, iface); err != nil {
+				logf("迁移时还原旧网卡 %s 的 DNS 失败: %v", iface.Name, err)
+			}
 		}
 	}
-	// 2) 扫掉旧网卡上的国内分流（按旧网关 + metric 筛）
-	if oldGw.IsValid() {
-		sweepSplitRoutes(oldGw)
+	// 2) 扫掉旧网卡上的国内分流：只清自己装的；旧快照没有所有权记录才按形态扫
+	owns := make([]*splitOwnership, 0, 2)
+	if oldSnap.Split != nil {
+		owns = append(owns, oldSnap.Split)
+	}
+	if live := currentLiveSplitOwnership(); live != nil && live != oldSnap.Split {
+		owns = append(owns, live)
+	}
+	if len(owns) > 0 {
+		for _, own := range owns {
+			if _, serr := sweepOwnedSplitRoutes(own); serr != nil {
+				logf("迁移时清理旧分流未完成: %v", serr)
+			}
+		}
+	} else if oldGw.IsValid() {
+		if _, serr := sweepSplitRoutes(oldGw); serr != nil {
+			logf("迁移时按形态清理旧分流未完成: %v", serr)
+		}
 	}
 	// 3) 撤旧绕行路由
 	if oldSnap.ServerNextHop != "" && w.srv.IsValid() {
-		if a, ok, _ := adapterByIndex(uint32(oldSnap.DefaultIfIndex)); ok {
+		if a, ok := defaultAdapter(oldSnap); ok {
 			if hop, err := netip.ParseAddr(oldSnap.ServerNextHop); err == nil {
-				_ = a.LUID.DeleteRoute(netip.PrefixFrom(w.srv, 32), hop)
+				if derr := deleteRouteIgnoringMissing(a.LUID, netip.PrefixFrom(w.srv, 32), hop); derr != nil {
+					logf("迁移时撤旧绕行路由失败: %v", derr)
+				}
 			}
 		}
 	}
@@ -341,7 +365,7 @@ func (w *sessionWatcher) reconcile() {
 	if err != nil {
 		// 算不出来就把旧绕行原样装回去，别停在「旧绕行已删、新绕行没建」的状态
 		if oldSnap.ServerNextHop != "" && w.srv.IsValid() {
-			if a, ok, _ := adapterByIndex(uint32(oldSnap.DefaultIfIndex)); ok {
+			if a, ok := defaultAdapter(oldSnap); ok {
 				if oh, e := netip.ParseAddr(oldSnap.ServerNextHop); e == nil {
 					_ = a.LUID.AddRoute(netip.PrefixFrom(w.srv, 32), oh, 1)
 				}
@@ -376,13 +400,18 @@ func (w *sessionWatcher) reconcile() {
 		}
 	}
 	failed := 0
+	var installed []string
 	for _, p := range ActiveCNRoutes() {
-		if prefix, err := netip.ParsePrefix(p); err == nil {
-			if err := newDef.LUID.AddRoute(prefix.Masked(), gw, splitRouteMetric); err != nil &&
-				!errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) {
-				failed++
-			}
+		prefix, perr := netip.ParsePrefix(p)
+		if perr != nil {
+			continue
 		}
+		if err := newDef.LUID.AddRoute(prefix.Masked(), gw, splitRouteMetric); err != nil &&
+			!errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) {
+			failed++
+			continue
+		}
+		installed = append(installed, prefix.Masked().String())
 	}
 
 	// 6) 提交现场 + 唤醒隧道立刻重连
@@ -391,7 +420,9 @@ func (w *sessionWatcher) reconcile() {
 	// 状态（pending），下一轮事件会重试同一份现场 —— 重试只补写盘/补配置，不会重新
 	// 读网卡 DNS（那已经被我们改过了）。
 	snap := newSnapshot(gw.Unmap().String(), int(ifIndex), serverNextHop,
-		w.srv.String(), []IfaceDNS{{Name: newDef.Name, Index: int(newDef.Index), DNS: newDNSStrings}}, w.cfg)
+		w.srv.String(), []IfaceDNS{newIface}, w.cfg)
+	snap.Split = newSplitOwnership(newDef.key(), gw, installed)
+	setLiveSplitOwnership(snap.Split)
 	if !dnsApplied || !routeApplied {
 		w.pending = &pendingMigration{snap: snap, dnsApplied: dnsApplied, routeApplied: routeApplied}
 		logf("网络出口已切换，但关键配置没写全：保留待提交状态，下次事件会补修")
@@ -421,35 +452,60 @@ func (w *sessionWatcher) reconcile() {
 		newDef.Name, gw, migrationNote(failed))
 }
 
-// revertPending 把一笔未完成迁移在旧网卡上留下的配置撤掉。
+// revertPending 把一笔未完成迁移在网卡上留下的配置撤掉。
 //
 // 用的全是 pending 里记下的原始值：那张网卡的 DNS 原值和绕行下一跳。清理完就不再
-// 保留 —— 新迁移会重新记一份。
+// 保留 —— 新迁移会重新记一份。清理失败时**保留** pending 并在日志里报数：以前不管
+// 结果一律说「已清理」，用户看到的是假成功，而残留的隧道 DNS 还在那张网卡上。
 //
 // 调用点两个：reconcile 持 w.mu 时（出口已经换成别的网卡），以及 Disconnect 里
 // Stop 之后（那里没有并发，所以不加锁 —— 加了会和 reconcile 的持锁调用死锁）。
-func (w *sessionWatcher) revertPending() {
+func (w *sessionWatcher) revertPending() error {
 	p := w.pending
 	if p == nil {
-		return
+		return nil
 	}
-	w.pending = nil
+	var errs []error
 
-	// 还原那张网卡的原始 DNS（可能是空 = 回到自动获取）
-	for _, iface := range p.snap.Interfaces {
-		if a, ok, _ := adapterByName(iface.Name); ok {
-			_ = setAdapterDNS(a.LUID, iface.DNS)
+	// 还原那张网卡记录的 DNS（自动来源会清空设置，见 IfaceDNS.DNSAuto）
+	errs = append(errs, restoreIfacesDNS(p.snap.Interfaces)...)
+
+	// 这笔迁移可能已经把国内分流铺上了一部分（失败点通常在 DNS 或绕行路由之后），
+	// 一并撤掉；热更新铺的那一版也在这里兜底。
+	if p.snap.Split != nil {
+		if _, serr := sweepOwnedSplitRoutes(p.snap.Split); serr != nil {
+			errs = append(errs, fmt.Errorf("清理待回滚迁移的国内分流: %w", serr))
 		}
 	}
+	if live := currentLiveSplitOwnership(); live != nil && live != p.snap.Split {
+		if _, serr := sweepOwnedSplitRoutes(live); serr != nil {
+			errs = append(errs, fmt.Errorf("清理待回滚迁移的热更新分流: %w", serr))
+		} else {
+			clearLiveSplitOwnership()
+		}
+	}
+
 	// 撤掉我们写进去的云服 /32 绕行路由
 	if p.snap.ServerNextHop != "" && w.srv.IsValid() {
-		if a, ok, _ := adapterByIndex(uint32(p.snap.DefaultIfIndex)); ok {
+		if a, ok := defaultAdapter(p.snap); ok {
 			if hop, err := netip.ParseAddr(p.snap.ServerNextHop); err == nil {
-				_ = a.LUID.DeleteRoute(netip.PrefixFrom(w.srv, 32), hop)
+				if derr := deleteRouteIgnoringMissing(a.LUID, netip.PrefixFrom(w.srv, 32), hop); derr != nil {
+					errs = append(errs, fmt.Errorf("撤云服绕行路由: %w", derr))
+				}
 			}
 		}
 	}
-	logf("上一笔未完成的迁移已回滚（网卡 %d），它的残留配置已清理", p.snap.DefaultIfIndex)
+
+	if len(errs) > 0 {
+		joined := errors.Join(errs...)
+		// 不 reject pending：下一轮对账或下一次断开还能再试。这里也绝不能打「已清理」。
+		logf("上一笔未完成迁移回滚有 %d 处失败（保留待重试）: %v", len(errs), joined)
+		return joined
+	}
+	w.pending = nil
+	clearLiveSplitOwnership()
+	logf("上一笔未完成的迁移已回滚（网卡 %d），残留配置已清理", p.snap.DefaultIfIndex)
+	return nil
 }
 
 func migrationNote(failed int) string {

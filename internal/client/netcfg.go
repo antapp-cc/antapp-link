@@ -40,12 +40,84 @@ func (c Command) String() string {
 
 // IfaceDNS 记下一张网卡原来的 DNS，断开时要还回去。
 //
-// 不去区分「原值来自 DHCP 还是手工配置」：把同样的地址设成静态，解析行为完全一致，
-// 而判断来源要靠解析 netsh 的本地化输出（中文系统关键字对不上），不值得。
+// GUID 是网卡的稳定身份（系统按它记保存的配置），友好名用户能改、接口索引会被
+// 系统复用，所以识别网卡时 GUID 优先。旧快照没有 GUID，只能退回索引/名字。
 type IfaceDNS struct {
 	Name  string   `json:"name"`
 	Index int      `json:"index"`
+	GUID  string   `json:"guid,omitempty"`
 	DNS   []string `json:"dns"`
+
+	// DNSAuto 记下这些 DNS 是 DHCP 自动下发的还是用户静态配置的。
+	// nil 表示旧快照没记来源（或原生探测失败），按自动处理。
+	//
+	// 还原成同样的静态地址只在同一个网络里成立：换了 Wi-Fi/网线后，旧地址
+	// 多半已经不可达。自动来源必须还原成自动（清空静态设置让 DHCP 重新下发）；
+	// 来源未知时同样按自动处理 —— 写死旧地址的结果是解析全超时，而清空最多
+	// 让用户重配一次。
+	DNSAuto *bool `json:"dns_auto,omitempty"`
+}
+
+// restoreAsAuto 报告还原这张网卡时是否清空静态 DNS 设置、回到 DHCP 自动获取。
+func (i IfaceDNS) restoreAsAuto() bool { return i.DNSAuto == nil || *i.DNSAuto }
+
+// adapterRef / adapterKey 是快照侧与系统侧的网卡标识。
+//
+// 分开两个类型是为了让「按什么顺序认网卡」成为可单测的纯逻辑：GUID 优先，
+// 旧快照没有 GUID 时才退回索引、再退回友好名。
+type adapterRef struct {
+	GUID  string
+	Index int
+	Name  string
+}
+
+type adapterKey struct {
+	GUID  string
+	Index uint32
+	Name  string
+}
+
+func (i IfaceDNS) ref() adapterRef {
+	return adapterRef{GUID: i.GUID, Index: i.Index, Name: i.Name}
+}
+
+// sameAdapter 判断快照条目与当前网卡是不是同一张。
+// watcher 复用 DNS 原值前必须确认，否则会把上一张网卡的配置记到新网卡名下。
+func (r adapterRef) sameAdapter(k adapterKey) bool {
+	if r.GUID != "" && k.GUID != "" {
+		return r.GUID == k.GUID
+	}
+	return r.Index > 0 && int(k.Index) == r.Index
+}
+
+// pickAdapter 在当前网卡里找快照记的那一张。
+//
+// 有 GUID 却找不到时不退回索引：索引会被系统复用，退回去可能改到另一张网卡的
+// DNS。那张网卡真没了就什么都不该做。只有旧快照（无 GUID）才按索引、再按名字找。
+func pickAdapter(ref adapterRef, keys []adapterKey) (int, bool) {
+	if ref.GUID != "" {
+		for i, k := range keys {
+			if k.GUID == ref.GUID {
+				return i, true
+			}
+		}
+		return 0, false
+	}
+	if ref.Index > 0 {
+		for i, k := range keys {
+			if int(k.Index) == ref.Index {
+				return i, true
+			}
+		}
+	}
+	if ref.Name != "" {
+		for i, k := range keys {
+			if k.Name == ref.Name {
+				return i, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // Snapshot 是接管网络之前的现场。它必须能完整还原 —— 还原不了就是把用户搞断网。
@@ -70,6 +142,10 @@ type Snapshot struct {
 	// 网卡」的状态里。旧快照没有这两个字段，还原时回退到 cfg。
 	TunnelGateway string `json:"tunnel_gateway,omitempty"`
 	ServerIP      string `json:"server_ip,omitempty"`
+
+	// Split 记录本次实际铺上的国内分流路由。旧快照没有它（nil），还原时只能
+	// 退回「下一跳 + metric」的形态扫描（会碰到同形态的用户路由）。
+	Split *splitOwnership `json:"split_routes,omitempty"`
 }
 
 // NetConfig 是接管网络需要的参数。
@@ -111,6 +187,60 @@ func BuildNetConfig(inv pki.Invite) NetConfig {
 // splitRouteMetric 是国内直连路由的 route metric。还原时按
 // 「下一跳 = 原默认网关 且 metric = 此值」整批扫除，网段表更新过也能清干净。
 const splitRouteMetric = 5
+
+// splitOwnership 是本程序实际铺上的国内直连路由。
+//
+// 只按「下一跳 = 原网关 且 metric = 5」筛选会误删用户自己建的形态相同的路由
+// （手工路由、其它 VPN 客户端都可能长这样）。记下装在哪张网卡、走哪个网关、
+// 具体哪些前缀，还原时只清这一组。
+type splitOwnership struct {
+	IfGUID   string   `json:"if_guid,omitempty"`
+	IfIndex  int      `json:"if_index"`
+	Gateway  string   `json:"gateway"`
+	Prefixes []string `json:"prefixes,omitempty"`
+}
+
+// ownsRoute 判断一条路由是不是这次接管装上的。
+//
+// GUID 存在时只认 GUID：索引会被系统复用，退回索引可能删到别的网卡上的同类
+// 路由。网关和前缀集合再各挡一层，同形态的用户路由要同时满足三样才会被误判。
+func (o *splitOwnership) ownsRoute(guid string, ifIndex uint32, nextHop netip.Addr, metric uint32, dest netip.Prefix) bool {
+	if o == nil {
+		return false
+	}
+	if o.IfGUID != "" {
+		if guid != o.IfGUID {
+			return false
+		}
+	} else if int(ifIndex) != o.IfIndex {
+		return false
+	}
+	if metric != splitRouteMetric {
+		return false
+	}
+	gw, err := netip.ParseAddr(o.Gateway)
+	if err != nil || nextHop.Unmap() != gw.Unmap() {
+		return false
+	}
+	want := dest.Masked().String()
+	for _, p := range o.Prefixes {
+		if p == want {
+			return true
+		}
+	}
+	return false
+}
+
+// newSplitOwnership 汇总本次装上的分流前缀。prefixes 只收实际写进去的，
+// 没铺成功的条目不该出现在所有权里。
+func newSplitOwnership(ref adapterKey, gateway netip.Addr, prefixes []string) *splitOwnership {
+	return &splitOwnership{
+		IfGUID:   ref.GUID,
+		IfIndex:  int(ref.Index),
+		Gateway:  gateway.String(),
+		Prefixes: prefixes,
+	}
+}
 
 // nrptRuleComment 是 NRPT 规则的识别标记，增删都按它筛，不碰别人的规则。
 const nrptRuleComment = "AntApp Link DNS"

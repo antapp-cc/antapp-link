@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"strings"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
@@ -17,10 +19,15 @@ import (
 
 // adapterInfo 是一次适配器枚举的快照。
 type adapterInfo struct {
-	Name  string // FriendlyName，如 "WLAN"；还原 DNS 时按它找回来
+	Name  string // FriendlyName，如 "WLAN"；Tunnel 按固定名查找仍用它
 	Index uint32
+	GUID  string // 稳定身份（IF GUID），注册表与跨重启都不变
 	LUID  winipcfg.LUID
 	Up    bool
+}
+
+func (a adapterInfo) key() adapterKey {
+	return adapterKey{GUID: a.GUID, Index: a.Index, Name: a.Name}
 }
 
 // adapters 枚举全部适配器，含未连接的（旧版残留扫描要能看见它们）。
@@ -34,11 +41,37 @@ func adapters() ([]adapterInfo, error) {
 		out = append(out, adapterInfo{
 			Name:  aa.FriendlyName(),
 			Index: aa.IfIndex,
+			GUID:  luidGUID(aa.LUID),
 			LUID:  aa.LUID,
 			Up:    aa.OperStatus == winipcfg.IfOperStatusUp,
 		})
 	}
 	return out, nil
+}
+
+// luidGUID 把接口 LUID 转成稳定 GUID。转换失败返回空串，调用方退回索引。
+func luidGUID(l winipcfg.LUID) string {
+	g, err := l.GUID()
+	if err != nil {
+		return ""
+	}
+	return g.String()
+}
+
+// adapterForIface 按快照里的身份找网卡（GUID → 索引 → 友好名，见 pickAdapter）。
+func adapterForIface(iface IfaceDNS) (adapterInfo, bool, error) {
+	aas, err := adapters()
+	if err != nil {
+		return adapterInfo{}, false, err
+	}
+	keys := make([]adapterKey, len(aas))
+	for i := range aas {
+		keys[i] = aas[i].key()
+	}
+	if i, ok := pickAdapter(iface.ref(), keys); ok {
+		return aas[i], true, nil
+	}
+	return adapterInfo{}, false, nil
 }
 
 // adapterByName 按友好名找网卡（如隧道网卡的固定名 "AntApp Link"）。
@@ -167,6 +200,41 @@ func adapterDNS(l winipcfg.LUID) []netip.Addr {
 	return v4
 }
 
+// tcpipIfaceKey 是 Windows 按网卡保存 TCP/IP 配置的注册表位置（键名是网卡 GUID）。
+const tcpipIfaceKey = `SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\`
+
+// dnsWasAuto 判断一张网卡当前的 IPv4 DNS 是 DHCP 下发还是静态配置。
+//
+// 静态 DNS 写在 Tcpip\Parameters\Interfaces\{GUID}\NameServer，DHCP 下发的
+// 放在 DhcpNameServer —— 这是唯一可靠的原生来源。dnsapi 的
+// GetInterfaceDnsSettings 只给生效值，不区分来源；解析 netsh 输出又要面对
+// 本地化关键字（中文系统上 "DHCP" 显示成别的词），都不该再走。
+//
+// ok=false 表示读不到注册表（键缺失/权限），调用方按「来源未知」处理。
+func dnsWasAuto(l winipcfg.LUID) (auto bool, ok bool) {
+	guid := luidGUID(l)
+	if guid == "" {
+		return false, false
+	}
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, tcpipIfaceKey+guid, registry.QUERY_VALUE)
+	if err != nil {
+		return false, false
+	}
+	defer k.Close()
+	// ProfileNameServer 是「按网络位置」配置的静态 DNS，Windows 10/11 的
+	// 设置界面会写它，同样属于静态来源。
+	for _, name := range []string{"NameServer", "ProfileNameServer"} {
+		if v, _, err := k.GetStringValue(name); err == nil && strings.TrimSpace(v) != "" {
+			return false, true
+		}
+	}
+	if v, _, err := k.GetStringValue("DhcpNameServer"); err == nil && strings.TrimSpace(v) != "" {
+		return true, true
+	}
+	// 两个值都空：没有静态设置，生效值只能来自 DHCP（或根本没有 IPv4 DNS）。
+	return true, true
+}
+
 // adapterUnicastIPs 枚举一张网卡上的单播地址（含前缀长度），只返回 IPv4 的。
 func adapterUnicastIPs(l winipcfg.LUID) []netip.Prefix {
 	rows, err := winipcfg.GetUnicastIPAddressTable(windows.AF_UNSPEC)
@@ -194,50 +262,131 @@ func flushResolverCache() {
 	_, _, _ = windows.NewLazySystemDLL("dnsapi.dll").NewProc("DnsFlushResolverCache").Call()
 }
 
+// routeMissing 报告「路由本来就不在」。复原可以重复执行，或条目在扫描与删除
+// 之间消失，都不该算失败；除此之外的删除错误必须上报 —— 没删掉却报成功，
+// 用户就带着残留路由继续用，而且下次还原也不会再试。
+func routeMissing(err error) bool {
+	return errors.Is(err, windows.ERROR_NOT_FOUND) ||
+		errors.Is(err, windows.ERROR_FILE_NOT_FOUND) ||
+		errors.Is(err, windows.ERROR_PATH_NOT_FOUND)
+}
+
+// deleteRouteIgnoringMissing 删一条路由，「本来就不在」视为成功。
+func deleteRouteIgnoringMissing(l winipcfg.LUID, dest netip.Prefix, nextHop netip.Addr) error {
+	if err := l.DeleteRoute(dest, nextHop); err != nil && !routeMissing(err) {
+		return fmt.Errorf("删除路由 %s via %s: %w", dest, nextHop, err)
+	}
+	return nil
+}
+
+// guidByLUID 缓存 LUID → GUID，避免每行路由都做一次系统调用。
+func guidByLUID(cache map[winipcfg.LUID]string, l winipcfg.LUID) string {
+	if g, ok := cache[l]; ok {
+		return g
+	}
+	g := luidGUID(l)
+	cache[l] = g
+	return g
+}
+
+func prefixOfRow(r *winipcfg.MibIPforwardRow2) (netip.Prefix, bool) {
+	ip := r.DestinationPrefix.RawPrefix.Addr()
+	if !ip.IsValid() {
+		return netip.Prefix{}, false
+	}
+	return netip.PrefixFrom(ip.Unmap(), int(r.DestinationPrefix.PrefixLength)).Masked(), true
+}
+
 // sweepTunnelHalfRoutes 删掉隧道网卡上的 /1 接管路由，不按下一跳匹配。
 //
 // 给「快照损坏」或「快照来自还没记录隧道网关的旧版本」这种拿不到网关的保守
 // 还原用：0.0.0.0/1 与 128.0.0.0/1 只可能是本程序铺的（Windows 自己不会这么
-// 分半默认路由），所以无条件撤掉是安全的 —— 不撤掉的话，全部流量会继续灌进
-// 一张没人读的网卡，而这正是保守还原唯一能兑现的承诺。
-func sweepTunnelHalfRoutes(luid winipcfg.LUID) (removed int) {
+// 分半默认路由），所以无条件撤掉是安全的。
+func sweepTunnelHalfRoutes(luid winipcfg.LUID) (removed int, err error) {
 	rows, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("读路由表: %w", err)
 	}
+	var errs []error
 	for i := range rows {
-		r := rows[i]
+		r := &rows[i]
 		if r.InterfaceLUID != luid || r.DestinationPrefix.PrefixLength != 1 {
 			continue
 		}
-		if r.Delete() == nil {
-			removed++
+		dest, ok := prefixOfRow(r)
+		if !ok {
+			continue
 		}
+		if derr := r.Delete(); derr != nil {
+			if !routeMissing(derr) {
+				errs = append(errs, fmt.Errorf("删除接管路由 %s: %w", dest, derr))
+			}
+			continue
+		}
+		removed++
 	}
-	return removed
+	return removed, errors.Join(errs...)
 }
 
-// sweepSplitRoutes 删除「国内直连」残留路由：下一跳等于原默认网关且
-// route metric 为 5 的全部条目（默认路由除外）。一次全表扫描 + 逐条原生删除，
-// 毫秒级完成；不像 route.exe 那样删不存在的路由会卡死，条目不存在时静默跳过。
-func sweepSplitRoutes(gateway netip.Addr) (removed int) {
+// sweepSplitRoutes 是旧的形态扫描：下一跳等于原默认网关、metric = 5 且不是
+// 默认路由的条目一律删。只在快照没有所有权记录（旧版本写的 state.json）时
+// 使用 —— 它可能删到同形态的用户路由，新快照一律走 sweepOwnedSplitRoutes。
+func sweepSplitRoutes(gateway netip.Addr) (removed int, err error) {
 	rows, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("读路由表: %w", err)
 	}
+	var errs []error
 	for i := range rows {
-		r := rows[i]
+		r := &rows[i]
 		if r.Metric != splitRouteMetric || r.NextHop.Addr().Unmap() != gateway {
 			continue
 		}
-		dest := r.DestinationPrefix
-		ip := dest.RawPrefix.Addr()
-		if !ip.IsValid() || (ip.IsUnspecified() && dest.PrefixLength == 0) {
+		dest, ok := prefixOfRow(r)
+		if !ok || (dest.Addr().IsUnspecified() && dest.Bits() == 0) {
 			continue // 绝不动用户的默认路由
 		}
-		if r.Delete() == nil {
-			removed++
+		if derr := r.Delete(); derr != nil {
+			if !routeMissing(derr) {
+				errs = append(errs, fmt.Errorf("删除国内分流 %s: %w", dest, derr))
+			}
+			continue
 		}
+		removed++
 	}
-	return removed
+	return removed, errors.Join(errs...)
+}
+
+// sweepOwnedSplitRoutes 只删所有权记录里的国内分流路由：接口、网关、metric、
+// 前缀四层全对上才动手。没有记录时什么都不做 —— 这时宁可留残留，也不能按
+// 形态猜着删用户的静态路由。
+func sweepOwnedSplitRoutes(own *splitOwnership) (removed int, err error) {
+	if own == nil {
+		return 0, nil
+	}
+	rows, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
+	if err != nil {
+		return 0, fmt.Errorf("读路由表: %w", err)
+	}
+	guids := map[winipcfg.LUID]string{}
+	var errs []error
+	for i := range rows {
+		r := &rows[i]
+		dest, ok := prefixOfRow(r)
+		if !ok {
+			continue
+		}
+		guid := guidByLUID(guids, r.InterfaceLUID)
+		if !own.ownsRoute(guid, r.InterfaceIndex, r.NextHop.Addr(), r.Metric, dest) {
+			continue
+		}
+		if derr := r.Delete(); derr != nil {
+			if !routeMissing(derr) {
+				errs = append(errs, fmt.Errorf("删除国内分流 %s: %w", dest, derr))
+			}
+			continue
+		}
+		removed++
+	}
+	return removed, errors.Join(errs...)
 }

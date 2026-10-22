@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -53,9 +54,19 @@ func init() {
 	refreshSplitRoutesHook = refreshSplitRoutesFor
 }
 
+// liveSplitOwnership 是本进程当前铺着哪些国内分流路由的实时记录。
+//
+// 热更新（routeTableRefresher）只拿得到网关/索引/新网段表，拿不到 App 的
+// Snapshot，靠它知道上一版装了哪些前缀、该撤哪些。崩溃后这份记录丢失，只剩
+// state.json 里 Snapshot.Split 那一份（那是接管当时铺的那一版）。
+var liveSplitOwnership atomic.Pointer[splitOwnership]
+
+func setLiveSplitOwnership(o *splitOwnership)    { liveSplitOwnership.Store(o) }
+func currentLiveSplitOwnership() *splitOwnership { return liveSplitOwnership.Load() }
+func clearLiveSplitOwnership()                   { liveSplitOwnership.Store(nil) }
+
 // refreshSplitRoutesFor 按给定网段表重铺国内直连路由（原生，毫秒级）。
-// 由 routeTableRefresher 在拉到新表后调用；与 watcher 的迁移路径共用
-// sweepSplitRoutes，过滤条件（下一跳=网关 且 metric=5）保证只动自己的。
+// 由 routeTableRefresher 在拉到新表后调用。
 func refreshSplitRoutesFor(gw string, ifIndex int, table []string) {
 	gwAddr, err := netip.ParseAddr(gw)
 	if err != nil || ifIndex <= 0 {
@@ -65,7 +76,17 @@ func refreshSplitRoutesFor(gw string, ifIndex int, table []string) {
 	if err != nil || !ok {
 		return
 	}
-	sweepSplitRoutes(gwAddr)
+	// 先撤自己上一版的路由：有 live 记录就只删记录里的；没有（进程刚起、或
+	// 接管时没铺成分流）才退回形态扫描。
+	if own := currentLiveSplitOwnership(); own != nil {
+		if removed, serr := sweepOwnedSplitRoutes(own); serr != nil {
+			logf("国内分流热更新：旧路由有 %d 条没删掉（%v），继续铺新表", removed, serr)
+		}
+	} else if removed, serr := sweepSplitRoutes(gwAddr); serr != nil {
+		logf("国内分流热更新：按形态清理旧路由时 %d 条失败: %v", removed, serr)
+	}
+
+	installed := make([]string, 0, len(table))
 	failed := 0
 	for _, p := range table {
 		prefix, err := netip.ParsePrefix(p)
@@ -76,8 +97,11 @@ func refreshSplitRoutesFor(gw string, ifIndex int, table []string) {
 		if err := a.LUID.AddRoute(prefix.Masked(), gwAddr, splitRouteMetric); err != nil &&
 			!errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) {
 			failed++
+			continue
 		}
+		installed = append(installed, prefix.Masked().String())
 	}
+	setLiveSplitOwnership(newSplitOwnership(a.key(), gwAddr, installed))
 	if failed > 0 {
 		logf("国内分流重铺：%d 条失败（这些网段暂走隧道，不影响可用）", failed)
 	}
@@ -129,13 +153,20 @@ func Capture(cfg NetConfig) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("找不到承载默认路由的网卡（ifIndex %d）", gwIfIndex)
 	}
 
-	var dnsStrings []string
-	for _, a := range adapterDNS(def.LUID) {
-		dnsStrings = append(dnsStrings, a.String())
-	}
-
 	return newSnapshot(gw.Unmap().String(), int(gwIfIndex), serverNextHop, srv.String(),
-		[]IfaceDNS{{Name: def.Name, Index: int(def.Index), DNS: dnsStrings}}, cfg), nil
+		[]IfaceDNS{captureIfaceDNS(def)}, cfg), nil
+}
+
+// captureIfaceDNS 抓一张网卡的原 DNS，连同稳定身份和来源一起记下来。
+func captureIfaceDNS(a adapterInfo) IfaceDNS {
+	rec := IfaceDNS{Name: a.Name, Index: int(a.Index), GUID: a.GUID}
+	for _, d := range adapterDNS(a.LUID) {
+		rec.DNS = append(rec.DNS, d.String())
+	}
+	if auto, ok := dnsWasAuto(a.LUID); ok {
+		rec.DNSAuto = &auto
+	}
+	return rec
 }
 
 // resolveIPv4 把 host:port 里拆出来的主机部分变成 IPv4 地址。
@@ -269,9 +300,11 @@ func ConfigureAdapter(cfg NetConfig) error {
 // 最后铺国内直连分流（最慢的一步放最后，前面的失败不至于白等）。
 // 路由计划由 routePlan（纯函数）产出，绕行先于接管的顺序在那里保证。
 //
+// 用指针接收者是为了把「实际装了哪些分流路由」写回快照：还原时只清自己装的。
+//
 // 系统刚启动时网络栈可能尚未就绪（表现为 ERROR_NOT_FOUND，WireGuard 同款
 // 处理），此时退避重试；其它错误直接报给上层。
-func (s Snapshot) Apply(cfg NetConfig) error {
+func (s *Snapshot) Apply(cfg NetConfig) error {
 	evaluatePitfalls(cfg.ServerIP)
 	for attempt := 0; ; attempt++ {
 		err := s.applyOnce(cfg)
@@ -286,7 +319,7 @@ func (s Snapshot) Apply(cfg NetConfig) error {
 	}
 }
 
-func (s Snapshot) applyOnce(cfg NetConfig) error {
+func (s *Snapshot) applyOnce(cfg NetConfig) error {
 	if err := configureAdapterLUID(cfg); err != nil {
 		return err
 	}
@@ -297,7 +330,17 @@ func (s Snapshot) applyOnce(cfg NetConfig) error {
 
 	var def adapterInfo
 	haveDef := false
-	if s.DefaultIfIndex != 0 {
+	if len(s.Interfaces) > 0 {
+		def, haveDef, err = adapterForIface(s.Interfaces[0])
+		if err != nil {
+			return err
+		}
+		if !haveDef {
+			// 快照里记着 GUID 的网卡不在了：别退回索引硬找一个替身，那可能
+			// 把路由和 DNS 写到另一张网卡上。让连接失败，比改错网卡好。
+			return fmt.Errorf("找不到快照记录的网卡 %q（可能已被禁用或移除）", s.Interfaces[0].Name)
+		}
+	} else if s.DefaultIfIndex != 0 {
 		def, haveDef, err = adapterByIndex(uint32(s.DefaultIfIndex))
 		if err != nil {
 			return err
@@ -305,7 +348,7 @@ func (s Snapshot) applyOnce(cfg NetConfig) error {
 	}
 
 	// 1) 绕行 + 接管路由（顺序由 routePlan 保证）
-	for _, op := range routePlan(s, cfg) {
+	for _, op := range routePlan(*s, cfg) {
 		luid := def.LUID
 		if op.onTunnel {
 			luid = tunLUID
@@ -320,7 +363,7 @@ func (s Snapshot) applyOnce(cfg NetConfig) error {
 
 	// 2) DNS 改写到隧道地址 + 刷新缓存
 	for _, iface := range s.Interfaces {
-		a, ok, err := adapterByName(iface.Name)
+		a, ok, err := adapterForIface(iface)
 		if err != nil || !ok {
 			continue
 		}
@@ -343,6 +386,7 @@ func (s Snapshot) applyOnce(cfg NetConfig) error {
 	gwAddr, gwErr := netip.ParseAddr(s.DefaultGateway)
 	if gwErr == nil && haveDef {
 		added, failed := 0, 0
+		var installed []string
 		for _, p := range ActiveCNRoutes() {
 			prefix, err := netip.ParsePrefix(p)
 			if err != nil {
@@ -353,8 +397,14 @@ func (s Snapshot) applyOnce(cfg NetConfig) error {
 				failed++
 				continue
 			}
+			// 已存在的那条也记成自己的：形状（本接口 + 本网关 + metric 5 +
+			// 同一前缀）与本程序铺的完全一致，不记的话还原时会留在表里。
+			installed = append(installed, prefix.Masked().String())
 			added++
 		}
+		own := newSplitOwnership(def.key(), gwAddr, installed)
+		s.Split = own
+		setLiveSplitOwnership(own)
 		switch {
 		case failed == 0:
 			logf("智能分流已启用：国内流量直连，其余走隧道")
@@ -378,36 +428,74 @@ func setAdapterDNS(l winipcfg.LUID, servers []string) error {
 	return l.SetDNS(windows.AF_INET, addrs, nil)
 }
 
-// Restore 尽力还原全部配置：某一步失败不该阻断后面的还原。
+// applyIfaceDNS 按快照记录的方式还原一张网卡的 DNS。
+// 自动来源或来源未知 → 清空静态设置让 DHCP 重新下发；只有明确是静态配置时
+// 才写回原地址（见 IfaceDNS.DNSAuto）。
+func applyIfaceDNS(l winipcfg.LUID, iface IfaceDNS) error {
+	if iface.restoreAsAuto() {
+		return l.FlushDNS(windows.AF_INET)
+	}
+	return setAdapterDNS(l, iface.DNS)
+}
+
+// restoreIfacesDNS 按快照逐张网卡还原 DNS，返回每张网卡的错误。
+// 网卡已不在（拔掉的 USB 网卡等）时跳过：没有可还原的对象，也不该报失败。
+func restoreIfacesDNS(ifaces []IfaceDNS) []error {
+	var errs []error
+	for _, iface := range ifaces {
+		a, ok, err := adapterForIface(iface)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("查快照里的网卡 %s: %w", iface.Name, err))
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if err := applyIfaceDNS(a.LUID, iface); err != nil {
+			errs = append(errs, fmt.Errorf("还原网卡 %s 的 DNS: %w", iface.Name, err))
+		}
+	}
+	return errs
+}
+
+// defaultAdapter 找快照里承载默认路由的那张网卡（GUID 优先，旧快照退回索引）。
+func defaultAdapter(s Snapshot) (adapterInfo, bool) {
+	if len(s.Interfaces) > 0 {
+		if a, ok, err := adapterForIface(s.Interfaces[0]); err == nil && ok {
+			return a, true
+		}
+		return adapterInfo{}, false
+	}
+	if s.DefaultIfIndex != 0 {
+		if a, ok, err := adapterByIndex(uint32(s.DefaultIfIndex)); err == nil && ok {
+			return a, true
+		}
+	}
+	return adapterInfo{}, false
+}
+
+// Restore 还原全部配置：某一步失败不阻断后面的还原，但每一步的结果都要检查。
+//
+// 以前这里对路由/NRPT 删除一律 `_ =`，然后调用方直接报「已断开」：其实路由
+// 可能还在、NRPT 规则可能还指着已拆掉的隧道网关，用户下次断网时无从判断。
+// 现在把所有失败汇总返回，调用方据此保留 state.json 重试。
 //
 // 此时隧道多半已经拆掉（断开先关适配器），/1 路由和隧道地址会随适配器一起
 // 消失；这里只负责还 DNS、撤 NRPT、扫掉国内分流和绕行路由的残留。
 func (s Snapshot) Restore(cfg NetConfig) error {
-	var firstErr error
+	var errs []error
 	fail := func(err error) {
-		if firstErr == nil {
-			firstErr = err
+		if err != nil {
+			errs = append(errs, err)
 		}
 	}
 
 	// NRPT 最先撤：规则指向隧道网关，万一隧道已拆，留着它会让 Pi 域名解析死掉。
-	nrptRemove()
+	fail(nrptRemove())
 
-	// DNS 还原：原值来自快照。原来就没有静态 DNS 的网卡清空即可回到自动获取
-	// —— FlushDNS 是「清空设置」，等价于旧版 netsh source=dhcp，不会塞编造地址。
-	for _, iface := range s.Interfaces {
-		a, ok, err := adapterByName(iface.Name)
-		if err != nil {
-			fail(err)
-			continue
-		}
-		if !ok {
-			continue // 网卡已不在（如拔掉的 USB 网卡），没什么可还原的
-		}
-		if err := setAdapterDNS(a.LUID, iface.DNS); err != nil {
-			fail(fmt.Errorf("还原网卡 %s 的 DNS: %w", iface.Name, err))
-		}
-	}
+	// DNS 还原：原值来自快照。自动来源/来源未知的清空即可回到 DHCP 自动获取
+	// —— FlushDNS 是「清空静态设置」，不会塞编造地址。
+	errs = append(errs, restoreIfacesDNS(s.Interfaces)...)
 
 	// 隧道网关与云服地址优先取快照：自愈路径上 cfg 是零值（那时连接码还没加载），
 	// 只有快照里记着本次接管用的是什么。
@@ -425,40 +513,72 @@ func (s Snapshot) Restore(cfg NetConfig) error {
 	// 网卡」的元凶，必须无条件撤掉。
 	if tun, ok, _ := adapterByName(AdapterName); ok {
 		if gw, err := netip.ParseAddr(tunnelGw); err == nil {
-			_ = tun.LUID.DeleteRoute(netip.MustParsePrefix("0.0.0.0/1"), gw)
-			_ = tun.LUID.DeleteRoute(netip.MustParsePrefix("128.0.0.0/1"), gw)
+			fail(deleteRouteIgnoringMissing(tun.LUID, netip.MustParsePrefix("0.0.0.0/1"), gw))
+			fail(deleteRouteIgnoringMissing(tun.LUID, netip.MustParsePrefix("128.0.0.0/1"), gw))
 		} else {
 			// 连网关都拿不到（快照损坏，或来自还没记录它的旧版本）：按前缀整批扫，
 			// 隧道网卡上的 /1 只可能是我们铺的。
-			sweepTunnelHalfRoutes(tun.LUID)
+			if _, err := sweepTunnelHalfRoutes(tun.LUID); err != nil {
+				fail(fmt.Errorf("撤隧道接管路由: %w", err))
+			}
 		}
 		// 它身上挂的隧道 DNS 也一并撤掉，别留一个指向死网关的解析器
-		_ = tun.LUID.FlushDNS(windows.AF_INET)
+		if err := tun.LUID.FlushDNS(windows.AF_INET); err != nil && !routeMissing(err) {
+			fail(fmt.Errorf("清理隧道网卡 DNS: %w", err))
+		}
 	}
 
-	def, haveDef, err := adapterByIndex(uint32(s.DefaultIfIndex))
+	var def adapterInfo
+	haveDef := false
+	var err error
+	if len(s.Interfaces) > 0 {
+		def, haveDef, err = adapterForIface(s.Interfaces[0])
+	} else if s.DefaultIfIndex != 0 {
+		def, haveDef, err = adapterByIndex(uint32(s.DefaultIfIndex))
+	}
 	if err != nil {
 		fail(err)
 	}
 
 	if haveDef {
-		// 国内分流残留：按「下一跳 = 原默认网关 且 metric = 5」整批扫除，
-		// 网段表更新过也能清干净上一版留下的路由。
-		if gw, err := netip.ParseAddr(s.DefaultGateway); err == nil {
-			sweepSplitRoutes(gw)
+		// 国内分流残留：有所有权记录时只清自己装的那一组；旧快照没记，只能退回
+		// 「下一跳 + metric」的形态扫描（会碰到同形态的用户路由，见 sweepSplitRoutes）。
+		owns := make([]*splitOwnership, 0, 2)
+		if s.Split != nil {
+			owns = append(owns, s.Split)
+		}
+		if live := currentLiveSplitOwnership(); live != nil && live != s.Split {
+			owns = append(owns, live)
+		}
+		if len(owns) > 0 {
+			for _, own := range owns {
+				removed, serr := sweepOwnedSplitRoutes(own)
+				if serr != nil {
+					fail(fmt.Errorf("清理国内分流: %w", serr))
+				} else if removed > 0 {
+					logf("已清理国内分流残留 %d 条", removed)
+				}
+			}
+		} else if gw, gerr := netip.ParseAddr(s.DefaultGateway); gerr == nil {
+			removed, serr := sweepSplitRoutes(gw)
+			if serr != nil {
+				fail(fmt.Errorf("清理国内分流（旧快照无所有权记录）: %w", serr))
+			} else if removed > 0 {
+				logf("已清理国内分流残留 %d 条（按形态扫描）", removed)
+			}
 		}
 
 		// 替旧版本擦屁股：早期版本改写过 0.0.0.0/0。只匹配下一跳等于隧道网关的，
 		// 不会误伤用户的默认路由。
-		if gw, err := netip.ParseAddr(tunnelGw); err == nil {
-			_ = def.LUID.DeleteRoute(netip.MustParsePrefix("0.0.0.0/0"), gw)
+		if gw, gerr := netip.ParseAddr(tunnelGw); gerr == nil {
+			fail(deleteRouteIgnoringMissing(def.LUID, netip.MustParsePrefix("0.0.0.0/0"), gw))
 		}
 
 		// 绕行路由：快照里记着下一跳才加过它，按同样的下一跳精确删除。
 		if s.ServerNextHop != "" && serverIP != "" {
-			if srv, err := netip.ParseAddr(serverIP); err == nil {
-				if hop, err := netip.ParseAddr(s.ServerNextHop); err == nil {
-					_ = def.LUID.DeleteRoute(netip.PrefixFrom(srv, 32), hop)
+			if srv, gerr := netip.ParseAddr(serverIP); gerr == nil {
+				if hop, herr := netip.ParseAddr(s.ServerNextHop); herr == nil {
+					fail(deleteRouteIgnoringMissing(def.LUID, netip.PrefixFrom(srv, 32), hop))
 				}
 			}
 		}
@@ -468,28 +588,43 @@ func (s Snapshot) Restore(cfg NetConfig) error {
 		//
 		// 判据必须是**隧道网关**：用物理默认网关当判据会误清用户手工配置的 DNS
 		// （手工 DNS 常常正好填的是路由器地址，也就是原默认网关）。
-		if gw, err := netip.ParseAddr(tunnelGw); err == nil {
-			aas, err := adapters()
-			if err == nil {
-				for _, a := range aas {
-					if a.Index == uint32(s.DefaultIfIndex) {
-						continue
-					}
-					for _, d := range adapterDNS(a.LUID) {
-						if d == gw {
-							if err := a.LUID.FlushDNS(windows.AF_INET); err != nil {
-								logf("清理网卡 %s 的残留 DNS 失败: %v", a.Name, err)
-							}
-							break
+		if gw, gerr := netip.ParseAddr(tunnelGw); gerr == nil {
+			aas, aerr := adapters()
+			if aerr != nil {
+				fail(fmt.Errorf("枚举网卡清理残留 DNS: %w", aerr))
+			}
+			for _, a := range aas {
+				isDefault := a.Index == uint32(s.DefaultIfIndex)
+				if len(s.Interfaces) > 0 {
+					isDefault = s.Interfaces[0].ref().sameAdapter(a.key())
+				}
+				if isDefault {
+					continue
+				}
+				for _, d := range adapterDNS(a.LUID) {
+					if d == gw {
+						if ferr := a.LUID.FlushDNS(windows.AF_INET); ferr != nil && !routeMissing(ferr) {
+							fail(fmt.Errorf("清理网卡 %s 的残留 DNS: %w", a.Name, ferr))
 						}
+						break
 					}
 				}
 			}
 		}
 	}
 
+	// 进程内的所有权记录随这次还原一起失效：不管快照是否完好，接下来要么重新
+	// 接管（Apply 会重设），要么就在没接管的干净状态。
+	clearLiveSplitOwnership()
+
 	flushResolverCache()
-	return firstErr
+	if len(errs) > 0 {
+		joined := errors.Join(errs...)
+		// 报数不报「成功」：调用方看到 error 会保留 state.json，下次断开/启动重试。
+		logf("网络还原有 %d 处未完成（状态文件保留，稍后会重试）: %v", len(errs), joined)
+		return joined
+	}
+	return nil
 }
 
 // ---------- NRPT（注册表直写，Dnscache 动态生效）----------
@@ -522,25 +657,46 @@ func nrptApply(gateway string) error {
 	return k.SetStringValue("Comment", nrptRuleComment)
 }
 
+// regMissing 报告注册表对象本来就不在（重复删除必须幂等）。
+func regMissing(err error) bool {
+	return errors.Is(err, windows.ERROR_FILE_NOT_FOUND) ||
+		errors.Is(err, windows.ERROR_PATH_NOT_FOUND) ||
+		errors.Is(err, windows.ERROR_NOT_FOUND)
+}
+
 // nrptRemove 删掉我们名下的全部 NRPT 规则：固定 GUID 那条 + 任何 Comment
 // 等于标记的旧规则（旧版 PowerShell 创建的 GUID 是随机的，只能按标记扫）。
-// 键不存在时静默返回，重复执行无害。
-func nrptRemove() {
-	_ = registry.DeleteKey(registry.LOCAL_MACHINE, nrptKeyPath+`\`+nrptRuleGUID)
+// 键不存在时不算失败，重复执行无害；其它删除失败会汇总返回，不能吞掉。
+func nrptRemove() error {
+	var errs []error
+	delKey := func(path string) {
+		if err := registry.DeleteKey(registry.LOCAL_MACHINE, path); err != nil && !regMissing(err) {
+			errs = append(errs, fmt.Errorf("删除 NRPT 规则 %s: %w", path, err))
+		}
+	}
+	delKey(nrptKeyPath + `\` + nrptRuleGUID)
 
 	root, err := registry.OpenKey(registry.LOCAL_MACHINE, nrptKeyPath,
 		registry.ENUMERATE_SUB_KEYS|registry.QUERY_VALUE)
 	if err != nil {
-		return
+		if !regMissing(err) {
+			errs = append(errs, fmt.Errorf("打开 NRPT 根键: %w", err))
+		}
+		return errors.Join(errs...)
 	}
 	names, err := root.ReadSubKeyNames(-1)
 	root.Close()
 	if err != nil {
-		return
+		errs = append(errs, fmt.Errorf("枚举 NRPT 规则: %w", err))
+		return errors.Join(errs...)
 	}
 	for _, name := range names {
-		k, err := registry.OpenKey(registry.LOCAL_MACHINE, nrptKeyPath+`\`+name, registry.QUERY_VALUE)
+		path := nrptKeyPath + `\` + name
+		k, err := registry.OpenKey(registry.LOCAL_MACHINE, path, registry.QUERY_VALUE)
 		if err != nil {
+			if !regMissing(err) {
+				errs = append(errs, fmt.Errorf("打开 NRPT 规则 %s: %w", path, err))
+			}
 			continue
 		}
 		comment, _, _ := k.GetStringValue("Comment")
@@ -548,6 +704,7 @@ func nrptRemove() {
 		if comment != nrptRuleComment {
 			continue
 		}
-		_ = registry.DeleteKey(registry.LOCAL_MACHINE, nrptKeyPath+`\`+name)
+		delKey(path)
 	}
+	return errors.Join(errs...)
 }
