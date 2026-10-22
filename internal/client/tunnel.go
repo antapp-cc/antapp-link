@@ -191,6 +191,11 @@ func (t *Tunnel) Kick() {
 // sessionEndInfo 把会话结束的错误归类成日志级别和人话原因，
 // 让「会话结束」这行日志一眼能看出断线是什么造成的。
 func sessionEndInfo(err error) (slog.Level, string) {
+	// 到点主动重建不是故障，级别压到 Info：否则每 8 小时亮一个 ▲，
+	// 用户会以为链路出了问题，反而来问「为什么老是断」。
+	if errors.Is(err, errScheduledRecycle) {
+		return slog.LevelInfo, "定期重建连接（重置连接状态），不是故障"
+	}
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "EOF"):
@@ -1082,11 +1087,19 @@ func (s *clientSession) run(ctx context.Context) error {
 	s.ctx = ctx
 	s.touchCtrl()
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	go func() { errCh <- s.pumpFromTunnel(ctx) }()
 	go func() { errCh <- s.pumpFromDevice(ctx) }()
 	go func() { errCh <- s.heartbeat(ctx) }()
 	go s.watchDataPath(ctx)
+	// 到点主动结束会话，交给 Run 重开一次。只在真出错（到点）时投递：ctx 正常取消
+	// 时它返回 nil，把 nil 塞进 errCh 会被当成「某个协程正常收尾」，进而让 Run 走上
+	// 「runCtx 已取消 → 立即重连」那条路，形成无退避的重连风暴。
+	go func() {
+		if err := s.recycleAt(ctx); err != nil {
+			errCh <- err
+		}
+	}()
 	if s.members > 1 {
 		// 不单独打「多连接模式：目标 N 条，启动成员维护」—— 上面「已连接 … N 条并行连接」
 		// 已经说过了，用户不需要知道内部有个维护协程。
@@ -1104,6 +1117,73 @@ func (s *clientSession) run(ctx context.Context) error {
 
 // touchCtrl 记下控制连接最近一次收到帧的时间（心跳判死的唯一依据）。
 func (s *clientSession) touchCtrl() { s.ctrlSeen.Store(time.Now().UnixNano()) }
+
+// errScheduledRecycle 是「到点主动重建会话」的哨兵错误。
+//
+// 它走上层 Run 的普通重连路径（退避、重建 TLS、重新 JOIN），所以不需要任何额外的
+// 重连逻辑 —— 只要让会话返回它，现有循环就会把连接重开一次。
+var errScheduledRecycle = errors.New("定期重建连接")
+
+// 自动重建会话的阈值。用 var 而不是 const：测试要把周期压到毫秒级。
+var (
+	// recycleEvery 是自动重建会话的周期。
+	//
+	// 起因：链路做了 ECMP，同一条 TCP 流的包固定哈希到某条物理路径上。一旦那条路径
+	// 乱序严重（实测 rcv_ooopack 到过 20 万、乱序率 20%+），这条连接在整个生命周期
+	// 里都换不出去 —— 表现为「连上了但什么都打不开，重启云服或点重连立刻恢复」。
+	// 重连会换一个源端口，等于重新抽签选路径，这是客户端唯一能做的缓解。
+	//
+	// 8 小时：用户实测劣化到不可用约需 2 天，取 1/6 余量，一天只断 3 次、每次 8 秒。
+	recycleEvery = 8 * time.Hour
+
+	// recycleBusyBytes 是「正在传大量数据」的门槛：采样一分钟超过这个数就推迟。
+	//
+	// 重建会断 8 秒。正在下载或同步区块时插进去，损失比劣化本身还大。
+	// 类型跟 Stats 的计数器对齐（uint64），省掉比较处再转一次。
+	recycleBusyBytes uint64 = 5 << 20
+
+	// recycleBusyProbe 是判定「忙不忙」的采样时长。
+	recycleBusyProbe = time.Minute
+
+	// recycleRetry 是「太忙、推迟」之后重新检查的间隔。
+	recycleRetry = 10 * time.Minute
+)
+
+// recycleAt 到点返回 errScheduledRecycle，让上层把会话重建一次。
+//
+// 只在真正空闲时动手：先采样一分钟，这期间收发合计超过 recycleBusyBytes 就推迟
+// 一轮。用户正在用网时被打断 8 秒，比他不点重连更难受。
+func (s *clientSession) recycleAt(ctx context.Context) error {
+	if recycleEvery <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(recycleEvery)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-timer.C:
+		}
+
+		tx0, rx0 := s.stats.TxBytes.Load(), s.stats.RxBytes.Load()
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(recycleBusyProbe):
+		}
+		busy := s.stats.TxBytes.Load() - tx0 + s.stats.RxBytes.Load() - rx0
+		if busy >= recycleBusyBytes {
+			s.log.Info("正在传输数据，推迟自动重建连接")
+			timer.Reset(recycleRetry)
+			continue
+		}
+
+		s.log.Info("定期重建连接（重置连接状态），不是故障")
+		return errScheduledRecycle
+	}
+}
 
 // watchDataPath 定期检查「数据面还在不在动」。
 //
