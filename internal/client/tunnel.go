@@ -1153,9 +1153,12 @@ var (
 
 	// recycleBusyBytes 是「正在传大量数据」的门槛：采样一分钟超过这个数就推迟。
 	//
-	// 重建要断约 10 秒。正在下载或同步区块时插进去，损失比劣化本身还大。
+	// 20 MB/分钟 = 333 KB/s，约为隧道实测上限（542 KB/s）的 60% —— 只有接近跑满
+	// 带宽时才推迟。原来取 5 MB（83 KB/s）太低：实测 Pi 节点空闲也有 20~33 KB/s，
+	// 稍有活动就会越过它，导致每次重建都被推迟、定时器等于没装。
+	//
 	// 类型跟 Stats 的计数器对齐（uint64），省掉比较处再转一次。
-	recycleBusyBytes uint64 = 5 << 20
+	recycleBusyBytes uint64 = 20 << 20
 
 	// recycleBusyProbe 是判定「忙不忙」的采样时长。
 	recycleBusyProbe = time.Minute
