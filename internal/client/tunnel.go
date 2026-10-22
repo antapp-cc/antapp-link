@@ -709,10 +709,11 @@ func (s *clientSession) enqueue(k int, batch []byte) {
 	select {
 	case s.slotTx[k] <- cp:
 	default:
+		// 只进 Debug，不报 Warn。这条在 Pi 节点上会持续触发（几十个 peer 的上行
+		// 把管道吃满，每分钟都在丢），刷屏之后反而看不出真正的问题。计数仍然保留，
+		// 排障时开 Debug 就能看到；「丢包统计」那行也按原因汇总了同样的数字。
 		n := s.tunnel.Drops.SlotQueueFull.Add(1)
-		if n == 100 || n%1000 == 0 {
-			s.log.Warn(fmt.Sprintf("槽位写队列满，上行在丢（槽 %d，丢 %d 批）", k, n))
-		}
+		s.log.Debug("槽位写队列满，丢弃一批", "slot", k, "drops", n)
 	}
 }
 

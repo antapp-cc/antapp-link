@@ -964,14 +964,15 @@ func (a *App) watchRunStats(ctx context.Context, tun *Tunnel) {
 				"rx_mb", tun.Stats.RxBytes.Load()/1024/1024,
 				"tx_mb", tun.Stats.TxBytes.Load()/1024/1024)
 
-			// 四个分类挤在「运行状态」那行会有 88 宽度，界面上被截断，所以单独一条；
-			// 全为 0 时不打 —— 正常情况下它们本来就该一直是 0，没必要十分钟刷一次。
+			// 四个分类只进 Debug：Pi 节点有 80 多个 peer，上行常态就是满的，
+			// 这行会一直显示「槽队列=几万」—— 用户看不懂，也改变不了什么
+			// （需求本来就超过管道容量）。真要排障时开 Debug 就能看到。
 			dPkt := tun.Drops.PktChFull.Load()
 			dEmpty := tun.Drops.EmptySlot.Load()
 			dQueue := tun.Drops.SlotQueueFull.Load()
 			dMember := tun.Drops.MemberDrop.Load()
 			if dPkt > 0 || dEmpty > 0 || dQueue > 0 || dMember > 0 {
-				a.log.Info("丢包统计",
+				a.log.Debug("丢包统计",
 					"drop_pktch", dPkt,
 					"drop_empty", dEmpty,
 					"drop_queue", dQueue,
