@@ -48,9 +48,31 @@ func TestRulesMasqueradeAndForward(t *testing.T) {
 }
 
 func TestRulesClampMSS(t *testing.T) {
-	// 内层 MTU 只有 1400，不 clamp 就会出现「小包通、网页打不开」的黑洞
+	// 内层 MTU 只有 1400，不 clamp 就会出现「小包通、网页打不开」的黑洞。
+	// 但必须限定来源网段与出口网卡：不限定的 clamp 会波及云服上所有 FORWARD 的
+	// TCP SYN（容器、其他转发业务），等于替别人改了 MSS。
 	mustContain(t, ruleStrings(Default(), "eth0"),
-		"-t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu")
+		"-t mangle -A FORWARD -s 10.10.0.0/24 -o eth0 -p tcp --tcp-flags SYN,RST SYN "+
+			"-j TCPMSS --clamp-mss-to-pmtu")
+
+	cfg := Default()
+	cfg.Tunnel.Network = "10.20.0.0/24"
+	mustContain(t, ruleStrings(cfg, "ens3"),
+		"-t mangle -A FORWARD -s 10.20.0.0/24 -o ens3 -p tcp --tcp-flags SYN,RST SYN "+
+			"-j TCPMSS --clamp-mss-to-pmtu")
+}
+
+// 只加新规则不够：升级机器上旧版那条无限定的 clamp 还排在前面，限定等于没生效。
+// Up 会按 legacyRules 逐条 -D 清掉旧形态，所以它必须在这里。
+func TestLegacyRulesRemoveUnscopedClamp(t *testing.T) {
+	want := "mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+	for _, r := range legacyRules(Default()) {
+		joined := strings.Join(append([]string{r.Table, r.Chain}, r.Args...), " ")
+		if joined == want {
+			return
+		}
+	}
+	t.Fatal("legacyRules 里没有旧的无限定 clamp 规则，升级机器上它会被留下来继续 clamp")
 }
 
 func TestRulesOpenTunnelPort(t *testing.T) {
@@ -81,6 +103,42 @@ func TestRulesFollowConfig(t *testing.T) {
 	for _, s := range rules {
 		if strings.Contains(s, "31400:31409") {
 			t.Errorf("规则里不该出现硬编码的默认端口段：%s", s)
+		}
+	}
+}
+
+// mode=udp 时数据包走 UDP，端口与控制连接相同。缺了这条 INPUT 放行，客户端的
+// 认证探测包在服务端就被丢掉，UDP 模式永远连不上（客户端又不会偷偷回退 TCP）。
+func TestRulesOpenUDPTunnelPort(t *testing.T) {
+	cfg := Default()
+	cfg.Mode = "udp"
+	rules := ruleStrings(cfg, "eth0")
+
+	mustContain(t, rules, "-A INPUT -p udp --dport 62233 -j ACCEPT")
+	// 控制连接仍走 TCP：只加规则，不替换
+	mustContain(t, rules, "-A INPUT -p tcp --dport 62233 -j ACCEPT")
+}
+
+// 用配置里的实际监听端口，不能把默认 62233 写死进规则。
+func TestRulesUDPPortFollowsListen(t *testing.T) {
+	cfg := Default()
+	cfg.Mode = "udp"
+	cfg.Listen = "0.0.0.0:45000"
+	rules := ruleStrings(cfg, "eth0")
+
+	mustContain(t, rules, "-A INPUT -p udp --dport 45000 -j ACCEPT")
+	for _, s := range rules {
+		if strings.Contains(s, "-p udp --dport 62233") {
+			t.Errorf("udp 规则用了默认端口而不是配置里的监听端口：%s", s)
+		}
+	}
+}
+
+// tcp 模式下服务端并不监听 UDP，别顺带开一个没人管的 UDP 口。
+func TestRulesTCPModeHasNoUDPTunnelPort(t *testing.T) {
+	for _, s := range ruleStrings(Default(), "eth0") {
+		if strings.Contains(s, "-p udp --dport 62233") {
+			t.Errorf("tcp 模式下不该有 UDP 隧道端口规则：%s", s)
 		}
 	}
 }

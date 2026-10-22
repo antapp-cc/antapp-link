@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"strings"
+
+	"github.com/antapp-cc/antapp-link/internal/pki"
 )
 
 // ChainName 是自定义链名。用它而不是往 PREROUTING 里塞散装规则，
@@ -44,7 +46,7 @@ func Rules(cfg Config, wanIface string) []Rule {
 		listenPort = "62233"
 	}
 
-	return []Rule{
+	rules := []Rule{
 		// 客户端借云服的干净出口出网
 		{Table: "nat", Chain: "POSTROUTING", Args: []string{"-s", network, "-o", wanIface, "-j", "MASQUERADE"}},
 		{Chain: "FORWARD", Args: []string{"-s", network, "-j", "ACCEPT"}},
@@ -53,8 +55,11 @@ func Rules(cfg Config, wanIface string) []Rule {
 		{Chain: "FORWARD", Args: []string{"-d", network, "-m", "conntrack",
 			"--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"}},
 
-		// 内层 MTU 只有 1400，不 clamp 就会出现「小包通、网页打不开」的黑洞
+		// 内层 MTU 只有 1400，不 clamp 就会出现「小包通、网页打不开」的黑洞。
+		// 必须限定来源网段和出口网卡：不限定的话，云服上所有经过 FORWARD 的 TCP SYN
+		// （容器、其他转发业务）都会被一起 clamp，改了别人的 MSS。
 		{Table: "mangle", Chain: "FORWARD", Args: []string{
+			"-s", network, "-o", wanIface,
 			"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"}},
 
 		{Chain: "INPUT", Args: []string{"-p", "tcp", "--dport", listenPort, "-j", "ACCEPT"}},
@@ -68,6 +73,20 @@ func Rules(cfg Config, wanIface string) []Rule {
 		// 收到连接立即应答、再经隧道转给节点机。
 		{Chain: "INPUT", Args: []string{"-p", "tcp", "--dport", portRange, "-j", "ACCEPT"}},
 	}
+
+	// mode=udp 时数据包走 UDP，和 TCP 控制连接共用同一个端口号（不同协议，不冲突）。
+	// 少了这条，客户端发出的认证探测包在服务端就被 INPUT 丢掉，UDP 模式永远连不上 ——
+	// 而客户端不会偷偷回退 TCP，用户只会看到「怎么都连不上」。
+	//
+	// 和其它 INPUT 放行一样走 ensureRule 追加。这依赖链上没有更早的 DROP/REJECT：
+	// 现网机器 `iptables -S INPUT` 只有本项目这几条 ACCEPT、默认策略 ACCEPT，
+	// 追加的规则一定命中。若目标机的 INPUT 前面有 DROP，本项目所有端口放行都会
+	// 一起失效，不只是这一条。
+	if mode, _ := pki.ParseMode(cfg.Mode); mode == pki.ModeUDP {
+		rules = append(rules, Rule{Chain: "INPUT",
+			Args: []string{"-p", "udp", "--dport", listenPort, "-j", "ACCEPT"}})
+	}
+	return rules
 }
 
 // legacyRules 是本项目历史上铺过、现在已经不用的规则形态，供 Up 在铺新规则前清理。
@@ -81,5 +100,9 @@ func Rules(cfg Config, wanIface string) []Rule {
 func legacyRules(cfg Config) []Rule {
 	return []Rule{
 		{Chain: "FORWARD", Args: []string{"-d", cfg.Tunnel.Network, "-j", "ACCEPT"}},
+		// 旧版 clamp 没限定网段与出口网卡，会把云服上所有 FORWARD 的 TCP SYN 一起
+		// clamp。新规则加了限定，但旧规则仍排在前面生效 —— 不删等于没改。
+		{Table: "mangle", Chain: "FORWARD", Args: []string{
+			"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"}},
 	}
 }
