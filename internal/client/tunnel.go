@@ -12,6 +12,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -453,15 +455,43 @@ func (t *Tunnel) readPump(ctx context.Context, onFatal context.CancelFunc) {
 //
 // 实际能不能调到由内核限制决定（Linux 受 net.core.rmem_max / wmem_max 约束，服务端
 // 安装脚本已把它们提到 16 MB），调不上就按系统默认跑，不影响功能。
-const socketBufferBytes = 4 << 20
+// socketBufferBytes 是显式设置的收发缓冲字节数，0 表示完全不设置。
+//
+// 默认 0（交给系统自动调节）：显式设 SO_RCVBUF/SO_SNDBUF 会关掉该 socket 的自动
+// 调节（Linux 的 tcp_moderate_rcvbuf 对这条 socket 就失效了），而系统自动调节在
+// 未知线路上通常比一个写死的数字更合适。之前固定 4 MB，等于把自动调节全关了。
+//
+// 想要 A/B 对照时用环境变量覆盖：ANTAPP_SOCKET_BUFFER=1048576 之类。
+// 实测方法见 Codex 报告的 15 节：系统自动 vs 512K/1M/2M/4M，每次只改一项，
+// 同时记录实际 socket 内存和窗口，不能只看请求值。
+var socketBufferBytes = envSocketBufferBytes()
 
-// tuneTCPBuffers 调大这条 TCP 连接的收发缓冲。
+// 4 MB 这个值的来历（保留作参考，不再作为默认）：外层单条 TCP 实测峰值约 650 KB/s，
+// RTT 275ms，BDP 约 180 KB；取 4 MB 留了 20 倍余量。
+const socketBufferBytesReference = 4 << 20
+
+func envSocketBufferBytes() int {
+	v := strings.TrimSpace(os.Getenv("ANTAPP_SOCKET_BUFFER"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// tuneTCPBuffers 按配置调整这条 TCP 连接的收发缓冲。
 //
 // OpenVPN 用 --sndbuf / --rcvbuf 解决同一个问题：高延迟链路上内核默认缓冲装不下
 // 在途数据，窗口打不满，吞吐上不去。Go 里对应 SetReadBuffer / SetWriteBuffer。
 //
 // 设置失败不当错误：不同平台对上限的处理不一致，调不上只是回到默认值。
 func tuneTCPBuffers(conn net.Conn) {
+	if socketBufferBytes <= 0 {
+		return
+	}
 	tcp, ok := conn.(*net.TCPConn)
 	if !ok {
 		return
