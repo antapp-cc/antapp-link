@@ -631,8 +631,64 @@ func newClientSession(t *Tunnel, conn net.Conn, sid string, tlsCfg *tls.Config, 
 		writes: make([]sync.Mutex, n),
 		flow:   proto.NewFlowTable(),
 	}
+	sess.slotTx = make([]chan []byte, n)
+	for i := range sess.slotTx {
+		sess.slotTx[i] = make(chan []byte, slotTxLen)
+	}
+	sess.slotQueueDrops = make([]atomic.Int64, n)
 	sess.slots[0] = conn
 	return sess
+}
+
+// slotTxLen 是每槽待写批的队列深度，和服务端的 slotQueueLen 对齐。
+// 一批最大约 MaxBatchBytes，4 槽满载约 640KB，可以接受。
+const slotTxLen = 8
+
+// enqueue 把一批上行投递给槽 k 的写协程，立即返回。
+//
+// 批缓冲由 pumpFromDevice 复用，投递后马上会被覆盖，所以必须在这里拷一份。
+// 队列满就丢这批：内层 TCP 会重传，比让网卡 reader 停下来等某一槽好得多。
+func (s *clientSession) enqueue(k int, batch []byte) {
+	if len(batch) == 0 {
+		return
+	}
+	if k < 0 || k >= len(s.slotTx) {
+		s.emptySlotDrops.Add(1)
+		return
+	}
+	// 批缓冲由 pumpFromDevice 复用，投递后马上会被覆盖，所以必须在这里拷一份。
+	cp := make([]byte, len(batch))
+	copy(cp, batch)
+	select {
+	case s.slotTx[k] <- cp:
+	default:
+		n := s.slotQueueDrops[k].Add(1)
+		if n == 100 || n%1000 == 0 {
+			s.log.Warn(fmt.Sprintf("槽位写队列满，上行在丢（槽 %d，丢 %d 批）", k, n))
+		}
+	}
+}
+
+// slotWriteLoop 消费槽 k 的上行批，每个槽一条协程，互不阻塞。
+//
+// flushBatch 只在写控制连接失败或会话该结束时返回错误；成员槽写失败它会自己摘槽
+// 并返回 nil。所以拿到错误就意味着该结束会话，投给 errCh 让 run 走重连。
+func (s *clientSession) slotWriteLoop(ctx context.Context, k int, errCh chan<- error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case batch := <-s.slotTx[k]:
+			if err := flushBatch(s, k, batch); err != nil {
+				// 会话已在收尾时 errCh 可能没人收，用非阻塞投递免得协程卡死
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+		}
+	}
 }
 
 type clientSession struct {
@@ -667,6 +723,18 @@ type clientSession struct {
 	mu     sync.Mutex
 	slots  []net.Conn   // slots[0]=控制连接；成员槽位从 1 开始，nil=空
 	writes []sync.Mutex // 每槽一把写锁；成员槽空时流量落回控制连接，锁也跟着落回
+
+	// slotTx 是每槽的上行待写队列，由各自独立的写协程消费。
+	//
+	// 以前上行只有一个 pumpFromDevice 顺序 flushBatch：任意一条成员连接卡在重传上
+	// （单次写超时 20 秒），其他健康成员的上行也发不出去，64 个包的 pktCh 随即填满
+	// 开始丢包。服务端早就是每槽独立 writer（sc.writeLoop），客户端一直缺这一层。
+	slotTx []chan []byte
+
+	// slotQueueDrops 记录每槽因写队列满被丢掉的批数。和 emptySlotDrops 分开：
+	// 那个是「槽位空」，这个是「槽位在但写不动」，排障时是两回事。
+	slotQueueDrops []atomic.Int64
+
 	// flow 决定上行包走哪个槽：已有流固定不变（保序），新流分给当前承载流数最少的槽。
 	// 纯哈希做不到均衡，一条大流会把某条成员连接塞到写超时被摘掉。
 	flow *proto.FlowTable
@@ -1098,6 +1166,10 @@ func (s *clientSession) run(ctx context.Context) error {
 	s.touchCtrl()
 
 	errCh := make(chan error, 4)
+	// 每槽一条独立写协程：一条成员连接卡在重传上不该拖住其他成员的上行。
+	for k := 0; k < s.members && k < len(s.slotTx); k++ {
+		go s.slotWriteLoop(ctx, k, errCh)
+	}
 	go func() { errCh <- s.pumpFromTunnel(ctx) }()
 	go func() { errCh <- s.pumpFromDevice(ctx) }()
 	go func() { errCh <- s.heartbeat(ctx) }()
@@ -1360,9 +1432,7 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 			kk := s.flow.Slot(more, s.members, s.slotAlive)
 			s.trace.Record("tx", kk, more)
 			if kk != k {
-				if err := flushBatch(s, k, batch); err != nil {
-					return err
-				}
+				s.enqueue(k, batch)
 				k = kk
 				batch = batch[:0]
 			}
@@ -1371,9 +1441,7 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 			s.stats.TxBytes.Add(uint64(len(more)))
 		}
 
-		if err := flushBatch(s, k, batch); err != nil {
-			return err
-		}
+		s.enqueue(k, batch)
 		batch = batch[:0]
 	}
 }
