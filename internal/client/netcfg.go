@@ -218,18 +218,19 @@ func resolveClientDNS(inv pki.Invite) []string {
 			return out
 		}
 	}
-	if len(inv.DNS) > 0 && !isTunnelDNS(inv.DNS) {
+	if len(inv.DNS) > 0 && !isTunnelDNS(inv.DNS, inv.Gateway) {
 		// 连接码明确指定了别的解析器，尊重它
 		return inv.DNS
 	}
 	return defaultClientDNS
 }
 
-// isTunnelDNS 判断这组 DNS 是不是「只有隧道网关」。
+// isTunnelDNS 判断这组 DNS 是不是「恰好只有本次的隧道网关」。
 //
-// 只有这种情况才替换成公共 DNS：连接码如果已经写了具体的公共解析器，那是用户
-// 有意选的，不该被默认值覆盖。
-func isTunnelDNS(servers []string) bool {
+// 只有这种情况才替换成公共 DNS：连接码如果已经写了具体的解析器，那是签发者
+// 有意选的，不该被默认值覆盖。以前按「私网/回环」判断，会把内网 AD、旁路由这类
+// 私网 DNS 一并换掉 —— 那些地址是内网域名的唯一入口，换掉就等于内网域名解析失败。
+func isTunnelDNS(servers []string, gateway string) bool {
 	if len(servers) != 1 {
 		return false
 	}
@@ -237,7 +238,29 @@ func isTunnelDNS(servers []string) bool {
 	if err != nil {
 		return false
 	}
-	return ip.IsPrivate() || ip.IsLoopback()
+	gw, err := netip.ParseAddr(strings.TrimSpace(gateway))
+	if err != nil {
+		return false
+	}
+	return ip.Unmap() == gw.Unmap()
+}
+
+// applyNRPT 写入 Pi 域名的解析规则，失败时返回应当改用的隧道 DNS（nil 表示不用改）。
+//
+// 选「回退隧道 DNS」而不是「取消接管」：NRPT 只管 .minepi.com 的解析路径，写不
+// 进去（常见于权限不足或注册表被安全软件拦）时其它功能仍然可用，为它作废整次
+// 连接代价太大；而留在公共 DNS 上，这个域名在国内递归上必然拿到污染答案，
+// 结果就是「连上了但 Pi 用不了」。退到隧道网关上的 dnsmasq 是唯一能拿到干净
+// 答案的解析器，全部查询多走一趟跨境隧道是性能降级，功能仍然完整。
+func applyNRPT(cfg NetConfig, apply func(string) error) []string {
+	if cfg.Gateway == "" {
+		return nil
+	}
+	if err := apply(cfg.Gateway); err != nil {
+		logf("NRPT 规则写入失败（Pi 域名解析可能被污染）: %v", err)
+		return []string{cfg.Gateway}
+	}
+	return nil
 }
 
 // validateIPv4Only 在接管或还原前确认这次配置全在 IPv4 范围内。

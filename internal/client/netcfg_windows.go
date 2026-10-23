@@ -408,12 +408,26 @@ func (s *Snapshot) applyOnce(cfg NetConfig) error {
 	}
 	flushResolverCache()
 
-	// 3) NRPT：把被污染的 Pi 域名强制指到隧道网关解析
-	if cfg.Gateway != "" {
-		if err := nrptApply(cfg.Gateway); err != nil {
-			// 失败不阻断：顶多 Pi 域名解析回退到污染状态，其余功能不受影响
-			logf("NRPT 规则写入失败（Pi 域名解析可能被污染）: %v", err)
+	// 3) NRPT：把被污染的 Pi 域名强制指到隧道网关解析；写不进去时回退 DNS，
+	//    否则 .minepi.com 会在公共递归上拿到污染答案（见 applyNRPT 的取舍）。
+	if fallback := applyNRPT(cfg, nrptApply); len(fallback) > 0 {
+		for _, iface := range s.Interfaces {
+			a, ok, err := adapterForIface(iface)
+			if err != nil || !ok {
+				continue
+			}
+			if err := setAdapterDNS(a.LUID, fallback); err != nil {
+				logf("NRPT 失败后回退 DNS 写入网卡 %s 失败: %v", iface.Name, err)
+			}
 		}
+		// 隧道网卡自己也要改：它的接口跃点最低，系统解析会先问它。
+		if tun, ok, _ := adapterByName(AdapterName); ok {
+			if err := setAdapterDNS(tun.LUID, fallback); err != nil {
+				logf("NRPT 失败后回退 DNS 写入隧道网卡失败: %v", err)
+			}
+		}
+		flushResolverCache()
+		logf("NRPT 未能生效，DNS 已回退到隧道网关 %v（Pi 域名可解析，所有解析变慢）", fallback)
 	}
 
 	// 4) 智能分流：国内网段走原网关直连，其余才进隧道。

@@ -416,10 +416,23 @@ func TestNetEpochAdvances(t *testing.T) {
 // .minepi.com 由 NRPT 强制走隧道网关。
 func TestResolveClientDNSPrefersPublic(t *testing.T) {
 	t.Setenv("ANTAPP_CLIENT_DNS", "")
-	inv := pki.Invite{DNS: []string{"10.10.0.1"}}
+	inv := pki.Invite{DNS: []string{"10.10.0.1"}, Gateway: "10.10.0.1"}
 	got := resolveClientDNS(inv)
 	if len(got) != 2 || got[0] != "223.5.5.5" {
 		t.Fatalf("默认应换成公共 DNS，实际 %v", got)
+	}
+}
+
+// 连接码指定的私网 DNS（内网 AD、旁路由 DNS 等）不是隧道网关时原样保留。
+//
+// 它是内网域名的唯一解析入口；按「私网地址」一刀切换成公共 DNS，会让内网域名
+// 直接解析失败。
+func TestResolveClientDNSKeepsPrivateCustom(t *testing.T) {
+	t.Setenv("ANTAPP_CLIENT_DNS", "")
+	inv := pki.Invite{DNS: []string{"192.168.1.53"}, Gateway: "10.10.0.1"}
+	got := resolveClientDNS(inv)
+	if len(got) != 1 || got[0] != "192.168.1.53" {
+		t.Fatalf("非隧道网关的私网 DNS 应原样保留，实际 %v", got)
 	}
 }
 
@@ -686,22 +699,53 @@ func TestRefreshSplitRoutesSkipsWhenLedgerBelongsToOtherAdapter(t *testing.T) {
 	}
 }
 
-// 多个地址时不算「只有隧道网关」，原样保留。
+// 只有「恰好等于本次隧道网关」的那一个地址才替换成公共 DNS。
 func TestIsTunnelDNS(t *testing.T) {
 	cases := []struct {
-		in   []string
-		want bool
+		in      []string
+		gateway string
+		want    bool
 	}{
-		{[]string{"10.10.0.1"}, true},
-		{[]string{"127.0.0.1"}, true},
-		{[]string{"192.168.1.1"}, true},
-		{[]string{"223.5.5.5"}, false},
-		{[]string{"10.10.0.1", "223.5.5.5"}, false},
-		{[]string{}, false},
+		{[]string{"10.10.0.1"}, "10.10.0.1", true},
+		{[]string{"10.10.0.1"}, "10.10.0.9", false},
+		{[]string{"192.168.1.53"}, "10.10.0.1", false},
+		{[]string{"127.0.0.1"}, "10.10.0.1", false},
+		{[]string{"223.5.5.5"}, "10.10.0.1", false},
+		{[]string{"10.10.0.1", "223.5.5.5"}, "10.10.0.1", false},
+		{[]string{}, "10.10.0.1", false},
+		{[]string{"10.10.0.1"}, "", false},
 	}
 	for _, c := range cases {
-		if got := isTunnelDNS(c.in); got != c.want {
-			t.Errorf("isTunnelDNS(%v) = %v, want %v", c.in, got, c.want)
+		if got := isTunnelDNS(c.in, c.gateway); got != c.want {
+			t.Errorf("isTunnelDNS(%v, %q) = %v, want %v", c.in, c.gateway, got, c.want)
 		}
+	}
+}
+
+// NRPT 写入失败时回退到隧道网关解析：公共 DNS 拿不到 .minepi.com 的干净答案，
+// 全部查询多走一趟隧道总比「连上了但 Pi 用不了」好。
+func TestApplyNRPTFallsBackToTunnelDNS(t *testing.T) {
+	cfg := testNetConfig() // Gateway = 10.10.0.1
+	var gotGateway string
+	fallback := applyNRPT(cfg, func(gw string) error {
+		gotGateway = gw
+		return errors.New("拒绝访问")
+	})
+	if gotGateway != cfg.Gateway {
+		t.Errorf("NRPT 规则应写到隧道网关上，实际 %q", gotGateway)
+	}
+	if len(fallback) != 1 || fallback[0] != cfg.Gateway {
+		t.Fatalf("NRPT 失败应回退到隧道 DNS %q，实际 %v", cfg.Gateway, fallback)
+	}
+
+	// 写入成功时不动系统 DNS。
+	if fallback := applyNRPT(cfg, func(string) error { return nil }); fallback != nil {
+		t.Errorf("NRPT 成功时不该回退 DNS，实际 %v", fallback)
+	}
+
+	// 云服直连时没有隧道网关，也没有 NRPT 可写。
+	called := false
+	if fallback := applyNRPT(NetConfig{}, func(string) error { called = true; return nil }); fallback != nil || called {
+		t.Errorf("没有隧道网关时不该写 NRPT，实际 called=%v fallback=%v", called, fallback)
 	}
 }
