@@ -48,46 +48,38 @@ const (
 	// handshakeMaxConcurrent 是同时在做的外层 TLS 握手上限。relay 的 256 条上限
 	// 管的是转发连接，隧道监听这条路径上没有任何限制 —— 半开握手洪峰会吃光 fd，
 	// 而 accept 循环看起来还一切正常。
+	//
+	// 准入在派发处理协程之前完成：如果每个 accept 都先起一个 goroutine 再去排队，
+	// 等待队列本身就没有数量上限，洪峰时 goroutine 和 fd 照样会短时间冲高。
 	handshakeMaxConcurrent = 64
-	// handshakeQueueWait 是名额满后允许排队的时间。超过就直接断开：这些连接还没
-	// 完成 TLS、没有任何可信身份，无限排队只会把 fd 占得更久。
-	handshakeQueueWait = 5 * time.Second
 	// tunDropRefreshEvery 是重新执行 ip -s link 的间隔。每 5 秒 fork 一次没必要，
 	// 丢包是趋势指标，30 秒的粒度足够，也避免在 fd 紧张时雪上加霜。
 	tunDropRefreshEvery = 30 * time.Second
 )
 
 // handshakeLimiter 给外层 TLS 握手加一个有界闸门。
+//
+// 名额只覆盖「TLS 握手 + 读 HELLO」这一段（见 serveConn/handle），不覆盖之后的会话：
+// 长连接一占就是几小时，占着握手槽会让 64 条会话之后的新连接全部被拒。
 type handshakeLimiter struct {
 	slots chan struct{}
-	wait  time.Duration
 
 	inFlight atomic.Int64
 	peak     atomic.Int64
 	refused  atomic.Uint64
 }
 
-func newHandshakeLimiter(max int, wait time.Duration) *handshakeLimiter {
-	return &handshakeLimiter{slots: make(chan struct{}, max), wait: wait}
+func newHandshakeLimiter(max int) *handshakeLimiter {
+	return &handshakeLimiter{slots: make(chan struct{}, max)}
 }
 
-// acquire 拿一个握手名额。拿不到返回 (nil, false)，调用方负责关掉连接。
-func (l *handshakeLimiter) acquire(ctx context.Context) (func(), bool) {
+// acquire 非阻塞地拿一个握手名额。拿不到返回 (nil,false)，调用方负责关掉连接：
+// 这些连接还没完成 TLS、没有任何可信身份，排队只会把 fd 占得更久。
+func (l *handshakeLimiter) acquire() (func(), bool) {
 	select {
 	case l.slots <- struct{}{}:
 		return l.granted(), true
 	default:
-	}
-
-	timer := time.NewTimer(l.wait)
-	defer timer.Stop()
-	select {
-	case l.slots <- struct{}{}:
-		return l.granted(), true
-	case <-timer.C:
-		l.refused.Add(1)
-		return nil, false
-	case <-ctx.Done():
 		l.refused.Add(1)
 		return nil, false
 	}
@@ -114,6 +106,8 @@ func (l *handshakeLimiter) granted() func() {
 func (l *handshakeLimiter) snapshot() (inFlight, peak int, refused uint64) {
 	return int(l.inFlight.Load()), int(l.peak.Load()), l.refused.Load()
 }
+
+func (l *handshakeLimiter) refusedCount() uint64 { return l.refused.Load() }
 
 // newInstanceID 生成本次进程的随机 ID，用来确认状态是这一次启动写的。
 func newInstanceID() string {
@@ -202,7 +196,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 
 	s := &Server{cfg: cfg, tun: tun, tlsCfg: tlsCfg, log: logger, joins: newJoinGuard(),
 		fatal:      make(chan error, 1),
-		hs:         newHandshakeLimiter(handshakeMaxConcurrent, handshakeQueueWait),
+		hs:         newHandshakeLimiter(handshakeMaxConcurrent),
 		instanceID: newInstanceID(),
 		startedAt:  time.Now(),
 	}
@@ -289,7 +283,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 				return
 			}
 			backoff = 0
-			go s.handle(runCtx, conn)
+			s.serveConn(runCtx, conn)
 		}
 	}()
 
@@ -415,28 +409,51 @@ func tuneTCPBuffers(conn net.Conn) {
 	_ = tcp.SetWriteBuffer(socketBufferBytes)
 }
 
-func (s *Server) handle(ctx context.Context, raw net.Conn) {
+// serveConn 在派生处理协程之前完成握手准入。
+//
+// 队列不设缓冲：名额满了就直接关连接。半开握手洪峰下，拒绝日志按次数采样 ——
+// 每个连接一条 Warn 会把日志本身变成新的资源消耗。
+func (s *Server) serveConn(ctx context.Context, conn net.Conn) bool {
+	release, ok := s.hs.acquire()
+	if !ok {
+		if n := s.hs.refusedCount(); n == 1 || n%100 == 0 {
+			inFlight, _, _ := s.hs.snapshot()
+			s.log.Warn("握手并发已满，拒绝连接（防止半开握手吃光资源）",
+				"max", cap(s.hs.slots), "in_flight", inFlight, "refused_total", n,
+				"remote", conn.RemoteAddr())
+		}
+		_ = conn.Close()
+		return false
+	}
+	go s.handle(ctx, conn, release)
+	return true
+}
+
+func (s *Server) handle(ctx context.Context, raw net.Conn, releaseHandshake func()) {
 	defer raw.Close()
 	tuneTCPBuffers(raw)
 
-	// 先占握手名额再开始 TLS：名额满且排队超时就断开。这里的连接还没被认证，
-	// 不值得为它继续占着 fd 等一个可能永远不来的 ClientHello。
-	release, ok := s.hs.acquire(ctx)
+	tlsConn, name, hello, ok := s.handshake(ctx, raw)
+	// HELLO 验证完就还名额：后面的会话可能持续几小时，长连接占着握手槽会让
+	// 后续连接的准入全部失败（64 条会话就够占满整个闸门）。
+	releaseHandshake()
 	if !ok {
-		inFlight, _, refused := s.hs.snapshot()
-		s.log.Warn("TLS 握手并发已满，拒绝连接（防止半开握手吃光资源）",
-			"max", cap(s.hs.slots), "wait", s.hs.wait,
-			"in_flight", inFlight, "refused_total", refused,
-			"remote", raw.RemoteAddr())
 		return
 	}
-	defer release()
+	if hello.Member > 0 {
+		s.handleMember(ctx, tlsConn, name, hello)
+		return
+	}
+	s.handleControl(ctx, tlsConn, name, hello)
+}
 
+// handshake 做 TLS 握手并校验首帧 HELLO。ok=false 时调用方只需关闭连接。
+func (s *Server) handshake(ctx context.Context, raw net.Conn) (*tls.Conn, string, helloPayload, bool) {
 	tlsConn := tls.Server(raw, s.tlsCfg)
 	_ = tlsConn.SetDeadline(time.Now().Add(handshakeTimeout))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		s.log.Warn("TLS 握手失败（客户端证书不受信或版本不符）", connLogAttrs(err, raw)...)
-		return
+		return nil, "", helloPayload{}, false
 	}
 	_ = tlsConn.SetDeadline(time.Time{})
 
@@ -449,31 +466,26 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	typ, payload, err := proto.ReadFrame(tlsConn)
 	if err != nil {
 		s.log.Warn("读首帧失败", connLogAttrs(err, tlsConn, "client", name)...)
-		return
+		return nil, "", helloPayload{}, false
 	}
 	if typ != proto.TypeHello {
 		s.log.Warn("首帧不是 HELLO", "client", name, "type", typ.String())
-		return
+		return nil, "", helloPayload{}, false
 	}
 	_ = tlsConn.SetReadDeadline(time.Time{})
 
 	var hello helloPayload
 	if err := json.Unmarshal(payload, &hello); err != nil {
 		s.log.Warn("HELLO 解析失败", "client", name, "err", err)
-		return
+		return nil, "", helloPayload{}, false
 	}
 	if hello.Version != protoVersion {
 		// 明确告诉对端为什么连不上，否则老客户端只能看到连接被断开。
 		_ = proto.WriteFrame(tlsConn, proto.TypeBye,
 			[]byte(fmt.Sprintf("协议版本 %d 不受支持，本服务端为 %d", hello.Version, protoVersion)))
-		return
+		return nil, "", helloPayload{}, false
 	}
-
-	if hello.Member > 0 {
-		s.handleMember(ctx, tlsConn, name, hello)
-		return
-	}
-	s.handleControl(ctx, tlsConn, name, hello)
+	return tlsConn, name, hello, true
 }
 
 // handleMember 处理成员连接：要求已有同证书、同 sid 的逻辑会话且槽位空闲。

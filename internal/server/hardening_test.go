@@ -2,91 +2,199 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/antapp-cc/antapp-link/internal/pki"
+	"github.com/antapp-cc/antapp-link/internal/proto"
 )
 
 // 外层 TLS 握手必须有独立上限：relay 的 256 条限制在转发连接上，管不到隧道监听。
 // 没有它，大量半开握手能把 fd 和内存吃光，而 accept 循环看起来一切正常。
 func TestHandshakeLimiterCapsConcurrent(t *testing.T) {
-	l := newHandshakeLimiter(1, 20*time.Millisecond)
-	release, ok := l.acquire(context.Background())
+	l := newHandshakeLimiter(1)
+	release, ok := l.acquire()
 	if !ok {
 		t.Fatal("空位时应该能拿到名额")
 	}
 
 	start := time.Now()
-	if _, ok := l.acquire(context.Background()); ok {
+	if _, ok := l.acquire(); ok {
 		t.Fatal("超上限时必须拒绝，而不是无限排队")
 	}
-	if elapsed := time.Since(start); elapsed < 15*time.Millisecond {
-		t.Errorf("拒绝前应该排满等待预算，实际只等了 %v", elapsed)
+	// 等待队列不能缓冲：否则每个被拒连接都要先在内存里挂一会儿，
+	// 洪峰时 goroutine/fd 仍然冲高。
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Errorf("拒绝应该立刻返回，实际等了 %v", elapsed)
 	}
 	if inFlight, peak, refused := l.snapshot(); inFlight != 1 || peak != 1 || refused != 1 {
 		t.Errorf("统计不对: inFlight=%d peak=%d refused=%d, want 1/1/1", inFlight, peak, refused)
 	}
 
 	release()
-	again, ok := l.acquire(context.Background())
+	if inFlight, _, _ := l.snapshot(); inFlight != 0 {
+		t.Errorf("释放后 inFlight 应为 0，实际 %d", inFlight)
+	}
+	again, ok := l.acquire()
 	if !ok {
 		t.Fatal("释放后应能再拿到名额")
 	}
 	again()
-	if inFlight, _, _ := l.snapshot(); inFlight != 0 {
-		t.Errorf("全部释放后 inFlight 应为 0，实际 %d", inFlight)
-	}
 }
 
 // 重复 release 会把名额多还一次，最终让并发上限形同虚设。
 func TestHandshakeLimiterReleaseIsIdempotent(t *testing.T) {
-	l := newHandshakeLimiter(2, time.Millisecond)
-	release, ok := l.acquire(context.Background())
+	l := newHandshakeLimiter(2)
+	release, ok := l.acquire()
 	if !ok {
 		t.Fatal("应该拿到名额")
 	}
 	release()
 	release()
 
-	a, ok1 := l.acquire(context.Background())
-	b, ok2 := l.acquire(context.Background())
+	a, ok1 := l.acquire()
+	b, ok2 := l.acquire()
 	if !ok1 || !ok2 {
 		t.Fatalf("重复释放后名额应仍然只有 2 个: %v %v", ok1, ok2)
 	}
-	if _, ok := l.acquire(context.Background()); ok {
+	if _, ok := l.acquire(); ok {
 		t.Error("第三个名额不该存在（重复 release 不能凭空造名额）")
 	}
 	a()
 	b()
 }
 
-// 排队期间 ctx 取消（进程正在收尾）要立刻返回，且不能泄漏名额。
-func TestHandshakeLimiterStopsOnContextCancel(t *testing.T) {
-	l := newHandshakeLimiter(1, time.Hour)
-	release, ok := l.acquire(context.Background())
-	if !ok {
-		t.Fatal("应该拿到名额")
+// 洪峰时不能在派生处理协程之后才排队：名额之外直接关连接，
+// 否则 accept 每个连接都先起一个 goroutine，等待队列没有硬上限。
+func TestServeConnRefusesBeyondLimitWithoutSpawning(t *testing.T) {
+	s := &Server{log: discardLogger(), hs: newHandshakeLimiter(4), tlsCfg: &tls.Config{}}
+
+	var clients []net.Conn
+	t.Cleanup(func() {
+		for _, c := range clients {
+			_ = c.Close()
+		}
+	})
+
+	// 占满名额：这 4 条连接保持「正在握手」——对端始终不发 ClientHello。
+	for i := 0; i < 4; i++ {
+		srv, cli := net.Pipe()
+		clients = append(clients, cli)
+		if !s.serveConn(context.Background(), srv) {
+			t.Fatalf("第 %d 条应被接纳", i)
+		}
+	}
+	if inFlight, _, _ := s.hs.snapshot(); inFlight != 4 {
+		t.Fatalf("握手中的连接 = %d, want 4", inFlight)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	before := runtime.NumGoroutine()
+	for i := 0; i < 100; i++ {
+		srv, cli := net.Pipe()
+		if s.serveConn(context.Background(), srv) {
+			t.Fatalf("第 %d 条超出上限，应被拒绝", i)
+		}
+		_ = cli.Close()
+	}
+	if after := runtime.NumGoroutine(); after-before > 8 {
+		t.Errorf("拒绝路径不该派生 goroutine：%d → %d", before, after)
+	}
+	if _, _, refused := s.hs.snapshot(); refused != 100 {
+		t.Errorf("拒绝计数 = %d, want 100", refused)
+	}
+
+	// 对端关闭 → TLS 握手结束 → 名额必须归还，而不是永久占着。
+	for _, c := range clients[:4] {
+		_ = c.Close()
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		inFlight, _, _ := s.hs.snapshot()
+		return inFlight == 0
+	}, "握手结束后名额没有归还")
+}
+
+// 握手完成、进入会话后必须归还名额：长连接占着握手槽，64 条会话就能把
+// 新连接全部拒掉。同时这条验证 HandshakeInFlight 只统计真正在做握手的连接。
+func TestHandshakeSlotReleasedBeforeSession(t *testing.T) {
+	s, cliCfg := newTestServer(t, newHandshakeLimiter(1))
+
+	// 用真实 TCP 而不是 net.Pipe：TLS 握手在无缓冲管道上会互相等，
+	// 这里要验证的是服务端的名额归还，不是管道的调度行为。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	accepted := make(chan net.Conn, 1)
 	go func() {
-		time.Sleep(10 * time.Millisecond)
-		cancel()
+		conn, err := ln.Accept()
+		if err == nil {
+			accepted <- conn
+		}
 	}()
-	start := time.Now()
-	if _, ok := l.acquire(ctx); ok {
-		t.Fatal("ctx 已取消不该拿到名额")
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("取消后应立刻返回，实际 %v", elapsed)
+	t.Cleanup(func() { _ = clientConn.Close() })
+	serverConn := <-accepted
+
+	if !s.serveConn(context.Background(), serverConn) {
+		t.Fatal("第一条连接应被接纳")
 	}
 
-	release()
-	if inFlight, _, _ := l.snapshot(); inFlight != 0 {
-		t.Errorf("取消那次不该占着名额，inFlight=%d", inFlight)
+	clientDone := make(chan error, 1)
+	go func() {
+		cli := tls.Client(clientConn, cliCfg)
+		if err := cli.Handshake(); err != nil {
+			clientDone <- err
+			return
+		}
+		hello, err := json.Marshal(helloPayload{Version: protoVersion, Client: "test", Sid: "sid-1", Members: 1})
+		if err != nil {
+			clientDone <- err
+			return
+		}
+		if err := proto.WriteFrame(cli, proto.TypeHello, hello); err != nil {
+			clientDone <- err
+			return
+		}
+		typ, _, err := proto.ReadFrame(cli)
+		if err == nil && typ != proto.TypeHelloAck {
+			err = fmt.Errorf("首帧回包类型 = %s, want HELLO_ACK", typ)
+		}
+		clientDone <- err
+	}()
+
+	if err := <-clientDone; err != nil {
+		t.Fatalf("客户端握手/HELLO 失败: %v", err)
+	}
+
+	// HELLO_ACK 已经回来，说明服务端进入了会话；此刻名额必须已经还回去。
+	waitFor(t, time.Second, func() bool {
+		inFlight, _, _ := s.hs.snapshot()
+		return inFlight == 0
+	}, "握手完成后 HandshakeInFlight 应归零")
+
+	// 会话仍在进行时（连接没关），新的握手请求不能被这条长连接挡住。
+	release, ok := s.hs.acquire()
+	if !ok {
+		t.Error("长连接不该一直占着握手名额")
+	}
+	if ok {
+		release()
 	}
 }
 
@@ -317,4 +425,55 @@ func TestHelperProcess(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+}
+
+// newTestServer 起一个只够握手与会话外壳的 Server：测试里不会出现数据帧，
+// 所以不需要真实 TUN。证书走 pki，和线上同一条路径。
+func newTestServer(t *testing.T, hs *handshakeLimiter) (*Server, *tls.Config) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := pki.Init(dir); err != nil {
+		t.Fatalf("pki.Init: %v", err)
+	}
+	srvCfg, err := pki.ServerTLSConfig(dir)
+	if err != nil {
+		t.Fatalf("ServerTLSConfig: %v", err)
+	}
+	inv, err := pki.Issue(dir, "test-client", "127.0.0.1:62233", pki.TunnelParams{
+		TunnelIP: "10.10.0.2", Gateway: "10.10.0.1", Prefix: 24, MTU: 1400, Members: 1,
+	})
+	if err != nil {
+		t.Fatalf("pki.Issue: %v", err)
+	}
+	cliCfg, err := pki.ClientTLSConfig(inv)
+	if err != nil {
+		t.Fatalf("ClientTLSConfig: %v", err)
+	}
+	s := &Server{
+		cfg:    Default(),
+		tlsCfg: srvCfg,
+		log:    discardLogger(),
+		hs:     hs,
+		joins:  newJoinGuard(),
+		fatal:  make(chan error, 1),
+	}
+	return s, cliCfg
+}
+
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !cond() {
+		t.Fatal(msg)
+	}
 }

@@ -56,6 +56,8 @@ type Status struct {
 	StartedAt  string `json:"started_at,omitempty"`
 
 	// 外层 TLS 握手并发。被拒次数异常增长说明有人在用半开握手冲服务端。
+	// 只统计还在握手 / 读 HELLO 的连接：进入会话后名额已经还回去，不再计入，
+	// 否则这个数字会把长时间在线的会话也算成「正在握手」。
 	HandshakeInFlight int    `json:"handshake_in_flight,omitempty"`
 	HandshakePeak     int    `json:"handshake_peak,omitempty"`
 	HandshakeRefused  uint64 `json:"handshake_refused,omitempty"`
