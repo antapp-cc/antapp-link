@@ -352,10 +352,31 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 	a.mu.Lock()
 	a.connectCancelable = false
 	a.mu.Unlock()
-	if err := snap.Apply(cfg); err != nil {
-		// 网络已经改了一半，立刻还原，别把用户留在半截状态
-		restoreErr := snap.Restore(cfg)
+	if err := a.takeOver(&snap, cfg, statePath,
+		(*Snapshot).Apply, SaveSnapshot, Snapshot.Restore); err != nil {
 		_ = dev.Close()
+		return err
+	}
+
+	return a.startTunnel(cfg, dev, inv, &snap)
+}
+
+// takeOver 把接管配置写到系统上，并把 Apply 填好的分流所有权补写进快照。
+//
+// 前面那份快照是在 Apply 之前落的，那时还不知道实际铺了哪些分流。不补写的话，
+// 普通连接（没发生过出口迁移）崩溃后磁盘上的 Split 是空的，自愈只能退回
+// 「按网关 + metric」的形态扫描，可能碰掉形态相同的用户路由。
+//
+// apply/save/restore 由调用方传入：这三步真机上会改网络、写磁盘，单测靠桩
+// 构造「系统已改完但写盘失败」这个别处复现不了的窗口。
+func (a *App) takeOver(snap *Snapshot, cfg NetConfig, statePath string,
+	apply func(*Snapshot, NetConfig) error,
+	save func(string, Snapshot) error,
+	restore func(Snapshot, NetConfig) error,
+) error {
+	if err := apply(snap, cfg); err != nil {
+		// 网络已经改了一半，立刻还原，别把用户留在半截状态
+		restoreErr := restore(*snap, cfg)
 		if restoreErr != nil {
 			// 还原也没成功：留住状态文件让下次启动接着自愈。删掉它等于把唯一的
 			// 线索也丢了，用户就只能手动改 DNS —— 与 Disconnect 的处理保持一致。
@@ -366,7 +387,22 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 		return fmt.Errorf("接管网络失败（已还原）: %w", err)
 	}
 
-	return a.startTunnel(cfg, dev, inv, &snap)
+	// Apply 之后才有账本，这份账本落盘了才算接管完成。
+	if err := save(statePath, *snap); err != nil {
+		restoreErr := restore(*snap, cfg)
+		if restoreErr != nil {
+			// 系统改动已经生效，但账本写不进磁盘、网络也还不回去：留下 Apply 后
+			// 这份完整现场（含 Split），让下一次断开接着还原，不能当成连接成功。
+			a.mu.Lock()
+			a.pendingRestore = &pendingRestoreState{snap: *snap, cfg: cfg}
+			a.mu.Unlock()
+			return fmt.Errorf("分流所有权写盘失败，且还原未完全成功（现场已保留，下次断开会重试）: %v / %w",
+				restoreErr, err)
+		}
+		_ = RemoveSnapshot(statePath)
+		return fmt.Errorf("分流所有权写盘失败（已还原）: %w", err)
+	}
+	return nil
 }
 
 // startTunnel 登记隧道并拉起循环。只在写状态字段时短暂持锁。
