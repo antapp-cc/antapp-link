@@ -30,12 +30,26 @@ type flowEntry struct {
 	proto    uint8
 }
 
+// recentFlow 是被空闲清扫删掉、但短期内可能还有包回来的映射。
+//
+// 直接删会让下一包重新选槽，内层 TCP 乱序一次。留一个 30 秒的墓碑，同 key 的包
+// 在这段时间内回来就恢复原槽；超过就彻底忘掉。
+type recentFlow struct {
+	slot      int
+	deletedAt int64
+	proto     uint8
+}
+
 // 回收期限。TCP 的短连接大多有 FIN/RST，空闲兜底取长一点，免得误删正在
 // 长跑但暂时安静的流；UDP 没有结束标记，只能靠空闲期，取得保守一些。
 const (
 	tcpFlowIdle   = 5 * time.Minute
 	udpFlowIdle   = 5 * time.Minute
 	sweepInterval = time.Second
+	// recentTTL 是删除后保留原槽的时间窗口；窗口内同 key 的包恢复原槽。
+	recentTTL = 30 * time.Second
+	// recentMax 限制墓碑数量，避免大量短连接把内存吃穿。
+	recentMax = 8192
 )
 
 type FlowTable struct {
@@ -56,6 +70,11 @@ type FlowTable struct {
 	// 增减而变，选槽就只剩 O(槽数)；计数一旦漂移，某个槽会永远选不到，所以每条
 	// 改映射的路径都必须同步维护它。
 	counts []int
+	// tcpCount/udpCount 维护映射里的协议分布，Stats 就不用再遍历全表。
+	tcpCount int
+	udpCount int
+	// recent 是被空闲清扫删掉、短时间内可恢复原槽的映射。
+	recent map[flowKey]recentFlow
 	// clock 是时间源，测试注入用；nil 表示 time.Now。
 	clock func() time.Time
 }
@@ -72,7 +91,11 @@ type flowKey struct {
 }
 
 func NewFlowTable() *FlowTable {
-	return &FlowTable{m: make(map[flowKey]flowEntry, 256), max: maxFlows}
+	return &FlowTable{
+		m:      make(map[flowKey]flowEntry, 256),
+		recent: make(map[flowKey]recentFlow, 256),
+		max:    maxFlows,
+	}
 }
 
 func (t *FlowTable) now() time.Time {
@@ -119,10 +142,12 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 		t.lastN = n
 		t.counts = growCounts(t.counts, n)
 		clear(t.counts)
+		t.tcpCount, t.udpCount = 0, 0
 		for _, e := range t.m {
 			if e.slot > 0 && e.slot < n {
 				t.counts[e.slot]++
 			}
+			t.addCounts(e.proto, 1)
 		}
 	} else if len(t.counts) < n {
 		// 零值或手工构造的表可能没走过上面的重建，补齐长度即可，计数全零也是对的。
@@ -136,6 +161,7 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 		if proto == 6 && flags&(tcpFlagFIN|tcpFlagRST) != 0 {
 			delete(t.m, key)
 			t.counts[e.slot]--
+			t.addCounts(e.proto, -1)
 			t.reclaimed++
 			return e.slot
 		}
@@ -151,7 +177,21 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 		}
 		delete(t.m, key)
 		t.counts[e.slot]--
+		t.addCounts(e.proto, -1)
 		// 落到下面重新选槽
+	}
+	// 刚被空闲清扫删掉的流又回来了：恢复原槽，避免这一次换槽乱序。
+	if r, ok := t.recent[key]; ok {
+		if len(t.m) < t.max && now.UnixNano()-r.deletedAt <= int64(recentTTL) &&
+			r.slot > 0 && r.slot < len(t.counts) &&
+			(alive == nil || alive(r.slot)) {
+			t.m[key] = flowEntry{slot: r.slot, lastSeen: now.UnixNano(), proto: r.proto}
+			t.counts[r.slot]++
+			t.addCounts(r.proto, 1)
+			delete(t.recent, key)
+			return r.slot
+		}
+		delete(t.recent, key)
 	}
 	// 定期回收空闲流：不能只在满表时才扫。没发 FIN/RST 的流（异常断开、UDP）靠
 	// 空闲期回收；等到表满才扫的话，flow 会一路涨到上限才回落，看起来就是
@@ -186,6 +226,7 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 	}
 	t.m[key] = flowEntry{slot: best, lastSeen: now.UnixNano(), proto: proto}
 	t.counts[best]++
+	t.addCounts(proto, 1)
 	return best
 }
 
@@ -204,7 +245,28 @@ func (t *FlowTable) sweepLocked(now time.Time) {
 		if e.slot > 0 && e.slot < len(t.counts) {
 			t.counts[e.slot]--
 		}
+		t.addCounts(e.proto, -1)
 		t.reclaimed++
+		// 墓碑：下一包在近期回来还能恢复原槽，超过窗口就忘掉。
+		if len(t.recent) >= recentMax {
+			t.recent = make(map[flowKey]recentFlow, 256)
+		}
+		t.recent[k] = recentFlow{slot: e.slot, deletedAt: now.UnixNano(), proto: e.proto}
+	}
+	for k, r := range t.recent {
+		if now.UnixNano()-r.deletedAt > int64(recentTTL) {
+			delete(t.recent, k)
+		}
+	}
+}
+
+// addCounts 维护协议分布计数；只认 TCP/UDP，其他协议（含分片）不计入。
+func (t *FlowTable) addCounts(proto uint8, delta int) {
+	switch proto {
+	case 6:
+		t.tcpCount += delta
+	case 17:
+		t.udpCount += delta
 	}
 }
 
@@ -213,13 +275,14 @@ func (t *FlowTable) sweepLocked(now time.Time) {
 // 报告要求先量「占用率、满表回退次数、各槽活跃映射数」再决定要不要做 FIN/RST 回收：
 // 没有这三个数，谁也说不清长会话里的短连接到底有没有把表吃满。
 type FlowStats struct {
-	Size      int    // 已建立的映射数
-	Max       int    // 容量上限
-	Fallbacks uint64 // 表满后新流退回哈希的次数
-	Reclaimed uint64 // 因 FIN/RST 或空闲期回收的映射数
-	TCPCount  int    // 映射里的 TCP 流数
-	UDPCount  int    // 映射里的 UDP 流数
-	PerSlot   []int  // 各槽承载的流数，下标即槽号
+	Size       int    // 已建立的映射数
+	Max        int    // 容量上限
+	Fallbacks  uint64 // 表满后新流退回哈希的次数
+	Reclaimed  uint64 // 因 FIN/RST 或空闲期回收的映射数
+	TCPCount   int    // 映射里的 TCP 流数
+	UDPCount   int    // 映射里的 UDP 流数
+	OtherCount int    // 其他协议/分片占用的条目数
+	PerSlot    []int  // 各槽承载的流数，下标即槽号
 }
 
 // Stats 返回流表快照。锁开销可忽略：调用方是 10 分钟一次的状态日志。
@@ -228,18 +291,11 @@ func (t *FlowTable) Stats() FlowStats {
 	defer t.mu.Unlock()
 	per := make([]int, len(t.counts))
 	copy(per, t.counts)
-	tcp, udp := 0, 0
-	for _, e := range t.m {
-		switch e.proto {
-		case 6:
-			tcp++
-		case 17:
-			udp++
-		}
-	}
 	return FlowStats{
 		Size: len(t.m), Max: t.max, Fallbacks: t.fallbacks, Reclaimed: t.reclaimed,
-		TCPCount: tcp, UDPCount: udp, PerSlot: per,
+		TCPCount: t.tcpCount, UDPCount: t.udpCount,
+		OtherCount: len(t.m) - t.tcpCount - t.udpCount,
+		PerSlot:    per,
 	}
 }
 

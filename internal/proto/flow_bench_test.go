@@ -3,6 +3,7 @@ package proto
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 // 流表的新流分配原本要遍历整张映射统计每槽流数：表越满，单次分配越慢，累计 O(N²)。
@@ -171,5 +172,21 @@ func TestFlowTableFullFallbackDoesNotTouchCounts(t *testing.T) {
 	}
 	if got := ft.Slot(p, 4, nil); got != first {
 		t.Fatalf("回退路径对同一个包不稳定：%d → %d", first, got)
+	}
+}
+
+// 定期清扫每秒至少跑一次，测满表时一次全表遍历的代价。
+func BenchmarkFlowTableSweepAtCapacity(b *testing.B) {
+	ft := NewFlowTable()
+	pkts := benchPkts(maxFlows)
+	for j := 0; j < maxFlows; j++ {
+		ft.Slot(pkts[j], 4, nil)
+	}
+	now := time.Now()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ft.mu.Lock()
+		ft.sweepLocked(now)
+		ft.mu.Unlock()
 	}
 }

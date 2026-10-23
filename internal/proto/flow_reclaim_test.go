@@ -185,4 +185,58 @@ func TestFlowStatsProtocols(t *testing.T) {
 	if st.TCPCount != 1 || st.UDPCount != 1 {
 		t.Fatalf("TCP/UDP 计数不对：tcp=%d udp=%d", st.TCPCount, st.UDPCount)
 	}
+	if st.OtherCount != 0 {
+		t.Fatalf("两条 TCP/UDP 流不该算进其他协议，OtherCount=%d", st.OtherCount)
+	}
+}
+
+// 空闲清扫删掉一条流后留 30 秒墓碑：窗口内同 key 的包回来要恢复原槽，
+// 否则每清扫一次就可能让一条安静的长连接换槽、内层 TCP 乱序一次。
+func TestFlowTableRecentRestoresSlot(t *testing.T) {
+	base := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	ft := NewFlowTable()
+	ft.max = 10
+	ft.clock = func() time.Time { return base }
+	p := buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50000, 443, 0x10)
+	first := ft.Slot(p, 4, nil)
+
+	base = base.Add(tcpFlowIdle + time.Second)
+	ft.Slot(buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50001, 443, 0x10), 4, nil)
+
+	base = base.Add(10 * time.Second)
+	if got := ft.Slot(p, 4, nil); got != first {
+		t.Fatalf("墓碑窗口内应恢复原槽 %d，实际 %d", first, got)
+	}
+}
+
+// 清扫必须节流：每秒最多一次，不能每个包都遍历全表。
+func TestFlowTableSweepThrottled(t *testing.T) {
+	base := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	ft := NewFlowTable()
+	ft.max = 10
+	ft.clock = func() time.Time { return base }
+	ft.Slot(buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50000, 443, 0x10), 4, nil)
+
+	// 手动把已有流改成过期：这样不必推进 5 分钟也能验证节流。
+	ft.mu.Lock()
+	for k, e := range ft.m {
+		e.lastSeen = base.Add(-tcpFlowIdle - time.Second).UnixNano()
+		ft.m[k] = e
+	}
+	ft.mu.Unlock()
+
+	// 距上次清扫不到 1 秒：不该扫，过期的流还在。
+	base = base.Add(500 * time.Millisecond)
+	ft.Slot(buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50001, 443, 0x10), 4, nil)
+	if got := ft.Stats().Size; got != 2 {
+		t.Fatalf("1 秒内不该清扫，Size=%d", got)
+	}
+
+	// 超过 1 秒后再来一条：触发清扫，过期的 50000 被删。
+	base = base.Add(600 * time.Millisecond)
+	ft.Slot(buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50002, 443, 0x10), 4, nil)
+	st := ft.Stats()
+	if st.Size != 2 || st.Reclaimed != 1 {
+		t.Fatalf("超过 1 秒应清扫过期流：Size=%d Reclaimed=%d", st.Size, st.Reclaimed)
+	}
 }
