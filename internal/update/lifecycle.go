@@ -13,6 +13,7 @@ const (
 	EventUpdateStart    = "update_start"
 	EventUpdateSwapped  = "swap_done"
 	EventUpdateLaunched = "launch_ok"
+	EventHandoffLoaded  = "handoff_loaded"
 	EventUpdateReady    = "update_ready"
 	EventUpdateFailed   = "update_failed"
 	EventRollback       = "rollback"

@@ -4,6 +4,7 @@ package update
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -68,19 +69,37 @@ func Apply(newExePath string) error {
 		return nil
 	}
 
+	// 旧进程此刻还握着单实例互斥体，而新版要拿到它才写 ready。等待之前必须先让出去，
+	// 否则新版卡在单实例闸门、旧进程卡在这里，两边一起超时 —— 这不是保守，是死锁。
+	relinquishInstance()
+
 	// 只确认进程起来了还不够：Start 成功之后新版仍可能在初始化阶段退出。
 	ctx, cancel := context.WithTimeout(context.Background(), applyWaitReady)
 	defer cancel()
 	if _, werr := WaitReady(ctx, applyHandoffDir(), handoff.InvocationID, 50*time.Millisecond); werr != nil {
-		_ = FailHandoff(applyHandoffDir(), handoff.InvocationID,
-			fmt.Errorf("%v 内没有收到新版的启动确认: %w", applyWaitReady, werr))
+		// 新版没接手，旧进程还得继续跑：先把互斥体收回来，确认自己仍是唯一实例。
+		// 收不回来通常意味着新版已经拿到锁并在跑，或者用户又起了一个实例。
+		reclaimed := reclaimInstance()
+		// 新版自己报过失败时保留第一手原因，别用「没收到确认」覆盖掉
+		// 「拿不到互斥体」这类真正有用的信息。
+		if !errors.Is(werr, ErrHandoffFailed) {
+			_ = FailHandoff(applyHandoffDir(), handoff.InvocationID,
+				fmt.Errorf("%v 内没有收到新版的启动确认: %w", applyWaitReady, werr))
+		}
+		detail := "新版没有确认启动，保留回滚副本"
+		if errors.Is(werr, ErrHandoffFailed) {
+			detail = "新版报告启动失败，保留回滚副本"
+		}
 		recordLifecycle(LifecycleEvent{
 			Event:  EventHandoffTimeout,
-			Detail: "新版没有确认启动，保留回滚副本",
+			Detail: detail,
 			Err:    werr.Error(),
 		})
-		// 不退出、也不回滚：新旧两版里只有旧版在跑（互斥体还在旧版手里），
-		// 磁盘上的文件名属于新版，回滚需要用户重新启动时才安全。
+		// 不退出、也不回滚：新旧两版里只有旧版在跑，磁盘上的文件名属于新版，
+		// 回滚需要用户重新启动时才安全。
+		if !reclaimed {
+			return fmt.Errorf("新版没有确认启动（%v），且单实例互斥体已被别的实例持有：请从托盘确认当前在跑的是哪一个", werr)
+		}
 		return fmt.Errorf("新版已拉起，但没有在 %v 内确认启动（回滚副本仍保留在 %s.old，可重试更新）",
 			applyWaitReady, self)
 	}

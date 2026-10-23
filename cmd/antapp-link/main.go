@@ -4,10 +4,12 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/antapp-cc/antapp-link/internal/client"
@@ -44,6 +46,24 @@ func main() {
 }
 
 func run() int {
+	// 更新拉起的新版一旦没走到「初始化完成」就退出，旧进程必须收到 failed 才能
+	// 恢复运行。兜底放在最前面：单实例检查本身就可能失败，而那条路径以前会让
+	// 旧进程一直等到超时。
+	startupConfirmed := false
+	failureReported := false
+	failStartup := func(err error) {
+		if failureReported {
+			return
+		}
+		failureReported = true
+		update.FailStartup(err)
+	}
+	defer func() {
+		if !startupConfirmed {
+			failStartup(errors.New("启动未完成"))
+		}
+	}()
+
 	var (
 		codeArg    = flag.String("c", "", "连接码：单行 antapp:// 或 .antapp 文件路径（双击连接码文件时由系统传入）")
 		dataArg    = flag.String("data", defaultRootDir(), "工作根目录（config/、logs/、data/ 都建在它下面）")
@@ -74,6 +94,7 @@ func run() int {
 	// 更要紧的是几个实例会同时去抢同一块虚拟网卡和同一批路由，把网络搅乱。
 	release, first, err := client.SingleInstance()
 	if err != nil {
+		failStartup(err)
 		client.ShowMessage("AntApp Link", "单实例检查失败："+err.Error())
 		return 1
 	}
@@ -95,19 +116,52 @@ func run() int {
 		if inviteArg != "" {
 			importInviteQuietly(rootDir, inviteArg)
 		}
+		// 更新拉起的新版走到这里等于没接手，旧进程要知道这一点。
+		failStartup(errors.New("没有拿到单实例互斥体"))
 		client.ActivateExisting()
 		return 0
 	}
-	defer release()
+
+	// 互斥体要能在交接等待期间让出去、失败后再收回来：新版必须拿到它才写 ready，
+	// 而旧进程要等 ready 才退出 —— 谁都不放手就是死锁（见 update/apply_windows.go）。
+	var (
+		releaseMu sync.Mutex
+		releaseFn = release
+	)
+	releaseInstance := func() {
+		releaseMu.Lock()
+		defer releaseMu.Unlock()
+		if releaseFn != nil {
+			releaseFn()
+			releaseFn = nil
+		}
+	}
+	reclaimInstance := func() bool {
+		releaseMu.Lock()
+		defer releaseMu.Unlock()
+		if releaseFn != nil {
+			return true
+		}
+		r, ok, ierr := client.SingleInstance()
+		if ierr != nil || !ok {
+			return false
+		}
+		releaseFn = r
+		return true
+	}
+	update.SetInstanceHandoffHooks(releaseInstance, reclaimInstance)
+	defer releaseInstance()
 
 	dataDir := rootDir
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		failStartup(err)
 		client.ShowMessage("AntApp Link", "创建工作目录失败："+err.Error())
 		return 1
 	}
 
 	logger, logs, closeLog, err := client.NewFileLogger(dataDir)
 	if err != nil {
+		failStartup(err)
 		client.ShowMessage("AntApp Link", "初始化日志失败："+err.Error())
 		return 1
 	}
@@ -116,6 +170,7 @@ func run() int {
 	if inviteArg != "" {
 		if _, err := client.ImportInviteFile(dataDir, inviteArg); err != nil {
 			logger.Error("导入连接码失败", "err", err)
+			failStartup(err)
 			client.ShowMessage("AntApp Link", "导入连接码失败："+err.Error())
 			return 1
 		}
@@ -151,6 +206,14 @@ func run() int {
 		return 0
 	}
 
+	// 到这一步互斥体、工作目录、日志、网络自愈都完成了，才敢让旧进程退出。
+	// 顺序不能再往前挪：init 阶段能证明的只有「二进制加载了」，那正是问题 1 的坑。
+	// 写状态失败不算致命：旧进程会按超时处理（不退出、保留回滚副本）。
+	if err := update.MarkStartupReady(); err != nil {
+		logger.Warn("写更新交接状态失败，旧进程会把这次更新当作未确认", "err", err)
+	}
+	startupConfirmed = true
+
 	if *once {
 		// 命令行一次性模式：config 里必须恰好有一个连接码文件（联调用，不做选择界面）
 		cands := client.ListInviteFiles(dataDir)
@@ -183,6 +246,7 @@ func run() int {
 	go waitHealthyThenCleanup(app)
 	if err := client.RunUI(app, logs, dataDir); err != nil {
 		logger.Error("界面启动失败", "err", err)
+		failStartup(err)
 		client.ShowMessage("AntApp Link", "界面启动失败："+err.Error())
 		return 1
 	}
