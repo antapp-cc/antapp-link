@@ -1147,9 +1147,11 @@ func (a *App) watchRunStats(ctx context.Context, tun *Tunnel) {
 			cur, peak := tun.SlotDepthReport()
 			flowSize, flowMax := 0, 0
 			var flowFallbacks, flowReclaimed uint64
+			flowTCP, flowUDP := 0, 0
 			if ft := tun.FlowSnapshot(); ft != nil {
 				st := ft.Stats()
 				flowSize, flowMax, flowFallbacks, flowReclaimed = st.Size, st.Max, st.Fallbacks, st.Reclaimed
+				flowTCP, flowUDP = st.TCPCount, st.UDPCount
 			}
 			a.log.Info("运行状态",
 				"goroutines", runtime.NumGoroutine(),
@@ -1161,6 +1163,8 @@ func (a *App) watchRunStats(ctx context.Context, tun *Tunnel) {
 				"slot_depth", fmt.Sprint(cur),
 				"slot_peak", fmt.Sprint(peak),
 				"flow", fmt.Sprintf("%d/%d", flowSize, flowMax),
+				"flow_tcp", flowTCP,
+				"flow_udp", flowUDP,
 				"flow_fallback", flowFallbacks,
 				"flow_reclaim", flowReclaimed)
 

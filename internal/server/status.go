@@ -30,6 +30,13 @@ type Status struct {
 	// 每槽收发字节 + 熔断计数：灰度多连接时看流量分摊，以及 JOIN 是否正被拒
 	Slots        []SlotStatus `json:"slots,omitempty"`
 	JoinFailures int          `json:"join_failures,omitempty"`
+	// 流表（下行选槽）：占用、回退、回收和每槽流数。服务端也跑同一套回收，
+	// 这几个数能看出下行流表有没有被短连接吃满。
+	FlowSize     int    `json:"flow_size,omitempty"`
+	FlowMax      int    `json:"flow_max,omitempty"`
+	FlowFallback uint64 `json:"flow_fallback,omitempty"`
+	FlowReclaim  uint64 `json:"flow_reclaim,omitempty"`
+	FlowPerSlot  []int  `json:"flow_per_slot,omitempty"`
 	// 端口转发监听结果：多出来的 JSON 字段不影响旧版 status 子命令解析
 	ForwardReady bool   `json:"forward_ready"`
 	ForwardError string `json:"forward_error,omitempty"`

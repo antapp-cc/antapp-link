@@ -153,19 +153,18 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 		t.counts[e.slot]--
 		// 落到下面重新选槽
 	}
-	// 表满：先回收过期项（异常断开、没发 FIN/RST 的 TCP，或空闲的 UDP），仍满才回退。
-	// 节流：满表时新流可能每秒几十条，全表扫描不能每条都做。
+	// 定期回收空闲流：不能只在满表时才扫。没发 FIN/RST 的流（异常断开、UDP）靠
+	// 空闲期回收；等到表满才扫的话，flow 会一路涨到上限才回落，看起来就是
+	// 「回收不理想」。每秒最多一扫，全表遍历约 1ms 量级。
+	if now.UnixNano()-t.lastSweep > int64(sweepInterval) {
+		t.lastSweep = now.UnixNano()
+		t.sweepLocked(now)
+	}
 	if len(t.m) >= t.max {
-		if now.UnixNano()-t.lastSweep > int64(sweepInterval) {
-			t.lastSweep = now.UnixNano()
-			t.sweepLocked(now)
-		}
 		// 新流不插入（老流的映射绝不能动 —— 那会让内层 TCP 乱序），但仍必须
 		// 在**活槽**里选，直接纯哈希会把这批新流分到已经断开的成员槽上。
-		if len(t.m) >= t.max {
-			t.fallbacks++
-			return hashToAlive(payload, n, alive)
-		}
+		t.fallbacks++
+		return hashToAlive(payload, n, alive)
 	}
 
 	best := 0
@@ -190,7 +189,8 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 	return best
 }
 
-// sweepLocked 回收所有超过空闲期的映射。只在表满时兜底调用，由 lastSweep 节流。
+// sweepLocked 回收所有超过空闲期的映射。由 lastSweep 节流，每个 Slot 调用都会
+// 检查一次，但真正扫表最多每秒一次。
 func (t *FlowTable) sweepLocked(now time.Time) {
 	for k, e := range t.m {
 		limit := tcpFlowIdle
@@ -217,6 +217,8 @@ type FlowStats struct {
 	Max       int    // 容量上限
 	Fallbacks uint64 // 表满后新流退回哈希的次数
 	Reclaimed uint64 // 因 FIN/RST 或空闲期回收的映射数
+	TCPCount  int    // 映射里的 TCP 流数
+	UDPCount  int    // 映射里的 UDP 流数
 	PerSlot   []int  // 各槽承载的流数，下标即槽号
 }
 
@@ -226,7 +228,19 @@ func (t *FlowTable) Stats() FlowStats {
 	defer t.mu.Unlock()
 	per := make([]int, len(t.counts))
 	copy(per, t.counts)
-	return FlowStats{Size: len(t.m), Max: t.max, Fallbacks: t.fallbacks, Reclaimed: t.reclaimed, PerSlot: per}
+	tcp, udp := 0, 0
+	for _, e := range t.m {
+		switch e.proto {
+		case 6:
+			tcp++
+		case 17:
+			udp++
+		}
+	}
+	return FlowStats{
+		Size: len(t.m), Max: t.max, Fallbacks: t.fallbacks, Reclaimed: t.reclaimed,
+		TCPCount: tcp, UDPCount: udp, PerSlot: per,
+	}
 }
 
 // growCounts 保证计数切片至少覆盖 n 个槽，已有计数原样保留。

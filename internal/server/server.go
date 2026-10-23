@@ -997,6 +997,14 @@ func (s *Server) reportStatus(ctx context.Context) {
 				st.UDPRxBytes = u.rxBytes.Load()
 				st.UDPTxBytes = u.txBytes.Load()
 			}
+			if sess.flow != nil {
+				fs := sess.flow.Stats()
+				st.FlowSize = fs.Size
+				st.FlowMax = fs.Max
+				st.FlowFallback = fs.Fallbacks
+				st.FlowReclaim = fs.Reclaimed
+				st.FlowPerSlot = fs.PerSlot
+			}
 		}
 		if err := WriteStatus(st); err != nil {
 			s.log.Debug("写状态文件失败", "err", err)

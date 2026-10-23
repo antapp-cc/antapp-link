@@ -147,3 +147,42 @@ func TestFlowTableReclaimKeepsCounts(t *testing.T) {
 		t.Fatalf("回收后 Size=%d Reclaimed=%d，期望 3/3", st.Size, st.Reclaimed)
 	}
 }
+
+// 空闲回收不能只在表满时才跑：表没满时也要定期清，否则 flow 会一路涨到上限
+// 才回落，看起来就是「回收不理想」。
+func TestFlowTableSweepsStaleWhenNotFull(t *testing.T) {
+	base := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	ft := NewFlowTable()
+	ft.max = 10
+	ft.clock = func() time.Time { return base }
+	ft.Slot(buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50000, 443, 0x10), 4, nil)
+	if ft.Stats().Size != 1 {
+		t.Fatalf("插入后 Size 应为 1，实际 %d", ft.Stats().Size)
+	}
+
+	base = base.Add(tcpFlowIdle + time.Second)
+	ft.Slot(buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50001, 443, 0x10), 4, nil)
+
+	st := ft.Stats()
+	if st.Size != 1 {
+		t.Fatalf("表没满时也应清掉空闲流，Size=%d", st.Size)
+	}
+	if st.Reclaimed != 1 {
+		t.Fatalf("应回收一条空闲流，实际 %d", st.Reclaimed)
+	}
+	if st.Fallbacks != 0 {
+		t.Fatalf("腾出空间后不该回退，Fallbacks=%d", st.Fallbacks)
+	}
+}
+
+// Stats 要能区分 TCP/UDP：回收期该缩哪一个，取决于表里哪类流多。
+func TestFlowStatsProtocols(t *testing.T) {
+	ft := NewFlowTable()
+	ft.Slot(buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50000, 443, 0x10), 4, nil)
+	ft.Slot(buildUDPFlow([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50001, 53), 4, nil)
+
+	st := ft.Stats()
+	if st.TCPCount != 1 || st.UDPCount != 1 {
+		t.Fatalf("TCP/UDP 计数不对：tcp=%d udp=%d", st.TCPCount, st.UDPCount)
+	}
+}

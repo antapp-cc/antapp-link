@@ -431,6 +431,10 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 				fmt.Fprintf(stdout, "数据通道    : UDP（控制仍走 TCP），收 %d / 发 %d 字节\n",
 					st.UDPRxBytes, st.UDPTxBytes)
 			}
+			if st.FlowSize > 0 {
+				fmt.Fprintf(stdout, "流表        : %d/%d（回退 %d，回收 %d），每槽 %v\n",
+					st.FlowSize, st.FlowMax, st.FlowFallback, st.FlowReclaim, st.FlowPerSlot)
+			}
 			if st.Goroutines > 0 {
 				fmt.Fprintf(stdout, "goroutine   : %d\n", st.Goroutines)
 			}
