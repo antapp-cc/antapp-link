@@ -66,16 +66,27 @@ func checkFlowCounts(t *testing.T, ft *FlowTable) {
 	ft.mu.Lock()
 	defer ft.mu.Unlock()
 	want := make([]int, len(ft.counts))
+	tcp, udp := 0, 0
 	for _, e := range ft.m {
 		if e.slot < 0 || e.slot >= len(want) {
 			t.Fatalf("映射指向槽 %d，超出计数长度 %d", e.slot, len(want))
 		}
 		want[e.slot]++
+		switch e.proto {
+		case 6:
+			tcp++
+		case 17:
+			udp++
+		}
 	}
 	for i := 1; i < len(want); i++ {
 		if ft.counts[i] != want[i] {
 			t.Fatalf("槽 %d 计数漂移：记录 %d，实际 %d", i, ft.counts[i], want[i])
 		}
+	}
+	if ft.tcpCount != tcp || ft.udpCount != udp {
+		t.Fatalf("协议计数漂移：tcp %d（实际 %d），udp %d（实际 %d）",
+			ft.tcpCount, tcp, ft.udpCount, udp)
 	}
 }
 

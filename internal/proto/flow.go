@@ -260,7 +260,8 @@ func (t *FlowTable) sweepLocked(now time.Time) {
 	}
 }
 
-// addCounts 维护协议分布计数；只认 TCP/UDP，其他协议（含分片）不计入。
+// addCounts 维护协议分布计数；只认协议号 6/17（分片包的 proto 也是 6/17，
+// 会正常计入，不会落到 OtherCount）。
 func (t *FlowTable) addCounts(proto uint8, delta int) {
 	switch proto {
 	case 6:
@@ -281,7 +282,7 @@ type FlowStats struct {
 	Reclaimed  uint64 // 因 FIN/RST 或空闲期回收的映射数
 	TCPCount   int    // 映射里的 TCP 流数
 	UDPCount   int    // 映射里的 UDP 流数
-	OtherCount int    // 其他协议/分片占用的条目数
+	OtherCount int    // 其他协议（非 TCP/UDP）占用的条目数
 	PerSlot    []int  // 各槽承载的流数，下标即槽号
 }
 

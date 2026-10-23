@@ -209,6 +209,28 @@ func TestFlowTableRecentRestoresSlot(t *testing.T) {
 	}
 }
 
+// 墓碑只保留 30 秒：窗口外同 key 的包不再恢复原槽，墓碑本身也会被清掉。
+func TestFlowTableRecentExpires(t *testing.T) {
+	base := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	ft := NewFlowTable()
+	ft.max = 10
+	ft.clock = func() time.Time { return base }
+	p := buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50000, 443, 0x10)
+	ft.Slot(p, 4, nil)
+
+	base = base.Add(tcpFlowIdle + time.Second)
+	ft.Slot(buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50001, 443, 0x10), 4, nil)
+	if got := len(ft.recent); got != 1 {
+		t.Fatalf("清扫后应留一条墓碑，实际 %d", got)
+	}
+
+	base = base.Add(recentTTL + time.Second)
+	ft.Slot(p, 4, nil) // 墓碑过期：不恢复，按新流分配
+	if got := len(ft.recent); got != 0 {
+		t.Fatalf("过期墓碑应被清理，仍有 %d 条", got)
+	}
+}
+
 // 清扫必须节流：每秒最多一次，不能每个包都遍历全表。
 func TestFlowTableSweepThrottled(t *testing.T) {
 	base := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
