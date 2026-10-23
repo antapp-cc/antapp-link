@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"testing"
 
+	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
@@ -156,5 +157,43 @@ func TestRevertPendingCleansOldAndNewLedgers(t *testing.T) {
 	}
 	if cleaned != 2 {
 		t.Fatalf("旧账本和新账本都要清，实际清理 %d 次", cleaned)
+	}
+}
+
+// 迁移也要走 installSplitRoutes：新出口上本来就有同前缀的路由，没有账本证据
+// 就不能认领，否则断开时会把用户手工建的配置删掉。
+func TestMigrationDoesNotClaimForeignSplitRoutes(t *testing.T) {
+	old := testOldExitSnapshot()
+	w, updates, _ := newMigrationTestWatcher(t, old)
+	addSplitRouteFn = func(winipcfg.LUID, netip.Prefix, netip.Addr) error {
+		return windows.ERROR_OBJECT_ALREADY_EXISTS
+	}
+
+	w.reconcile()
+
+	if *updates != 1 {
+		t.Fatalf("迁移应当正常提交，实际提交 %d 次", *updates)
+	}
+	if w.snap.Split == nil {
+		t.Fatal("新现场必须带分流账本")
+	}
+	if len(w.snap.Split.Prefixes) != 0 {
+		t.Fatalf("把用户已有的路由记进了账本: %v", w.snap.Split.Prefixes)
+	}
+}
+
+// 真正新建成功的分流路由仍要进账本，别把修复做成「一条都不记」。
+func TestMigrationClaimsNewlyInstalledSplitRoutes(t *testing.T) {
+	old := testOldExitSnapshot()
+	w, updates, _ := newMigrationTestWatcher(t, old)
+
+	w.reconcile()
+
+	if *updates != 1 {
+		t.Fatalf("迁移应当正常提交，实际提交 %d 次", *updates)
+	}
+	want := len(ActiveCNRoutes())
+	if w.snap.Split == nil || len(w.snap.Split.Prefixes) != want {
+		t.Fatalf("新建成功的分流应当全部入账：want %d，got %+v", want, w.snap.Split)
 	}
 }

@@ -482,6 +482,110 @@ func claimedBySplitLedger(ledgers []*splitOwnership, ref adapterKey, gw netip.Ad
 	return false
 }
 
+// splitRouteOps 是热重铺用到的系统操作。抽成参数是为了让「先写盘、再动路由」
+// 这个崩溃安全顺序能被单测钉住，不必真去改路由表。
+type splitRouteOps struct {
+	existing  func() (map[string]struct{}, error)
+	sweep     func(*splitOwnership) (int, error)
+	sweepForm func() (int, error)
+	install   func([]*splitOwnership) ([]string, int)
+	persist   func(*splitOwnership) error
+}
+
+// hotSplitLedgerSink 是热重铺把「即将铺上」的账本落盘的口子，由 App 在热重铺前
+// 注入（生产写 state.json）。默认空实现：没有 App 侧注入时（非 Windows、单测）
+// 没有热重铺，也就没有要落的盘。
+var hotSplitLedgerSink = func(*splitOwnership) error { return nil }
+
+// splitLedgerToPersist 算热重铺动路由之前应该先落盘的账本：上一版账本，加上新表里
+// 「当前路由表里还没有」的前缀 —— 那些是本轮一定要新建的。
+//
+// 只提前记这些，是因为「本来就在」的路由没有账本证据时可能是用户的（见
+// installSplitRoutes）：提前认领会把用户的配置写进账本，断开时一并删掉。
+func splitLedgerToPersist(ref adapterKey, gw netip.Addr, previous *splitOwnership,
+	table []string, existing map[string]struct{}) *splitOwnership {
+	prefixes := make([]string, 0, len(table))
+	seen := make(map[string]struct{}, len(table))
+	add := func(p string) {
+		if _, ok := seen[p]; ok {
+			return
+		}
+		seen[p] = struct{}{}
+		prefixes = append(prefixes, p)
+	}
+	if previous != nil {
+		for _, p := range previous.Prefixes {
+			add(p)
+		}
+	}
+	for _, raw := range table {
+		prefix, err := netip.ParsePrefix(raw)
+		if err != nil {
+			continue
+		}
+		dest := prefix.Masked().String()
+		if _, ok := existing[dest]; ok {
+			continue
+		}
+		add(dest)
+	}
+	return newSplitOwnership(ref, gw, prefixes)
+}
+
+// refreshSplitRoutes 执行一次热重铺，返回最终账本。
+//
+// 顺序是崩溃安全的关键：
+//  1. 先落盘「旧账本 + 预计新建」的账本，此时路由一条都还没动；写盘失败就放弃
+//     本轮，系统保持上一版可用状态。
+//  2. 撤旧账本、铺新表。任一点崩溃，磁盘上那份账本都已经覆盖了已铺的前缀。
+//  3. 落盘最终账本。失败也不回滚：预写的是超集，只多记不漏记，自愈仍清得掉。
+func refreshSplitRoutes(ref adapterKey, gw netip.Addr, previous *splitOwnership,
+	table []string, ops splitRouteOps) *splitOwnership {
+	cur := newSplitOwnership(ref, gw, nil)
+	if previous != nil && !sameSplitScope(previous, cur) {
+		// 旧账本属于别的网卡/网关：那是出口迁移该处理的状态，混着铺会把账本
+		// 钉到错误的接口上。等迁移完成后的下一轮。
+		logf("国内分流热更新：旧账本属于另一张网卡或网关，等出口迁移处理，本轮放弃")
+		return previous
+	}
+
+	existing, err := ops.existing()
+	if err != nil {
+		logf("国内分流热更新：读路由表失败（%v），本轮放弃", err)
+		return previous
+	}
+	if err := ops.persist(splitLedgerToPersist(ref, gw, previous, table, existing)); err != nil {
+		logf("国内分流热更新：账本预写盘失败（%v），本轮放弃（旧路由未动）", err)
+		return previous
+	}
+
+	oldSweepFailed := false
+	if previous != nil {
+		if removed, serr := ops.sweep(previous); serr != nil {
+			logf("国内分流热更新：旧路由有 %d 条没删掉（%v），继续铺新表", removed, serr)
+			oldSweepFailed = true
+		}
+	} else if removed, serr := ops.sweepForm(); serr != nil {
+		logf("国内分流热更新：按形态清理旧路由时 %d 条失败: %v", removed, serr)
+	}
+
+	installed, failed := ops.install([]*splitOwnership{previous})
+	own := newSplitOwnership(ref, gw, installed)
+	own, kept := splitLedgerAfterRefresh(own, previous, oldSweepFailed)
+	if oldSweepFailed && !kept {
+		logf("国内分流热更新：旧账本属于另一张网卡或网关，%d 条残留无法并入新账本",
+			len(previous.Prefixes))
+	}
+	if serr := ops.persist(own); serr != nil {
+		logf("国内分流热更新：新账本写盘失败（%v），磁盘上留的是不会漏清的预写账本", serr)
+	}
+	if failed > 0 {
+		logf("国内分流重铺：%d 条失败（这些网段暂走隧道，不影响可用）", failed)
+	}
+	setLiveSplitOwnership(own)
+	return own
+}
+
 // nrptRuleComment 是 NRPT 规则的识别标记，增删都按它筛，不碰别人的规则。
 const nrptRuleComment = "AntApp Link DNS"
 

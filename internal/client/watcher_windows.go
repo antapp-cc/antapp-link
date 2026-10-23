@@ -427,33 +427,37 @@ func (w *sessionWatcher) reconcile() {
 			}
 		}
 	}
-	failed := 0
-	var installed []string
-	for _, p := range ActiveCNRoutes() {
-		prefix, perr := netip.ParsePrefix(p)
-		if perr != nil {
-			continue
-		}
-		if err := newDef.LUID.AddRoute(prefix.Masked(), gw, splitRouteMetric); err != nil &&
-			!errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) {
-			failed++
-			continue
-		}
-		installed = append(installed, prefix.Masked().String())
+	// 迁移和常规接管共用同一套认领规则：新出口上「本来就在」的同形状路由
+	// 没有账本证据就不能算自己的，否则断开时会把用户手工建的配置删掉。
+	previous := make([]*splitOwnership, 0, 2)
+	if oldSnap.Split != nil {
+		previous = append(previous, oldSnap.Split)
 	}
+	if live := currentLiveSplitOwnership(); live != nil && live != oldSnap.Split {
+		previous = append(previous, live)
+	}
+	installed, failed := installSplitRoutes(ActiveCNRoutes(), func(p netip.Prefix) error {
+		return addSplitRouteFn(newDef.LUID, p, gw)
+	}, newDef.key(), gw, previous)
 
 	// 6) 提交现场 + 唤醒隧道立刻重连
 	//
-	// 只有「关键配置都写上 + 快照落盘成功」才算提交。任一条件不满足就保留待提交
-	// 状态（pending），下一轮事件会重试同一份现场 —— 重试只补写盘/补配置，不会重新
-	// 读网卡 DNS（那已经被我们改过了）。
+	// 只有「旧出口清干净 + 关键配置都写上 + 快照落盘成功」才算提交。任一条件
+	// 不满足就保留待提交状态（pending），下一轮事件会重试同一份现场 —— 重试只
+	// 补写盘/补配置/补清理，不会重新读网卡 DNS（那已经被我们改过了）。
 	snap := newSnapshot(gw.Unmap().String(), int(ifIndex), serverNextHop,
 		w.srv.String(), []IfaceDNS{newIface}, w.cfg)
 	snap.Split = newSplitOwnership(newDef.key(), gw, installed)
 	setLiveSplitOwnership(snap.Split)
-	if !dnsApplied || !routeApplied {
-		w.pending = &pendingMigration{snap: snap, dnsApplied: dnsApplied, routeApplied: routeApplied}
-		logf("网络出口已切换，但关键配置没写全：保留待提交状态，下次事件会补修")
+	if !dnsApplied || !routeApplied || len(cleanupErrs) > 0 {
+		p := &pendingMigration{snap: snap, dnsApplied: dnsApplied, routeApplied: routeApplied}
+		if len(cleanupErrs) > 0 {
+			// 旧账本连同旧网卡的原始 DNS 一起留在待办里：这套清理下次对账
+			// 还要接着做，现在丢掉就再也没人记得该清哪张网卡。
+			p.old = &oldSnap
+		}
+		w.pending = p
+		logf("网络出口已切换，但迁移事务未完成：保留待提交状态，下次事件继续")
 		if w.kick != nil {
 			w.kick()
 		}

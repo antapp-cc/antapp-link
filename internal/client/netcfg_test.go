@@ -532,6 +532,160 @@ func TestMergeSplitOwnershipKeepsFailedPrefixes(t *testing.T) {
 	}
 }
 
+// ---------- 热重铺的账本持久化 ----------
+
+// 热重铺必须先落盘「旧账本 + 预计新建的前缀」，再动路由。
+//
+// 否则「删了旧路由、铺了新路由、还没写盘」这段窗口里崩溃，磁盘上只有上一版
+// 账本，新铺的那批路由无人认领，重启自愈后永久残留。
+func TestRefreshSplitRoutesPersistsSupersetBeforeTouchingRoutes(t *testing.T) {
+	t.Cleanup(clearLiveSplitOwnership)
+	ref := adapterKey{GUID: "{eth}", Index: 12}
+	gw := netip.MustParseAddr("192.168.1.1")
+	previous := &splitOwnership{IfGUID: "{eth}", IfIndex: 12, Gateway: "192.168.1.1",
+		Prefixes: []string{"1.0.1.0/24"}}
+	table := []string{"1.0.1.0/24", "1.0.2.0/23", "1.0.9.0/24"}
+	// 1.0.9.0/24 已经在路由表里且不在账本里：那是用户的同形状路由，不能进账本。
+	existing := map[string]struct{}{"1.0.9.0/24": {}}
+	var order []string
+	var persisted []*splitOwnership
+	ops := splitRouteOps{
+		existing:  func() (map[string]struct{}, error) { return existing, nil },
+		sweep:     func(own *splitOwnership) (int, error) { order = append(order, "sweep"); return len(own.Prefixes), nil },
+		sweepForm: func() (int, error) { order = append(order, "sweepForm"); return 0, nil },
+		install: func(prev []*splitOwnership) ([]string, int) {
+			order = append(order, "install")
+			if len(prev) != 1 || prev[0] != previous {
+				t.Errorf("铺路由必须拿旧账本当归属证据，实际 %v", prev)
+			}
+			return []string{"1.0.1.0/24", "1.0.2.0/23"}, 1
+		},
+		persist: func(own *splitOwnership) error {
+			order = append(order, "persist")
+			persisted = append(persisted, own)
+			return nil
+		},
+	}
+
+	own := refreshSplitRoutes(ref, gw, previous, table, ops)
+
+	if len(order) < 2 || order[0] != "persist" {
+		t.Fatalf("第一步必须是落盘账本，实际顺序 %v", order)
+	}
+	if len(persisted) != 2 {
+		t.Fatalf("应当落盘两次（预写 + 最终），实际 %d 次", len(persisted))
+	}
+	tentative := persisted[0]
+	for _, want := range []string{"1.0.1.0/24", "1.0.2.0/23"} {
+		if !slices.Contains(tentative.Prefixes, want) {
+			t.Errorf("预写账本缺 %s: %v", want, tentative.Prefixes)
+		}
+	}
+	if slices.Contains(tentative.Prefixes, "1.0.9.0/24") {
+		t.Errorf("表里已存在且无账本证据的前缀不能提前认领: %v", tentative.Prefixes)
+	}
+	if own == nil || currentLiveSplitOwnership() != own {
+		t.Errorf("热重铺完成后应把最终账本设为 live 账本，实际 own=%v live=%v",
+			own, currentLiveSplitOwnership())
+	}
+}
+
+// 预写盘失败时必须原地放弃：旧路由还没动，系统保持上一版可用状态；
+// 硬着头皮铺下去就成了「路由已换、磁盘账本还是上一版」。
+func TestRefreshSplitRoutesAbortsWhenPrePersistFails(t *testing.T) {
+	t.Cleanup(clearLiveSplitOwnership)
+	ref := adapterKey{GUID: "{eth}", Index: 12}
+	gw := netip.MustParseAddr("192.168.1.1")
+	previous := &splitOwnership{IfGUID: "{eth}", IfIndex: 12, Gateway: "192.168.1.1",
+		Prefixes: []string{"1.0.1.0/24"}}
+	setLiveSplitOwnership(previous)
+	touched := false
+	ops := splitRouteOps{
+		existing:  func() (map[string]struct{}, error) { return nil, nil },
+		sweep:     func(*splitOwnership) (int, error) { touched = true; return 0, nil },
+		sweepForm: func() (int, error) { touched = true; return 0, nil },
+		install:   func([]*splitOwnership) ([]string, int) { touched = true; return nil, 0 },
+		persist:   func(*splitOwnership) error { return errors.New("磁盘只读") },
+	}
+
+	own := refreshSplitRoutes(ref, gw, previous, []string{"1.0.2.0/23"}, ops)
+
+	if own != previous {
+		t.Errorf("预写盘失败应保留旧账本，实际 %+v", own)
+	}
+	if touched {
+		t.Error("预写盘失败时不能动任何路由（旧路由还没撤）")
+	}
+	if currentLiveSplitOwnership() != previous {
+		t.Error("预写盘失败不能改进程内账本")
+	}
+}
+
+// 最终账本写盘失败不再回滚：磁盘上留着预写的那份超集，只要它覆盖了所有已铺
+// 前缀，崩溃后自愈就清得掉。
+func TestRefreshSplitRoutesKeepsSupersetLedgerOnFinalPersistFailure(t *testing.T) {
+	t.Cleanup(clearLiveSplitOwnership)
+	ref := adapterKey{GUID: "{eth}", Index: 12}
+	gw := netip.MustParseAddr("192.168.1.1")
+	previous := &splitOwnership{IfGUID: "{eth}", IfIndex: 12, Gateway: "192.168.1.1",
+		Prefixes: []string{"1.0.1.0/24"}}
+	var persisted []*splitOwnership
+	ops := splitRouteOps{
+		existing:  func() (map[string]struct{}, error) { return nil, nil },
+		sweep:     func(own *splitOwnership) (int, error) { return len(own.Prefixes), nil },
+		sweepForm: func() (int, error) { return 0, nil },
+		install:   func([]*splitOwnership) ([]string, int) { return []string{"1.0.1.0/24", "1.0.2.0/23"}, 0 },
+		persist: func(own *splitOwnership) error {
+			persisted = append(persisted, own)
+			if len(persisted) == 2 {
+				return errors.New("磁盘只读")
+			}
+			return nil
+		},
+	}
+
+	own := refreshSplitRoutes(ref, gw, previous, []string{"1.0.1.0/24", "1.0.2.0/23"}, ops)
+
+	if own == nil || currentLiveSplitOwnership() != own {
+		t.Fatal("最终账本写盘失败不能阻止进程内账本更新")
+	}
+	if len(persisted) != 2 {
+		t.Fatalf("应当尝试落盘两次，实际 %d 次", len(persisted))
+	}
+	for _, p := range own.Prefixes {
+		if !slices.Contains(persisted[0].Prefixes, p) {
+			t.Errorf("预写账本漏了已铺前缀 %s，崩溃后清不掉: %v", p, persisted[0].Prefixes)
+		}
+	}
+}
+
+// 旧账本记的是另一张网卡/网关时，热重铺不能拿它当本网卡的证据继续铺：
+// 那是出口迁移该处理的状态，混着铺会把账本钉到错误的接口上。
+func TestRefreshSplitRoutesSkipsWhenLedgerBelongsToOtherAdapter(t *testing.T) {
+	t.Cleanup(clearLiveSplitOwnership)
+	ref := adapterKey{GUID: "{eth}", Index: 12}
+	gw := netip.MustParseAddr("192.168.1.1")
+	previous := &splitOwnership{IfGUID: "{wlan}", IfIndex: 7, Gateway: "192.168.9.1",
+		Prefixes: []string{"1.0.1.0/24"}}
+	var touched bool
+	ops := splitRouteOps{
+		existing:  func() (map[string]struct{}, error) { touched = true; return nil, nil },
+		sweep:     func(*splitOwnership) (int, error) { touched = true; return 0, nil },
+		sweepForm: func() (int, error) { touched = true; return 0, nil },
+		install:   func([]*splitOwnership) ([]string, int) { touched = true; return nil, 0 },
+		persist:   func(*splitOwnership) error { touched = true; return nil },
+	}
+
+	own := refreshSplitRoutes(ref, gw, previous, []string{"1.0.2.0/23"}, ops)
+
+	if own != previous {
+		t.Errorf("应保留旧账本等迁移处理，实际 %+v", own)
+	}
+	if touched {
+		t.Error("账本属于别的网卡时不应写盘或动路由")
+	}
+}
+
 // 多个地址时不算「只有隧道网关」，原样保留。
 func TestIsTunnelDNS(t *testing.T) {
 	cases := []struct {

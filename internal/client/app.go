@@ -537,14 +537,14 @@ func (a *App) hotApplyRouteTable() {
 	epoch := netEpoch.Load()
 	a.mu.Lock()
 	running := a.running
-	gw := a.snapshot.DefaultGateway
-	ifIndex := a.snapshot.DefaultIfIndex
+	snap := a.snapshot
 	table := ActiveCNRoutes()
 	a.mu.Unlock()
 	if afterHotSnapshot != nil {
 		afterHotSnapshot()
 	}
-	if !running || gw == "" || ifIndex == 0 || refreshSplitRoutesHook == nil {
+	if !running || snap.DefaultGateway == "" || snap.DefaultIfIndex == 0 ||
+		refreshSplitRoutesHook == nil {
 		return
 	}
 
@@ -553,27 +553,73 @@ func (a *App) hotApplyRouteTable() {
 	if !netTxnMu.TryLock() {
 		return
 	}
-	defer netTxnMu.Unlock()
-	a.applySplitRoutes(epoch, gw, ifIndex, table)
+	own := a.applySplitRoutes(epoch, snap.DefaultGateway, snap.DefaultIfIndex, table, snap)
+	netTxnMu.Unlock()
+
+	if own != nil {
+		a.commitHotSplitLedger(snap, own)
+	}
 }
 
-// applySplitRoutes 在持有网络事务锁后做最后一道校验再铺。
+// applySplitRoutes 在持有网络事务锁后做最后一道校验再铺，返回最终账本。
 //
 // 代际变了说明排队期间有迁移提交了新出口或还原撤了网络，手里的网关和网卡
 // 不再是当前的 —— 宁可不铺，下一轮会读到新值。
-func (a *App) applySplitRoutes(epoch uint64, gw string, ifIndex int, table []string) {
+func (a *App) applySplitRoutes(epoch uint64, gw string, ifIndex int, table []string, snap Snapshot) *splitOwnership {
 	if netEpoch.Load() != epoch {
-		return
+		return nil
 	}
 	if !a.stillRunning() {
-		return
+		return nil
 	}
+
+	// 热重铺要在动路由之前把「旧账本 + 预计新建」落盘，写盘口子只能由 App 提供
+	// （它知道 state.json 在哪、接管现场长什么样）。注入的生命周期就是这一轮
+	// 热重铺，读写都在 netTxnMu 内，天然串行。
+	before := currentLiveSplitOwnership()
+	hotSplitLedgerSink = func(own *splitOwnership) error {
+		return SaveSnapshot(a.statePath, snapshotWithSplit(snap, own))
+	}
+	defer func() { hotSplitLedgerSink = func(*splitOwnership) error { return nil } }()
+
 	refreshSplitRoutesHook(gw, ifIndex, table)
+	after := currentLiveSplitOwnership()
 	if netEpoch.Load() != epoch {
 		// 铺到一半被还原抢先了。还原自己也持锁，理论上到不了这里；留个提醒，
 		// 真出现说明锁序出了问题。
 		a.log.Warn("分流热重铺与本轮还原交叠，已放弃本轮")
 	}
+	if after == nil || after == before {
+		return nil
+	}
+
+	// 最终账本再写一次：与迁移/还原互斥，不会用旧快照覆盖新现场；上一次写盘
+	// 失败（netcfg 层只留了预写的超集）时这一写正好把它修正成准确账本。
+	if err := SaveSnapshot(a.statePath, snapshotWithSplit(snap, after)); err != nil {
+		a.log.Error("热重铺后的分流账本写盘失败，崩溃自愈可能漏清新铺的路由", "err", err)
+	}
+	return after
+}
+
+// snapshotWithSplit 只替换账本字段，接管现场其余字段原样保留。
+func snapshotWithSplit(snap Snapshot, own *splitOwnership) Snapshot {
+	snap.Split = own
+	return snap
+}
+
+// commitHotSplitLedger 把热重铺的账本同步进内存快照。
+//
+// 必须在放掉 netTxnMu 之后做：锁序要求持锁时不拿 a.mu。同步前核对快照身份 ——
+// 这段窗口里可能刚完成一次出口迁移，a.snapshot 已经换了网卡，再把账本写回去
+// 会把它钉在旧接口上。
+func (a *App) commitHotSplitLedger(snap Snapshot, own *splitOwnership) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.snapshot.DefaultIfIndex != snap.DefaultIfIndex ||
+		a.snapshot.DefaultGateway != snap.DefaultGateway {
+		return
+	}
+	a.snapshot.Split = own
 }
 
 // stillRunning 是 hotApplyRouteTable 在持锁后复查运行状态的入口。

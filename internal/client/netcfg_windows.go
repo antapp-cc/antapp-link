@@ -84,6 +84,31 @@ func installSplitRoutes(table []string, add func(netip.Prefix) error, ref adapte
 	return installed, failed
 }
 
+// existingSplitRoutes 返回当前路由表里与本程序同形状（本接口 + 原网关 +
+// metric 5）的前缀集合。热重铺要抢在铺新之前算出「哪些前缀会新建」，只能先读表。
+func existingSplitRoutes(ref adapterKey, gw netip.Addr) (map[string]struct{}, error) {
+	rows, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
+	if err != nil {
+		return nil, fmt.Errorf("读路由表: %w", err)
+	}
+	guids := map[winipcfg.LUID]string{}
+	probe := newSplitOwnership(ref, gw, nil)
+	out := make(map[string]struct{}, len(rows))
+	for i := range rows {
+		r := &rows[i]
+		dest, ok := prefixOfRow(r)
+		if !ok {
+			continue
+		}
+		probe.Prefixes = append(probe.Prefixes[:0], dest.String())
+		guid := guidByLUID(guids, r.InterfaceLUID)
+		if probe.ownsRoute(guid, r.InterfaceIndex, r.NextHop.Addr(), r.Metric, dest) {
+			out[dest.String()] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
 // refreshSplitRoutesFor 按给定网段表重铺国内直连路由（原生，毫秒级）。
 // 由 routeTableRefresher 在拉到新表后调用。
 func refreshSplitRoutesFor(gw string, ifIndex int, table []string) {
@@ -95,33 +120,20 @@ func refreshSplitRoutesFor(gw string, ifIndex int, table []string) {
 	if err != nil || !ok {
 		return
 	}
-	// 先撤自己上一版的路由：有 live 记录就只删记录里的；没有（进程刚起、或
-	// 接管时没铺成分流）才退回形态扫描。
-	previous := currentLiveSplitOwnership()
-	oldSweepFailed := false
-	if previous != nil {
-		if removed, serr := sweepOwnedSplitRoutes(previous); serr != nil {
-			logf("国内分流热更新：旧路由有 %d 条没删掉（%v），继续铺新表", removed, serr)
-			oldSweepFailed = true
-		}
-	} else if removed, serr := sweepSplitRoutes(gwAddr); serr != nil {
-		logf("国内分流热更新：按形态清理旧路由时 %d 条失败: %v", removed, serr)
-	}
-
-	installed, failed := installSplitRoutes(table, func(p netip.Prefix) error {
-		return a.LUID.AddRoute(p, gwAddr, splitRouteMetric)
-	}, a.key(), gwAddr, []*splitOwnership{previous})
-
-	own := newSplitOwnership(a.key(), gwAddr, installed)
-	own, kept := splitLedgerAfterRefresh(own, previous, oldSweepFailed)
-	if oldSweepFailed && !kept {
-		logf("国内分流热更新：旧账本属于另一张网卡或网关，%d 条残留无法并入新账本",
-			len(previous.Prefixes))
-	}
-	setLiveSplitOwnership(own)
-	if failed > 0 {
-		logf("国内分流重铺：%d 条失败（这些网段暂走隧道，不影响可用）", failed)
-	}
+	ref := a.key()
+	refreshSplitRoutes(ref, gwAddr, currentLiveSplitOwnership(), table, splitRouteOps{
+		existing: func() (map[string]struct{}, error) { return existingSplitRoutes(ref, gwAddr) },
+		sweep:    sweepOwnedSplitRoutes,
+		sweepForm: func() (int, error) {
+			return sweepSplitRoutes(gwAddr)
+		},
+		install: func(previous []*splitOwnership) ([]string, int) {
+			return installSplitRoutes(table, func(p netip.Prefix) error {
+				return a.LUID.AddRoute(p, gwAddr, splitRouteMetric)
+			}, ref, gwAddr, previous)
+		},
+		persist: func(own *splitOwnership) error { return hotSplitLedgerSink(own) },
+	})
 }
 
 // runCommand / hiddenProcAttr 仅供 schtasks（开机自启）这类低频操作使用。
