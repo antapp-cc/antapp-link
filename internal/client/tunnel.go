@@ -703,7 +703,10 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 			// 实际跑的是 TCP，既违背「纯 UDP、不自动切换」的设计，也让故障无法定位。
 			// 报错后连接失败，用户能直接看到「UDP 通道不可用」，自己决定放行端口，
 			// 或换一张 TCP 连接码。
-			return true, fmt.Errorf("UDP 数据通道不可用（%s 模式下数据只走 UDP，不回退 TCP）: %w",
+			//
+			// 返回 false：通道没建起来就不算「连上过」。返回 true 会让 Run 把退避清零，
+			// UDP 端口被封时变成每十几秒一次「握手 → 探测 5 秒 → 失败」的死循环。
+			return false, fmt.Errorf("UDP 数据通道不可用（%s 模式下数据只走 UDP，不回退 TCP）: %w",
 				t.inv.Mode, uerr)
 		}
 		sess.udp = u
@@ -718,8 +721,29 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 			u.conn.LocalAddr().(*net.UDPAddr).Port))
 	}
 
+	// 断线、退避、握手期间网卡照读不误，pktCh 里攒的是几秒到几分钟前的旧包：内层
+	// TCP 早就重传过了，再发出去只会先把新会话的槽队列占满，让真正的新包被丢。
+	if n := t.drainPending(); n > 0 {
+		t.log.Debug("丢弃断线期间积压的上行包", "packets", n)
+	}
+
 	cancel() // 建连结束：后面的读循环与保活只受外层 ctx 约束
 	return true, sess.run(ctx)
+}
+
+// drainPending 非阻塞清空 pktCh，返回丢掉的包数。最多清一个队列深度：readPump
+// 还在并发往里塞，不设上限的话洪峰时这里可能一直清不完。
+func (t *Tunnel) drainPending() int {
+	n := 0
+	for n < cap(t.pktCh) {
+		select {
+		case <-t.pktCh:
+			n++
+		default:
+			return n
+		}
+	}
+	return n
 }
 
 // newSessionID 生成 16 字节随机数的 hex（32 字符），成员连接的认亲凭证。
@@ -1083,7 +1107,10 @@ func closeOnDone(ctx context.Context, conn io.Closer) (stop func()) {
 
 // dialMember 拨一条成员连接并完成认亲握手；成功后进入该连接的读循环（阻塞）。
 // TLS 配置复用会话里那一份：会话缓存在成员连接之间共享，才有机会走会话恢复。
-func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) error {
+//
+// 返回值里的时长是这条连接在槽里待了多久（没入槽就是 0）。读循环只会以错误结束，
+// 所以光看 err 分不清「根本没建起来」和「用了几小时才断」，补拨的退避要靠这个数区分。
+func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) (time.Duration, error) {
 	// 建连这三段共用一个总预算（见 memberHandshakeTimeout）。进入读循环前必须让它失效，
 	// 并且保活与关闭只认外层 ctx —— 否则预算一到，会把一条已经正常工作的成员连接关掉。
 	hctx, cancelBudget := context.WithTimeout(ctx, memberHandshakeTimeout)
@@ -1092,7 +1119,7 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 	dialer := &net.Dialer{}
 	raw, err := dialer.DialContext(hctx, "tcp", t.inv.Server)
 	if err != nil {
-		return fmt.Errorf("成员连接 %d 拨号: %w", k, err)
+		return 0, fmt.Errorf("成员连接 %d 拨号: %w", k, err)
 	}
 	tuneTCPBuffers(raw)
 	conn := tls.Client(raw, sess.tlsCfg)
@@ -1102,7 +1129,7 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 	defer closeOnDone(ctx, conn)()
 
 	if err := conn.HandshakeContext(hctx); err != nil {
-		return fmt.Errorf("成员连接 %d TLS 握手: %w", k, err)
+		return 0, fmt.Errorf("成员连接 %d TLS 握手: %w", k, err)
 	}
 	if conn.ConnectionState().DidResume {
 		// 每次补拨都有，日常日志里纯噪声；验收会话恢复时开 Debug 看
@@ -1119,7 +1146,7 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 		_ = conn.SetWriteDeadline(dl)
 	}
 	if err := proto.WriteFrame(conn, proto.TypeHello, hello); err != nil {
-		return err
+		return 0, err
 	}
 	_ = conn.SetWriteDeadline(time.Time{})
 	// 等两个 ACK 也吃同一个总预算：用 hctx 的截止时刻，而不是再起一段独立超时
@@ -1128,34 +1155,35 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 	}
 	typ, _, err := proto.ReadFrame(conn)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if typ == proto.TypeBye {
-		return fmt.Errorf("成员连接 %d 被服务端拒绝: %s", k, "见服务端日志")
+		return 0, fmt.Errorf("成员连接 %d 被服务端拒绝: %s", k, "见服务端日志")
 	}
 	if typ != proto.TypeMemberAck {
-		return fmt.Errorf("成员连接 %d 期望 MEMBER_ACK 收到 %s", k, typ.String())
+		return 0, fmt.Errorf("成员连接 %d 期望 MEMBER_ACK 收到 %s", k, typ.String())
 	}
 	// 第一个 ACK 收到：加入被接受。继续等第二个 ACK（带槽位号）=
 	// 服务端读循环已启动的信号，收到它才把连接当可用
 	typ2, _, err := proto.ReadFrame(conn)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 	// 建连结束：立刻把预算放掉，后面的读循环与保活只受外层 ctx 约束
 	cancelBudget()
 	if typ2 != proto.TypeMemberAck {
-		return fmt.Errorf("成员连接 %d 期望就绪 ACK 收到 %s", k, typ2.String())
+		return 0, fmt.Errorf("成员连接 %d 期望就绪 ACK 收到 %s", k, typ2.String())
 	}
 
 	sess.mu.Lock()
 	if k >= len(sess.slots) || sess.slots[k] != nil {
 		sess.mu.Unlock()
-		return fmt.Errorf("成员连接 %d 槽位不可用", k)
+		return 0, fmt.Errorf("成员连接 %d 槽位不可用", k)
 	}
 	sess.slots[k] = conn
 	sess.mu.Unlock()
+	joinedAt := time.Now()
 	// 逐条报「就位」而不是只在凑齐时报一条：哪一条卡住了、补了几次才上来，
 	// 都要能一眼看出来。现在日志区是单行模式，一条一行不会挤。
 	t.log.Info(fmt.Sprintf("连接已就位 %d/%d", sess.liveCount(), sess.members))
@@ -1182,7 +1210,7 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 				t.log.Warn("成员连接断开", "member", k, "reason", reason,
 					"drops", n, "live", sess.liveCount())
 			}
-			return err
+			return time.Since(joinedAt), err
 		}
 		switch typ {
 		case proto.TypeIP:
@@ -1195,7 +1223,7 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 					sess.slots[k] = nil
 				}
 				sess.mu.Unlock()
-				return err
+				return time.Since(joinedAt), err
 			}
 			sess.stats.RxBytes.Add(uint64(len(payload)))
 		case proto.TypeBye:
@@ -1206,7 +1234,7 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 			}
 			sess.mu.Unlock()
 			t.log.Warn("成员连接被服务端关闭", "member", k, "reason", string(payload))
-			return fmt.Errorf("成员连接 %d 被服务端关闭: %s", k, string(payload))
+			return time.Since(joinedAt), fmt.Errorf("成员连接 %d 被服务端关闭: %s", k, string(payload))
 		case proto.TypePong:
 			// 心跳得到应答，说明这条连接还活着；不需要别的动作
 		default:
@@ -1220,6 +1248,16 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) err
 // 刻意不并发建：几条 TLS 在几十毫秒内挤向同一个 IP:端口是很好认的行为特征，
 // 正常客户端不会这样。错开也不影响可用性 —— 成员没就位时数据走控制连接。
 const memberStagger = 400 * time.Millisecond
+
+// memberStableAfter 是成员连接「算是稳定用过」的门槛：在槽里待够这么久才断开，
+// 补拨时退避清零；不到这个数就断的（刚入槽就被掐）仍按失败退避，免得一条反复
+// 闪断的连接让补拨变成一秒几次的 TLS 握手风暴。
+const memberStableAfter = 30 * time.Second
+
+// memberDial 是 maintainMembers 拨成员连接的入口。用 var 只为测试能换成桩。
+var memberDial = func(ctx context.Context, t *Tunnel, sess *clientSession, k int) (time.Duration, error) {
+	return t.dialMember(ctx, sess, k)
+}
 
 // memberRetryDelay 是补拨成员连接前的等待。
 //
@@ -1271,10 +1309,18 @@ func maintainMembers(ctx context.Context, t *Tunnel, sess *clientSession) {
 				} else if ctx.Err() != nil {
 					return
 				}
-				if err := t.dialMember(ctx, sess, k); err != nil {
-					if ctx.Err() != nil {
-						return
-					}
+				up, err := memberDial(ctx, t, sess, k)
+				if ctx.Err() != nil {
+					return
+				}
+				if up >= memberStableAfter {
+					// 稳定用过一阵才断开：这是正常补位，不是建连失败。原来这里也会让
+					// attempt 加一，一个 12 小时的会话里断上几次，之后每次补拨都要白等
+					// 15 秒，还会误报「成员补不上」。
+					attempt = 0
+					continue
+				}
+				if err != nil {
 					// 前几次留 Debug：刚建连时成员还在建，失败一两次是正常的。
 					// 但持续补不上就必须 Warn —— 那种状态下控制连接还活着、面板显示
 					// 「已连接」，而上行数据全被 emptySlotDrops 丢掉，用户只觉得
@@ -1286,12 +1332,10 @@ func maintainMembers(ctx context.Context, t *Tunnel, sess *clientSession) {
 						t.log.Warn(fmt.Sprintf("成员补不上，上行在丢（成员 %d，已试 %d 次，连接 %d/%d）",
 							k, attempt+1, sess.liveCount(), sess.members))
 					}
-					if attempt < 10 {
-						attempt++
-					}
-					continue
 				}
-				attempt = 0 // 读循环退出（连接断开），重置退避继续补拨
+				if attempt < 10 {
+					attempt++
+				}
 			}
 		}()
 	}

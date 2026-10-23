@@ -348,3 +348,30 @@ func TestFlowTableRecentEvictsOldest(t *testing.T) {
 		t.Fatal("最新的墓碑应保留")
 	}
 }
+
+// 成员数变少后，墓碑不能把流恢复到已经不存在的槽：counts 只增不减，按它判越界
+// 会放过 slot >= n 的墓碑，发送端随后拿到一个越界槽号。
+func TestFlowTableRecentNotRestoredToRemovedSlot(t *testing.T) {
+	base := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	ft := NewFlowTable()
+	ft.max = 10
+	ft.clock = func() time.Time { return base }
+	var onSlot3 []byte
+	for i := 0; i < 3; i++ {
+		p := buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, uint16(50000+i), 443, 0x10)
+		if ft.Slot(p, 4, nil) == 3 {
+			onSlot3 = p
+		}
+	}
+	if onSlot3 == nil {
+		t.Fatal("前提不成立：三条新流应分别落在槽 1/2/3")
+	}
+
+	base = base.Add(tcpFlowIdle + time.Second)
+	ft.Slot(buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 51000, 443, 0x10), 4, nil)
+
+	base = base.Add(10 * time.Second)
+	if got := ft.Slot(onSlot3, 3, nil); got <= 0 || got >= 3 {
+		t.Fatalf("成员数降到 3 后应落在 1..2，实际 %d", got)
+	}
+}

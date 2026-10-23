@@ -161,7 +161,10 @@ type Server struct {
 	// udp 是 UDP 数据通道的多路复用器（mode=udp 时才有）。控制仍走 TCP，数据包走它。
 	udp *udpMux
 
-	hs         *handshakeLimiter
+	hs *handshakeLimiter
+	// hsFails 是 TLS 握手失败累计次数。隧道端口对公网开放，扫描器的失败握手是常态，
+	// 日志按它采样（同握手并发已满那条的做法）。
+	hsFails    atomic.Uint64
 	instanceID string
 	startedAt  time.Time
 }
@@ -221,7 +224,10 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		"client_ip", cfg.Tunnel.ClientIP,
 		"network", cfg.Tunnel.Network,
 		"mtu", cfg.Tunnel.MTU,
-		"forward_ports", fmt.Sprintf("%d-%d", cfg.ForwardPorts.Start, cfg.ForwardPorts.End))
+		"forward_ports", fmt.Sprintf("%d-%d", cfg.ForwardPorts.Start, cfg.ForwardPorts.End),
+		// 0 = 交给内核：升级后在 journal 里一眼能确认这两项按预期生效
+		"socket_buffer", socketBufferBytes,
+		"notsent_lowat", notsentLowat)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -394,17 +400,18 @@ func (s *Server) pumpTun(ctx context.Context) {
 	}
 }
 
-// socketBufferBytes 是单条连接的收发缓冲目标值，和客户端同一套理由：
-// 跨境链路带宽延迟积约 2.5 MB，内核默认缓冲装不下，窗口撑不满吞吐就上不去。
-// 上限由安装脚本设置的 net.core.rmem_max / wmem_max（16 MB）兜着。
+// socketBufferBytes 是显式设置的单条连接收发缓冲，0 表示不设置、交给内核自动调节。
 //
-// 默认仍是 4 MB。运行优化报告第 5 项要求在隔离机器上做 A/B（固定 4 MB vs 交给系统
-// 自动调节），所以留了环境变量：ANTAPP_SERVER_SOCKET_BUFFER=0 表示不显式设置。
-// 拿到 A/B 数据之前不改默认值 —— 两端策略不一致不代表哪一边更快。
+// 默认 0，和客户端一致。原来固定 4 MB，但显式 SO_RCVBUF/SO_SNDBUF 会关掉这条 socket
+// 的自动调节，而安装脚本已经把 net.ipv4.tcp_rmem / tcp_wmem 的上限设到 16 MB ——
+// 自动调节本可以按需涨到 16 MB，写死 4 MB 等于把窗口天花板压低了四分之三，空闲连接
+// 还白占着大缓冲。跨境链路 BDP 约 2.5 MB，16 MB 的自动上限足够覆盖。
+//
+// A/B 或回退用环境变量：ANTAPP_SERVER_SOCKET_BUFFER=4194304 恢复原来的固定 4 MB。
 var socketBufferBytes = envServerSocketBufferBytes()
 
 func envServerSocketBufferBytes() int {
-	const fallback = 4 << 20
+	const fallback = 0
 	v := strings.TrimSpace(os.Getenv("ANTAPP_SERVER_SOCKET_BUFFER"))
 	if v == "" {
 		return fallback
@@ -416,15 +423,49 @@ func envServerSocketBufferBytes() int {
 	return n
 }
 
-// tuneTCPBuffers 调大这条 TCP 连接的收发缓冲，对应 OpenVPN 的 --sndbuf / --rcvbuf。
-// 调不上不是错误：回到系统默认值，功能不受影响。0 表示完全不设置。
+// notsentLowat 是每条隧道连接「已写进内核、还没发出去」的字节上限（TCP_NOTSENT_LOWAT），
+// 0 表示不设置。
+//
+// 为什么要它：线路拥塞时，pumpTun 写出的数据会先堆在 socket 发送缓冲里，Write 照样
+// 立刻返回 —— 槽队列永远不满、「队列满就丢、让内层 TCP 重传」的设计就失效了，数据
+// 改成排长队：按实测 540 KB/s，排满几 MB 就是好几秒，大流量后面的网页、心跳一起被拖住。
+// 限住未发送量之后，拥塞会回压到写协程，表现为槽队列满丢包，内层 TCP 能及时降速。
+//
+// 128 KB：只管「还没发」的部分，在途数据（拥塞窗口）不计入，所以不限吞吐；按 540 KB/s
+// 约 240ms 的排队，够写协程在两次写之间把管道续上。每条连接 setsockopt 设置，不依赖
+// sysctl：自动更新替换二进制、重启服务后立即生效。
+//
+// A/B 或回退用环境变量：ANTAPP_SERVER_NOTSENT_LOWAT=0 表示不设置（回到内核默认，即不限）。
+var notsentLowat = envServerNotsentLowat()
+
+func envServerNotsentLowat() int {
+	const fallback = 128 << 10
+	v := strings.TrimSpace(os.Getenv("ANTAPP_SERVER_NOTSENT_LOWAT"))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
+}
+
+// tuneTCPBuffers 按配置调整这条 TCP 连接：显式收发缓冲（对应 OpenVPN 的 --sndbuf /
+// --rcvbuf，0 = 不设置）和未发送字节上限（见 notsentLowat）。
+// 调不上不是错误：回到系统默认值，功能不受影响（老内核没有 TCP_NOTSENT_LOWAT）。
 func tuneTCPBuffers(conn net.Conn) {
 	tcp, ok := conn.(*net.TCPConn)
-	if !ok || socketBufferBytes <= 0 {
+	if !ok {
 		return
 	}
-	_ = tcp.SetReadBuffer(socketBufferBytes)
-	_ = tcp.SetWriteBuffer(socketBufferBytes)
+	if socketBufferBytes > 0 {
+		_ = tcp.SetReadBuffer(socketBufferBytes)
+		_ = tcp.SetWriteBuffer(socketBufferBytes)
+	}
+	if notsentLowat > 0 {
+		_ = setNotsentLowat(tcp, notsentLowat)
+	}
 }
 
 // serveConn 在派生处理协程之前完成握手准入。
@@ -470,7 +511,14 @@ func (s *Server) handshake(ctx context.Context, raw net.Conn) (*tls.Conn, string
 	tlsConn := tls.Server(raw, s.tlsCfg)
 	_ = tlsConn.SetDeadline(time.Now().Add(handshakeTimeout))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		s.log.Warn("TLS 握手失败（客户端证书不受信或版本不符）", connLogAttrs(err, raw)...)
+		// 第 1 次和之后每 100 次进 Warn，其余进 Debug：扫描器一直在敲这个端口，逐条
+		// Warn 会把 journal 刷满，真正的故障反而翻不到。failed_total 说明被采样掉了多少。
+		if n := s.hsFails.Add(1); n == 1 || n%100 == 0 {
+			s.log.Warn("TLS 握手失败（客户端证书不受信或版本不符）",
+				connLogAttrs(err, raw, "failed_total", n)...)
+		} else {
+			s.log.Debug("TLS 握手失败", connLogAttrs(err, raw, "failed_total", n)...)
+		}
 		return nil, "", helloPayload{}, false
 	}
 	_ = tlsConn.SetDeadline(time.Time{})
@@ -777,6 +825,8 @@ func (s *Server) handleControl(ctx context.Context, tlsConn *tls.Conn, name stri
 	sess.slots[0] = newSlotConn(tlsConn)
 	if err := sess.write(proto.TypeHelloAck, ack); err != nil {
 		s.log.Warn("回 HELLO_ACK 失败", connLogAttrs(err, tlsConn, "client", name)...)
+		// newSlotConn 已经起了写协程；会话还没 attach，没人会再关它，不收就永远挂着
+		sess.close()
 		return
 	}
 
@@ -815,31 +865,7 @@ func (s *Server) serveSession(ctx context.Context, sess *session) {
 				}
 			case proto.TypeUDPPort:
 				// 客户端上报自己的 UDP 数据口：从这里开始，数据包改走 UDP。
-				if s.udp == nil {
-					s.log.Warn("收到 UDP 端口上报，但服务端不是 udp 模式，已忽略",
-						"client", sess.name)
-					continue
-				}
-				if len(payload) < 2 {
-					continue
-				}
-				port := int(binary.BigEndian.Uint16(payload))
-				remote, ok := sess.slot(0).conn.RemoteAddr().(*net.TCPAddr)
-				if !ok || sess.tlsConn == nil {
-					s.log.Warn("登记 UDP 会话失败：拿不到 TCP 远端地址", "client", sess.name)
-					continue
-				}
-				// IP 只认 TCP 连接的真实远端，端口由控制通道上报 —— 见 udprelay.go 的注释
-				u, err := s.udp.addSession(sess.tlsConn.ConnectionState(), remote.IP, port)
-				if err != nil {
-					s.log.Warn("登记 UDP 会话失败", "client", sess.name, "err", err)
-					continue
-				}
-				sess.mu.Lock()
-				sess.udp = u
-				sess.mu.Unlock()
-				s.log.Info("客户端 UDP 数据通道已登记", "client", sess.name,
-					"udp_port", port, "remote_ip", remote.IP.String())
+				s.registerUDP(sess, payload)
 			case proto.TypePing:
 				if err := sess.write(proto.TypePong, payload); err != nil {
 					sess.close()
@@ -879,6 +905,44 @@ func (s *Server) serveSession(ctx context.Context, sess *session) {
 			}
 		}
 	}
+}
+
+// registerUDP 处理控制通道上的 UDP 端口上报，登记这个会话的 UDP 数据通道。
+//
+// 每个会话只认第一次上报：密钥从同一个 TLS 会话导出，内容是固定的，再建一个
+// Cipher 序号会从 0 重来 —— 同一把 AES-GCM 密钥下 nonce 重复，这是密码学错误，
+// 不只是丢包。正常客户端每会话只报一次；换端口要重建会话（重新握手、重新导出密钥）。
+// 只在该会话的读循环里调用，所以「先查后设」不会和自己竞争。
+func (s *Server) registerUDP(sess *session, payload []byte) {
+	if s.udp == nil {
+		s.log.Warn("收到 UDP 端口上报，但服务端不是 udp 模式，已忽略",
+			"client", sess.name)
+		return
+	}
+	if len(payload) < 2 {
+		return
+	}
+	if sess.udpSession() != nil {
+		s.log.Warn("同一会话重复上报 UDP 端口，已忽略（防止 nonce 复用）", "client", sess.name)
+		return
+	}
+	port := int(binary.BigEndian.Uint16(payload))
+	remote, ok := sess.slot(0).conn.RemoteAddr().(*net.TCPAddr)
+	if !ok || sess.tlsConn == nil {
+		s.log.Warn("登记 UDP 会话失败：拿不到 TCP 远端地址", "client", sess.name)
+		return
+	}
+	// IP 只认 TCP 连接的真实远端，端口由控制通道上报 —— 见 udprelay.go 的注释
+	u, err := s.udp.addSession(sess.tlsConn.ConnectionState(), remote.IP, port)
+	if err != nil {
+		s.log.Warn("登记 UDP 会话失败", "client", sess.name, "err", err)
+		return
+	}
+	sess.mu.Lock()
+	sess.udp = u
+	sess.mu.Unlock()
+	s.log.Info("客户端 UDP 数据通道已登记", "client", sess.name,
+		"udp_port", port, "remote_ip", remote.IP.String())
 }
 
 // udpSession 返回这个会话的 UDP 数据通道，没有则 nil。

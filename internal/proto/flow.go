@@ -185,7 +185,9 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 	// 刚被空闲清扫删掉的流又回来了：恢复原槽，避免这一次换槽乱序。
 	if r, ok := t.recent[key]; ok {
 		if now.UnixNano()-r.deletedAt <= int64(recentTTL) &&
-			r.slot > 0 && r.slot < len(t.counts) &&
+			// 用 n 而不是 len(t.counts)：counts 只增不减，成员数变少后它仍比 n 长，
+			// 按它判会把流恢复到一个已经不存在的槽上。
+			r.slot > 0 && r.slot < n &&
 			(alive == nil || alive(r.slot)) {
 			// 表满时先清一次过期项：墓碑恢复不该因为短时间满载而换槽。
 			// 同样受 1 秒节流，避免大量墓碑同时恢复时反复全表扫描。
