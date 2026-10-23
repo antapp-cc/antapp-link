@@ -53,6 +53,37 @@ func init() {
 	refreshSplitRoutesHook = refreshSplitRoutesFor
 }
 
+// installSplitRoutes 按网段表铺国内直连路由，返回实际记进账本的前缀与失败条数。
+//
+// 「本来就在」要分三种情况：新建成功、账本证明是本程序早先铺的、形状相同但没有
+// 任何账本证据。只有前两种能进账本 —— 第三种很可能是用户手工建的路由或其它 VPN
+// 客户端建的路由（同接口、同网关、metric 5），认领它等于把别人的配置记成自己的，
+// 断开时一并删掉。
+func installSplitRoutes(table []string, add func(netip.Prefix) error, ref adapterKey, gw netip.Addr,
+	previous []*splitOwnership) (installed []string, failed int) {
+	installed = make([]string, 0, len(table))
+	for _, p := range table {
+		prefix, err := netip.ParsePrefix(p)
+		if err != nil {
+			failed++
+			continue
+		}
+		dest := prefix.Masked()
+		if err := add(dest); err != nil {
+			if errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) {
+				if claimedBySplitLedger(previous, ref, gw, dest) {
+					installed = append(installed, dest.String())
+				}
+				continue
+			}
+			failed++
+			continue
+		}
+		installed = append(installed, dest.String())
+	}
+	return installed, failed
+}
+
 // refreshSplitRoutesFor 按给定网段表重铺国内直连路由（原生，毫秒级）。
 // 由 routeTableRefresher 在拉到新表后调用。
 func refreshSplitRoutesFor(gw string, ifIndex int, table []string) {
@@ -77,21 +108,9 @@ func refreshSplitRoutesFor(gw string, ifIndex int, table []string) {
 		logf("国内分流热更新：按形态清理旧路由时 %d 条失败: %v", removed, serr)
 	}
 
-	installed := make([]string, 0, len(table))
-	failed := 0
-	for _, p := range table {
-		prefix, err := netip.ParsePrefix(p)
-		if err != nil {
-			failed++
-			continue
-		}
-		if err := a.LUID.AddRoute(prefix.Masked(), gwAddr, splitRouteMetric); err != nil &&
-			!errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) {
-			failed++
-			continue
-		}
-		installed = append(installed, prefix.Masked().String())
-	}
+	installed, failed := installSplitRoutes(table, func(p netip.Prefix) error {
+		return a.LUID.AddRoute(p, gwAddr, splitRouteMetric)
+	}, a.key(), gwAddr, []*splitOwnership{previous})
 
 	own := newSplitOwnership(a.key(), gwAddr, installed)
 	own, kept := splitLedgerAfterRefresh(own, previous, oldSweepFailed)
@@ -389,30 +408,25 @@ func (s *Snapshot) applyOnce(cfg NetConfig) error {
 	//    好处是服务端出口出问题时国内网络照常可用，不会「连上就没有网」。
 	gwAddr, gwErr := netip.ParseAddr(s.DefaultGateway)
 	if gwErr == nil && haveDef {
-		added, failed := 0, 0
-		var installed []string
-		for _, p := range ActiveCNRoutes() {
-			prefix, err := netip.ParsePrefix(p)
-			if err != nil {
-				continue
-			}
-			if err := def.LUID.AddRoute(prefix.Masked(), gwAddr, splitRouteMetric); err != nil &&
-				!errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) {
-				failed++
-				continue
-			}
-			// 已存在的那条也记成自己的：形状（本接口 + 本网关 + metric 5 +
-			// 同一前缀）与本程序铺的完全一致，不记的话还原时会留在表里。
-			installed = append(installed, prefix.Masked().String())
-			added++
+		// 先前的账本是「本来就在」的路由唯一的归属证据：形状相同的用户路由
+		// 不能因为这次重铺就被算成自己的。
+		previous := make([]*splitOwnership, 0, 2)
+		if s.Split != nil {
+			previous = append(previous, s.Split)
 		}
+		if live := currentLiveSplitOwnership(); live != nil && live != s.Split {
+			previous = append(previous, live)
+		}
+		installed, failed := installSplitRoutes(ActiveCNRoutes(), func(p netip.Prefix) error {
+			return def.LUID.AddRoute(p, gwAddr, splitRouteMetric)
+		}, def.key(), gwAddr, previous)
 		own := newSplitOwnership(def.key(), gwAddr, installed)
 		s.Split = own
 		setLiveSplitOwnership(own)
 		switch {
 		case failed == 0:
 			logf("智能分流已启用：国内流量直连，其余走隧道")
-		case added > 0:
+		case len(installed) > 0:
 			logf("智能分流部分生效：%d 条直连路由没写进去（这些网段会走隧道，不影响可用）", failed)
 		default:
 			logf("智能分流未能写入（国内流量将全部走隧道，不影响可用）")

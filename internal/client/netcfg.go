@@ -469,6 +469,19 @@ func splitLedgerAfterRefresh(fresh, previous *splitOwnership, oldSweepFailed boo
 	return fresh, false
 }
 
+// claimedBySplitLedger 报告一条「本来就在」的路由是否有账本证明是本程序装的。
+//
+// 形状（本接口 + 原网关 + metric 5）不能当证据：用户手工建的路由、其它 VPN
+// 客户端建的路由都是这个形状。没有账本还认领，断开时就会删掉用户的配置。
+func claimedBySplitLedger(ledgers []*splitOwnership, ref adapterKey, gw netip.Addr, dest netip.Prefix) bool {
+	for _, own := range ledgers {
+		if own.ownsRoute(ref.GUID, ref.Index, gw, splitRouteMetric, dest) {
+			return true
+		}
+	}
+	return false
+}
+
 // nrptRuleComment 是 NRPT 规则的识别标记，增删都按它筛，不碰别人的规则。
 const nrptRuleComment = "AntApp Link DNS"
 
