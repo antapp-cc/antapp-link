@@ -11,7 +11,6 @@ import (
 	"net/netip"
 	"os/exec"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -54,17 +53,6 @@ func init() {
 	refreshSplitRoutesHook = refreshSplitRoutesFor
 }
 
-// liveSplitOwnership 是本进程当前铺着哪些国内分流路由的实时记录。
-//
-// 热更新（routeTableRefresher）只拿得到网关/索引/新网段表，拿不到 App 的
-// Snapshot，靠它知道上一版装了哪些前缀、该撤哪些。崩溃后这份记录丢失，只剩
-// state.json 里 Snapshot.Split 那一份（那是接管当时铺的那一版）。
-var liveSplitOwnership atomic.Pointer[splitOwnership]
-
-func setLiveSplitOwnership(o *splitOwnership)    { liveSplitOwnership.Store(o) }
-func currentLiveSplitOwnership() *splitOwnership { return liveSplitOwnership.Load() }
-func clearLiveSplitOwnership()                   { liveSplitOwnership.Store(nil) }
-
 // refreshSplitRoutesFor 按给定网段表重铺国内直连路由（原生，毫秒级）。
 // 由 routeTableRefresher 在拉到新表后调用。
 func refreshSplitRoutesFor(gw string, ifIndex int, table []string) {
@@ -78,9 +66,12 @@ func refreshSplitRoutesFor(gw string, ifIndex int, table []string) {
 	}
 	// 先撤自己上一版的路由：有 live 记录就只删记录里的；没有（进程刚起、或
 	// 接管时没铺成分流）才退回形态扫描。
-	if own := currentLiveSplitOwnership(); own != nil {
-		if removed, serr := sweepOwnedSplitRoutes(own); serr != nil {
+	previous := currentLiveSplitOwnership()
+	oldSweepFailed := false
+	if previous != nil {
+		if removed, serr := sweepOwnedSplitRoutes(previous); serr != nil {
 			logf("国内分流热更新：旧路由有 %d 条没删掉（%v），继续铺新表", removed, serr)
+			oldSweepFailed = true
 		}
 	} else if removed, serr := sweepSplitRoutes(gwAddr); serr != nil {
 		logf("国内分流热更新：按形态清理旧路由时 %d 条失败: %v", removed, serr)
@@ -101,7 +92,14 @@ func refreshSplitRoutesFor(gw string, ifIndex int, table []string) {
 		}
 		installed = append(installed, prefix.Masked().String())
 	}
-	setLiveSplitOwnership(newSplitOwnership(a.key(), gwAddr, installed))
+
+	own := newSplitOwnership(a.key(), gwAddr, installed)
+	own, kept := splitLedgerAfterRefresh(own, previous, oldSweepFailed)
+	if oldSweepFailed && !kept {
+		logf("国内分流热更新：旧账本属于另一张网卡或网关，%d 条残留无法并入新账本",
+			len(previous.Prefixes))
+	}
+	setLiveSplitOwnership(own)
 	if failed > 0 {
 		logf("国内分流重铺：%d 条失败（这些网段暂走隧道，不影响可用）", failed)
 	}
@@ -549,21 +547,13 @@ func (s Snapshot) Restore(cfg NetConfig) error {
 	if haveDef {
 		// 国内分流残留：有所有权记录时只清自己装的那一组；旧快照没记，只能退回
 		// 「下一跳 + metric」的形态扫描（会碰到同形态的用户路由，见 sweepSplitRoutes）。
-		owns := make([]*splitOwnership, 0, 2)
-		if s.Split != nil {
-			owns = append(owns, s.Split)
-		}
-		if live := currentLiveSplitOwnership(); live != nil && live != s.Split {
-			owns = append(owns, live)
-		}
-		if len(owns) > 0 {
-			for _, own := range owns {
-				removed, serr := sweepOwnedSplitRoutes(own)
-				if serr != nil {
-					fail(fmt.Errorf("清理国内分流: %w", serr))
-				} else if removed > 0 {
-					logf("已清理国内分流残留 %d 条", removed)
-				}
+		if len(splitLedgersForRestore(s.Split, currentLiveSplitOwnership())) > 0 {
+			removed, serr := restoreSplitRoutes(s.Split, sweepOwnedSplitRoutes)
+			if serr != nil {
+				fail(fmt.Errorf("清理国内分流: %w", serr))
+			}
+			if removed > 0 {
+				logf("已清理国内分流残留 %d 条", removed)
 			}
 		} else if gw, gerr := netip.ParseAddr(s.DefaultGateway); gerr == nil {
 			removed, serr := sweepSplitRoutes(gw)
@@ -619,10 +609,8 @@ func (s Snapshot) Restore(cfg NetConfig) error {
 		}
 	}
 
-	// 进程内的所有权记录随这次还原一起失效：不管快照是否完好，接下来要么重新
-	// 接管（Apply 会重设），要么就在没接管的干净状态。
-	clearLiveSplitOwnership()
-
+	// 进程内账本已由 restoreSplitRoutes 按清理结果维护：没清干净的那份留着等
+	// 下一次还原重试，这里不能再无条件清空。
 	flushResolverCache()
 	if len(errs) > 0 {
 		joined := errors.Join(errs...)

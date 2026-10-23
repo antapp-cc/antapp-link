@@ -1,9 +1,11 @@
 package client
 
 import (
+	"errors"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -448,6 +450,85 @@ func TestResolveClientDNSKeepsExplicitPublic(t *testing.T) {
 	got := resolveClientDNS(inv)
 	if len(got) != 1 || got[0] != "9.9.9.9" {
 		t.Fatalf("连接码指定的解析器应保留，实际 %v", got)
+	}
+}
+
+// ---------- 还原失败时的分流账本 ----------
+
+// 还原失败时不能清掉进程内账本：热更新铺的那一版（B）只存在于内存里。
+//
+// 复现红线：快照账本为 A，热更新后进程内账本为 B。第一次还原删 B 失败，若顺手
+// 清空账本，第二次还原就只认快照里的 A、返回成功 —— B 那批路由此后再也没有人
+// 知道它们存在，也就永远清不掉。
+func TestRestoreSplitRoutesKeepsFailedLiveLedger(t *testing.T) {
+	t.Cleanup(clearLiveSplitOwnership)
+	snapOwn := &splitOwnership{IfIndex: 12, Gateway: "192.168.1.1", Prefixes: []string{"1.0.1.0/24"}}
+	liveOwn := &splitOwnership{IfIndex: 12, Gateway: "192.168.1.1", Prefixes: []string{"1.0.2.0/23"}}
+	setLiveSplitOwnership(liveOwn)
+
+	failLive := func(own *splitOwnership) (int, error) {
+		if own == liveOwn {
+			return 0, errors.New("删除路由 1.0.2.0/23: 拒绝访问")
+		}
+		return len(own.Prefixes), nil
+	}
+	if _, err := restoreSplitRoutes(snapOwn, failLive); err == nil {
+		t.Fatal("B 没删掉必须报错，否则调用方会删掉 state.json、当还原已经完成")
+	}
+	if got := currentLiveSplitOwnership(); got != liveOwn {
+		t.Fatalf("失败时进程内账本必须保留 B，实际 %+v", got)
+	}
+
+	// 第二轮：这次 B 删得掉。必须真的重试到 B，而不是只处理快照里的 A 就报成功。
+	var swept []*splitOwnership
+	allOK := func(own *splitOwnership) (int, error) {
+		swept = append(swept, own)
+		return len(own.Prefixes), nil
+	}
+	if _, err := restoreSplitRoutes(snapOwn, allOK); err != nil {
+		t.Fatalf("第二轮应当成功: %v", err)
+	}
+	if !slices.Contains(swept, liveOwn) {
+		t.Fatal("第二轮没有重试 B 的账本，B 的路由永远清不掉")
+	}
+	if got := currentLiveSplitOwnership(); got != nil {
+		t.Errorf("全部清干净后进程内账本应清空，实际 %+v", got)
+	}
+}
+
+// 热更新时旧账本删失败，没删掉的前缀必须并进新账本：新网段表未必包含它们，
+// 一趟丢弃就等于把它们从账本上抹掉，以后热更新和还原都不会再碰。
+func TestMergeSplitOwnershipKeepsFailedPrefixes(t *testing.T) {
+	old := &splitOwnership{IfGUID: "{eth}", IfIndex: 12, Gateway: "192.168.1.1",
+		Prefixes: []string{"1.0.1.0/24", "1.0.2.0/23"}}
+	fresh := &splitOwnership{IfGUID: "{eth}", IfIndex: 12, Gateway: "192.168.1.1",
+		Prefixes: []string{"1.0.1.0/24", "1.0.3.0/24"}}
+
+	merged := mergeSplitOwnership(fresh, old)
+	if merged == nil {
+		t.Fatal("同网卡同网关的两份账本应当能合并")
+	}
+	if len(merged.Prefixes) != 3 {
+		t.Fatalf("合并后应是去重的 3 条前缀，实际 %v", merged.Prefixes)
+	}
+	for _, want := range []string{"1.0.1.0/24", "1.0.2.0/23", "1.0.3.0/24"} {
+		if !slices.Contains(merged.Prefixes, want) {
+			t.Errorf("合并后丢了 %s: %v", want, merged.Prefixes)
+		}
+	}
+
+	other := &splitOwnership{IfGUID: "{wlan}", IfIndex: 7, Gateway: "192.168.1.1"}
+	if mergeSplitOwnership(fresh, other) != nil {
+		t.Error("网卡不同时一条账本记录装不下两套路由，应返回 nil 让调用方报数")
+	}
+
+	// 热更新：旧表删失败时新账本必须带着旧前缀；删干净了就只用新账本。
+	own, kept := splitLedgerAfterRefresh(fresh, old, true)
+	if !kept || len(own.Prefixes) != 3 {
+		t.Errorf("旧表删失败时新账本应并回残留前缀，kept=%v own=%v", kept, own)
+	}
+	if own, kept := splitLedgerAfterRefresh(fresh, old, false); kept || own != fresh {
+		t.Error("旧表删干净时不该把上一版前缀再带回来")
 	}
 }
 

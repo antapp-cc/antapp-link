@@ -350,6 +350,125 @@ func newSplitOwnership(ref adapterKey, gateway netip.Addr, prefixes []string) *s
 	}
 }
 
+// liveSplitOwnership 是本进程当前铺着哪些国内分流路由的实时记录。
+//
+// 热更新（routeTableRefresher）只拿得到网关/索引/新网段表，拿不到 App 的
+// Snapshot，靠它知道上一版装了哪些前缀、该撤哪些。崩溃后这份记录丢失，只剩
+// state.json 里 Snapshot.Split 那一份（那是接管当时铺的那一版）。
+var liveSplitOwnership atomic.Pointer[splitOwnership]
+
+func setLiveSplitOwnership(o *splitOwnership)    { liveSplitOwnership.Store(o) }
+func currentLiveSplitOwnership() *splitOwnership { return liveSplitOwnership.Load() }
+func clearLiveSplitOwnership()                   { liveSplitOwnership.Store(nil) }
+
+// splitLedgersForRestore 汇总一次还原要清理的两份账本：快照里那份与进程内那份。
+func splitLedgersForRestore(snapshot, live *splitOwnership) []*splitOwnership {
+	owns := make([]*splitOwnership, 0, 2)
+	if snapshot != nil {
+		owns = append(owns, snapshot)
+	}
+	if live != nil && live != snapshot {
+		owns = append(owns, live)
+	}
+	return owns
+}
+
+// sweepSplitLedgers 按账本逐份清理分流路由，返回删掉的条数、这次没清干净的那份
+// 账本，以及汇总的删除错误。
+//
+// 失败时要把 live 账本原样交回去，是因为它只存在于进程内：快照里那份（A）还躺在
+// state.json 里等下一次还原重试，热更新后的那份（B）一旦从内存里清掉，就再没有
+// 第二处知道它铺过什么，B 的残留路由会从此无人认领。
+func sweepSplitLedgers(owns []*splitOwnership, live *splitOwnership,
+	sweep func(*splitOwnership) (int, error)) (removed int, remain *splitOwnership, err error) {
+	var errs []error
+	for _, own := range owns {
+		n, serr := sweep(own)
+		removed += n
+		if serr == nil {
+			continue
+		}
+		errs = append(errs, serr)
+		if own == live {
+			remain = own
+		}
+	}
+	return removed, remain, errors.Join(errs...)
+}
+
+// restoreSplitRoutes 按快照账本与进程内账本清理分流路由，并据此维护进程内账本：
+// 全部清干净才清空，没清干净就留到下一次还原重试。
+func restoreSplitRoutes(snapshot *splitOwnership, sweep func(*splitOwnership) (int, error)) (removed int, err error) {
+	live := currentLiveSplitOwnership()
+	owns := splitLedgersForRestore(snapshot, live)
+	if len(owns) == 0 {
+		return 0, nil
+	}
+	removed, remain, serr := sweepSplitLedgers(owns, live, sweep)
+	if remain != nil {
+		setLiveSplitOwnership(remain)
+	} else {
+		clearLiveSplitOwnership()
+	}
+	return removed, serr
+}
+
+// mergeSplitOwnership 把 extra 的前缀并进 base，给「上一版没删干净」的残留用。
+// 两者不属于同一张网卡或同一个网关时返回 nil：一条账本记录装不下两套路由。
+//
+// 已删掉的前缀也会留在合并结果里；下次重试对「本来就不在」的路由不计失败，
+// 所以这份账本只是需要重试的超集，不会因此误删。
+func mergeSplitOwnership(base, extra *splitOwnership) *splitOwnership {
+	if base == nil {
+		return extra
+	}
+	if extra == nil {
+		return base
+	}
+	if !sameSplitScope(base, extra) {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(base.Prefixes)+len(extra.Prefixes))
+	out := &splitOwnership{IfGUID: base.IfGUID, IfIndex: base.IfIndex, Gateway: base.Gateway}
+	for _, list := range [][]string{base.Prefixes, extra.Prefixes} {
+		for _, p := range list {
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			out.Prefixes = append(out.Prefixes, p)
+		}
+	}
+	return out
+}
+
+// sameSplitScope 判断两份账本记的是不是同一张网卡加同一个网关（GUID 优先）。
+func sameSplitScope(a, b *splitOwnership) bool {
+	if a.IfGUID != "" || b.IfGUID != "" {
+		if a.IfGUID == "" || a.IfGUID != b.IfGUID {
+			return false
+		}
+	} else if a.IfIndex != b.IfIndex {
+		return false
+	}
+	return a.Gateway == b.Gateway
+}
+
+// splitLedgerAfterRefresh 算热更新铺完之后该留哪份账本。
+//
+// 上一版没删干净时，那些路由还在表里，而新网段表未必包含它们。不并回账本就等于
+// 把它们从账本上抹掉，下一轮热更新和还原都不会再去删。kept 报告是否真的并了进来
+// （两份账本分属不同网卡/网关时一条记录装不下，只能保留新账本并报数）。
+func splitLedgerAfterRefresh(fresh, previous *splitOwnership, oldSweepFailed bool) (own *splitOwnership, kept bool) {
+	if !oldSweepFailed || previous == nil {
+		return fresh, false
+	}
+	if merged := mergeSplitOwnership(fresh, previous); merged != nil {
+		return merged, true
+	}
+	return fresh, false
+}
+
 // nrptRuleComment 是 NRPT 规则的识别标记，增删都按它筛，不碰别人的规则。
 const nrptRuleComment = "AntApp Link DNS"
 
