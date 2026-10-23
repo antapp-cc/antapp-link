@@ -23,6 +23,17 @@ var (
 	adapterByIndexFn   = adapterByIndex
 )
 
+// 迁移路径上的系统入口。单测要构造「旧网卡清理失败」「新出口上已有同形状
+// 的用户路由」这两类真机上很难复现的场景，只能替换这些调用。
+var (
+	bestRouteToFn     = bestRouteTo
+	setAdapterDNSFn   = setAdapterDNS
+	sweepOwnedSplitFn = sweepOwnedSplitRoutes
+	addSplitRouteFn   = func(l winipcfg.LUID, dest netip.Prefix, gw netip.Addr) error {
+		return l.AddRoute(dest, gw, splitRouteMetric)
+	}
+)
+
 func init() {
 	// 撤不干净时把 pending 的现场一并交出去：App 会把它落盘，下次启动自愈
 	// 还能照着清那张网卡。默认实现读不到 watcher 的 pending。
@@ -60,6 +71,14 @@ type pendingMigration struct {
 	snap         Snapshot
 	dnsApplied   bool
 	routeApplied bool
+
+	// old 是这次迁移还没清理干净的旧出口现场。非 nil 表示旧网卡的 DNS/分流/
+	// 绕行还有残留：在它清干净之前不能提交新现场，否则旧网卡的原始 DNS 和
+	// 路由账本就再没有记录可查了。
+	//
+	// 三步清理都是幂等的（DNS 写回快照原值、只删账本里的路由、按原下一跳删
+	// /32），所以重试整段就是「未完成清单」，不需要逐条记做到哪一步。
+	old *Snapshot
 }
 
 type sessionWatcher struct {
@@ -267,6 +286,18 @@ func (w *sessionWatcher) reconcile() {
 			return
 		}
 
+		// 上一次迁移的旧出口没清干净：先接着清，清不完就不提交 —— 旧账本
+		// 还在这笔 pending 里，提交新现场会把唯一的记录冲掉。
+		if p.old != nil {
+			if cerrs := w.cleanOldExit(*p.old, newDef.key(), false); len(cerrs) > 0 {
+				logf("上次迁移的旧出口仍有 %d 处清理未完成（保留待办，不提交新现场）: %v",
+					len(cerrs), errors.Join(cerrs...))
+				return
+			}
+			p.old = nil
+			logf("上次迁移遗留的旧出口配置已清理完成")
+		}
+
 		// 先补没写完的关键配置。用的是 pending 里那份**第一次捕获的原始现场**，
 		// 不是当前网卡上的值（那已经被改成隧道网关了）。
 		//
@@ -274,7 +305,7 @@ func (w *sessionWatcher) reconcile() {
 		// 「接口和网关都没变」就返回，于是那一次 DNS 失败永远补不上，状态却显示
 		// 迁移完成 —— 隧道一直连不上，而系统里的 DNS 还指着隧道网关。
 		if !p.dnsApplied {
-			if derr := setAdapterDNS(newDef.LUID, w.cfg.DNS); derr != nil {
+			if derr := setAdapterDNSFn(newDef.LUID, w.cfg.DNS); derr != nil {
 				logf("补写 DNS 仍失败（保留待修状态）: %v", derr)
 				return
 			}
@@ -309,7 +340,6 @@ func (w *sessionWatcher) reconcile() {
 	}
 
 	oldSnap := w.snap
-	oldGw, _ := netip.ParseAddr(oldSnap.DefaultGateway)
 
 	// 先把新现场完整抓下来，再动旧配置。
 	//
@@ -346,46 +376,12 @@ func (w *sessionWatcher) reconcile() {
 		newIface = captureIfaceDNS(newDef)
 	}
 
-	// 新现场齐了，才开始拆旧的。
-	// 1) 还原旧网卡的 DNS（用旧快照里记录的原值；网卡已消失则跳过）
-	for _, iface := range oldSnap.Interfaces {
-		if iface.ref().sameAdapter(newDef.key()) {
-			continue
-		}
-		if a, ok, _ := adapterForIface(iface); ok {
-			if err := applyIfaceDNS(a.LUID, iface); err != nil {
-				logf("迁移时还原旧网卡 %s 的 DNS 失败: %v", iface.Name, err)
-			}
-		}
-	}
-	// 2) 扫掉旧网卡上的国内分流：只清自己装的；旧快照没有所有权记录才按形态扫
-	owns := make([]*splitOwnership, 0, 2)
-	if oldSnap.Split != nil {
-		owns = append(owns, oldSnap.Split)
-	}
-	if live := currentLiveSplitOwnership(); live != nil && live != oldSnap.Split {
-		owns = append(owns, live)
-	}
-	if len(owns) > 0 {
-		for _, own := range owns {
-			if _, serr := sweepOwnedSplitRoutes(own); serr != nil {
-				logf("迁移时清理旧分流未完成: %v", serr)
-			}
-		}
-	} else if oldGw.IsValid() {
-		if _, serr := sweepSplitRoutes(oldGw); serr != nil {
-			logf("迁移时按形态清理旧分流未完成: %v", serr)
-		}
-	}
-	// 3) 撤旧绕行路由
-	if oldSnap.ServerNextHop != "" && w.srv.IsValid() {
-		if a, ok := defaultAdapter(oldSnap); ok {
-			if hop, err := netip.ParseAddr(oldSnap.ServerNextHop); err == nil {
-				if derr := deleteRouteIgnoringMissing(a.LUID, netip.PrefixFrom(w.srv, 32), hop); derr != nil {
-					logf("迁移时撤旧绕行路由失败: %v", derr)
-				}
-			}
-		}
+	// 新现场齐了，才开始拆旧的。清理失败不能只记日志：旧网卡的原始 DNS 和
+	// 路由账本只在旧快照里，提交一个只含新出口的快照就等于把它丢了。
+	cleanupErrs := w.cleanOldExit(oldSnap, newDef.key(), true)
+	if len(cleanupErrs) > 0 {
+		logf("迁移时旧出口有 %d 处清理未完成（保留待办，不提交新现场）: %v",
+			len(cleanupErrs), errors.Join(cleanupErrs...))
 	}
 
 	// 旧绕行撤掉之后，再算新出口到云服该怎么绕。
@@ -393,7 +389,7 @@ func (w *sessionWatcher) reconcile() {
 	// 必须排在这之后：连接期那条云服 /32 绕行还在表里时，最长前缀会命中它，
 	// 算出来的下一跳是旧网关（换出口后通常已不可达）。那样装到新网卡上的 /32
 	// 指向死路，隧道重拨的流量会被 /1 吸回隧道自己，永久连不上。
-	hop, _, err := bestRouteTo(w.srv, tunLUID)
+	hop, _, err := bestRouteToFn(w.srv, tunLUID)
 	if err != nil {
 		// 算不出来就把旧绕行原样装回去，别停在「旧绕行已删、新绕行没建」的状态
 		if oldSnap.ServerNextHop != "" && w.srv.IsValid() {
@@ -417,7 +413,7 @@ func (w *sessionWatcher) reconcile() {
 	// 快照写盘成功就把出口标记提交掉的话，对账发现接口与网关没变就直接返回，
 	// 这两个配置永远不会被补修，隧道一直连不上。
 	dnsApplied := true
-	if err := setAdapterDNS(newDef.LUID, w.cfg.DNS); err != nil {
+	if err := setAdapterDNSFn(newDef.LUID, w.cfg.DNS); err != nil {
 		dnsApplied = false
 		logf("迁移 DNS 到 %s 失败（待补修）: %v", newDef.Name, err)
 	}
@@ -484,6 +480,73 @@ func (w *sessionWatcher) reconcile() {
 		newDef.Name, gw, migrationNote(failed))
 }
 
+// cleanOldExit 把旧出口上的接管痕迹清掉，返回每一处没做成的清理。
+//
+// 三步都幂等：DNS 写回快照里的原值、只删账本里记过的分流、按原下一跳删云服
+// /32。失败重试直接整段重跑，不需要逐条记做到哪一步。
+//
+// keep 是这次迁移的新出口网卡。同一张网卡只换了网关时，它身上的 DNS 必须保持
+// 隧道值，不能按旧快照还原。withLive 为 false 时不动进程内的热更新账本 ——
+// 重试和回滚时那份账本已经属于新出口了。
+func (w *sessionWatcher) cleanOldExit(old Snapshot, keep adapterKey, withLive bool) []error {
+	var errs []error
+
+	for _, iface := range old.Interfaces {
+		if iface.ref().sameAdapter(keep) {
+			continue
+		}
+		if a, ok, _ := adapterForIface(iface); ok {
+			if err := applyIfaceDNS(a.LUID, iface); err != nil {
+				errs = append(errs, fmt.Errorf("还原旧网卡 %s 的 DNS: %w", iface.Name, err))
+			}
+		}
+	}
+
+	owns := make([]*splitOwnership, 0, 2)
+	if old.Split != nil {
+		owns = append(owns, old.Split)
+	}
+	if withLive {
+		if live := currentLiveSplitOwnership(); live != nil && live != old.Split {
+			owns = append(owns, live)
+		}
+	}
+	if len(owns) > 0 {
+		for _, own := range owns {
+			if _, err := sweepOwnedSplitFn(own); err != nil {
+				errs = append(errs, fmt.Errorf("清理旧网卡的国内分流: %w", err))
+			}
+		}
+	} else if gw, err := netip.ParseAddr(old.DefaultGateway); err == nil {
+		// 旧快照没有所有权记录时只能按形态扫，可能碰到同形态的用户路由 ——
+		// 这是旧版本留下的数据，没有更好的判据。
+		if _, serr := sweepSplitRoutes(gw); serr != nil {
+			errs = append(errs, fmt.Errorf("按形态清理旧网卡的国内分流: %w", serr))
+		}
+	}
+
+	if old.ServerNextHop != "" && w.srv.IsValid() {
+		if a, ok := defaultAdapter(old); ok {
+			if hop, err := netip.ParseAddr(old.ServerNextHop); err == nil {
+				if derr := deleteRouteIgnoringMissing(a.LUID, netip.PrefixFrom(w.srv, 32), hop); derr != nil {
+					errs = append(errs, fmt.Errorf("撤旧云服绕行路由: %w", derr))
+				}
+			}
+		}
+	}
+	return errs
+}
+
+// pendingKeep 是待提交新现场对应的网卡标识：重试旧出口清理时跳过同一张网卡
+// 的 DNS 还原 —— 它上面现在是隧道 DNS，不能按旧快照改回去。
+func pendingKeep(p *pendingMigration) adapterKey {
+	if p == nil || len(p.snap.Interfaces) == 0 {
+		return adapterKey{}
+	}
+	r := p.snap.Interfaces[0].ref()
+	return adapterKey{GUID: r.GUID, Index: uint32(r.Index), Name: r.Name}
+}
+
 // revertPending 把一笔未完成迁移在网卡上留下的配置撤掉。
 //
 // 用的全是 pending 里记下的原始值：那张网卡的 DNS 原值和绕行下一跳。清理完就不再
@@ -499,18 +562,28 @@ func (w *sessionWatcher) revertPending() error {
 	}
 	var errs []error
 
+	// 迁移事务里没做完的旧出口清理先补上：pending 一撤销，旧网卡的原始 DNS
+	// 和路由账本就没有别的记录了。
+	if p.old != nil {
+		if oerrs := w.cleanOldExit(*p.old, pendingKeep(p), false); len(oerrs) > 0 {
+			errs = append(errs, oerrs...)
+		} else {
+			p.old = nil
+		}
+	}
+
 	// 还原那张网卡记录的 DNS（自动来源会清空设置，见 IfaceDNS.DNSAuto）
 	errs = append(errs, restoreIfacesDNS(p.snap.Interfaces)...)
 
 	// 这笔迁移可能已经把国内分流铺上了一部分（失败点通常在 DNS 或绕行路由之后），
 	// 一并撤掉；热更新铺的那一版也在这里兜底。
 	if p.snap.Split != nil {
-		if _, serr := sweepOwnedSplitRoutes(p.snap.Split); serr != nil {
+		if _, serr := sweepOwnedSplitFn(p.snap.Split); serr != nil {
 			errs = append(errs, fmt.Errorf("清理待回滚迁移的国内分流: %w", serr))
 		}
 	}
 	if live := currentLiveSplitOwnership(); live != nil && live != p.snap.Split {
-		if _, serr := sweepOwnedSplitRoutes(live); serr != nil {
+		if _, serr := sweepOwnedSplitFn(live); serr != nil {
 			errs = append(errs, fmt.Errorf("清理待回滚迁移的热更新分流: %w", serr))
 		} else {
 			clearLiveSplitOwnership()
