@@ -27,3 +27,21 @@ func TestSysctlContentCoversTuning(t *testing.T) {
 		}
 	}
 }
+
+// 内置安装入口只写持久化配置，不立即 apply：内核还不是 bbr 时必须提示，
+// 否则「装完没生效」会被当成安装失败。
+func TestBBRReport(t *testing.T) {
+	if got := bbrReport("bbr\n"); got != "" {
+		t.Fatalf("已经是 bbr 时不该提示，实际 %q", got)
+	}
+	got := bbrReport("cubic\n")
+	if !strings.Contains(got, "cubic") {
+		t.Errorf("提示里要带当前算法，实际 %q", got)
+	}
+	if !strings.Contains(got, sysctlFile) {
+		t.Errorf("提示里要带持久化配置路径，实际 %q", got)
+	}
+	if !strings.Contains(got, "重启后生效") {
+		t.Errorf("提示里要说明何时生效，实际 %q", got)
+	}
+}

@@ -79,6 +79,10 @@ func TestRecycleAtDefersWhenBusy(t *testing.T) {
 	if errors.Is(err, errScheduledRecycle) {
 		t.Fatal("正在传数据时不该重建连接")
 	}
+	// 推迟次数要记下来：报告要求能回答「为什么本该 12 小时断一次却没断」
+	if s.recycleDeferrals == 0 {
+		t.Fatal("持续繁忙却一次推迟都没记下")
+	}
 }
 
 // 关闭开关（周期 <= 0）时必须立刻返回，不能阻塞。

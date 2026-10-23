@@ -212,6 +212,48 @@ func TestFlowTableFullFallbackStablePerFlow(t *testing.T) {
 	}
 }
 
+// 流表诊断快照：占用、容量、满表回退次数、各槽计数必须自洽。
+//
+// 运行优化报告第 3 项要求先量清「表有没有被吃满」再决定做不做 FIN/RST 回收；
+// 这几个数一旦漂移，判断会反过来 —— 明明没满却以为满了去加淘汰。
+func TestFlowTableStats(t *testing.T) {
+	ft := NewFlowTable()
+	ft.max = 3
+	for i := 0; i < 10; i++ {
+		p := buildTCP([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, uint16(40000+i), 443)
+		ft.Slot(p, 4, nil)
+	}
+
+	st := ft.Stats()
+	if st.Size != 3 {
+		t.Fatalf("占用应为容量 3，实际 %d", st.Size)
+	}
+	if st.Max != 3 {
+		t.Fatalf("容量应为 3，实际 %d", st.Max)
+	}
+	// 前 3 条建立映射，其余 7 条走满表回退
+	if st.Fallbacks != 7 {
+		t.Fatalf("满表回退次数应为 7，实际 %d", st.Fallbacks)
+	}
+	sum := 0
+	for _, c := range st.PerSlot {
+		sum += c
+	}
+	if sum != st.Size {
+		t.Fatalf("各槽计数合计 %d 与占用 %d 不一致（计数漏加减）", sum, st.Size)
+	}
+}
+
+// 未满表时回退计数必须保持 0：否则「占用没到顶」和「回退在涨」两条证据会自相矛盾。
+func TestFlowTableStatsNoFallbackWhenNotFull(t *testing.T) {
+	ft := NewFlowTable()
+	p := buildTCP([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 40000, 443)
+	ft.Slot(p, 4, nil)
+	if st := ft.Stats(); st.Fallbacks != 0 {
+		t.Fatalf("表没满却记了 %d 次回退", st.Fallbacks)
+	}
+}
+
 // 原来命中映射就直接返回、不管那个槽是否还活着：流会持续往死槽发、被 flushBatch
 // 整批丢掉，直到原槽被补拨回来（实测能黑几十秒，用户看到的是「显示已连接、延迟
 // 也在跳，但这条流就是不动」）。迁移只发生一次（迁完映射立刻更新），内层 TCP 的

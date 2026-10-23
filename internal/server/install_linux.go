@@ -95,7 +95,27 @@ func Install(stdout, stderr io.Writer, args []string) int {
 	fmt.Fprintf(stdout, "\n安装完成。启动顺序：\n")
 	fmt.Fprintf(stdout, "  %s up -c %s      # 先配 netfilter\n", binaryPath, *cfgPath)
 	fmt.Fprintf(stdout, "  systemctl start antapp-linkd     # 再起隧道\n")
+	reportBBRState(stdout)
 	return 0
+}
+
+// bbrReport 按内核当前的拥塞控制算法生成提示；bbr 时返回空串。
+//
+// 本入口只写 sysctl 持久化文件、不立即 apply（deploy/install.sh 才会当场 -w 并回读）。
+// 不说清楚的话，「装完 BBR 没生效」会被当成安装失败。
+func bbrReport(cc string) string {
+	cc = strings.TrimSpace(cc)
+	if cc == "bbr" {
+		return ""
+	}
+	return fmt.Sprintf("提示：当前内核拥塞控制是 %s，不是 bbr；配置已写入 %s，重启后生效。\n"+
+		"（若用 deploy/install.sh 安装，它会当场启用并回读，可以忽略本提示。）\n", cc, sysctlFile)
+}
+
+func reportBBRState(w io.Writer) {
+	if b, err := os.ReadFile("/proc/sys/net/ipv4/tcp_congestion_control"); err == nil {
+		fmt.Fprint(w, bbrReport(string(b)))
+	}
 }
 
 func installBinary() error {

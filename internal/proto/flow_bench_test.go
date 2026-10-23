@@ -65,11 +65,11 @@ func checkFlowCounts(t *testing.T, ft *FlowTable) {
 	ft.mu.Lock()
 	defer ft.mu.Unlock()
 	want := make([]int, len(ft.counts))
-	for _, s := range ft.m {
-		if s < 0 || s >= len(want) {
-			t.Fatalf("映射指向槽 %d，超出计数长度 %d", s, len(want))
+	for _, e := range ft.m {
+		if e.slot < 0 || e.slot >= len(want) {
+			t.Fatalf("映射指向槽 %d，超出计数长度 %d", e.slot, len(want))
 		}
-		want[s]++
+		want[e.slot]++
 	}
 	for i := 1; i < len(want); i++ {
 		if ft.counts[i] != want[i] {

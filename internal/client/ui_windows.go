@@ -896,6 +896,13 @@ func (u *UI) keepConnected() {
 			continue
 		}
 		st := u.app.Status()
+		if st.Updating {
+			// 旧版正在把单实例锁让给新版：绝不能在这时重新接管网络，否则两个
+			// 进程会并发改 DNS/路由（复审第 4 项）。
+			delay = 30 * time.Second
+			lastFailed = false
+			continue
+		}
 		if st.Online {
 			delay = 30 * time.Second // 真的在线了：退避清零，继续盯着
 			lastFailed = false

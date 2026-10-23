@@ -64,9 +64,23 @@ func Slot(payload []byte, n int) int {
 // flowKeyOf 把 IP 包规范化成可比较的流标识：同一内层流的两个方向算出同一个 key。
 // 第二个返回值为 false 表示包太短或不是 IPv4 —— 调用方退回控制连接或纯哈希。
 func flowKeyOf(payload []byte) (flowKey, bool) {
-	var k flowKey
+	k, _, _, ok := flowKeyMeta(payload)
+	return k, ok
+}
+
+// TCP 标志位（IP 头之后 TCP 头的第 14 字节）。FIN/RST 是连接结束的明确信号，
+// 流表靠它回收映射，避免短连接把表吃满。
+const (
+	tcpFlagFIN = 0x01
+	tcpFlagRST = 0x04
+)
+
+// flowKeyMeta 在 flowKeyOf 的基础上多返回协议号和 TCP 标志位。
+//
+// 分片包拿不到传输层头，flags 恒为 0：那种包不参与 FIN/RST 回收，靠空闲期兜底。
+func flowKeyMeta(payload []byte) (k flowKey, proto uint8, flags uint8, ok bool) {
 	if len(payload) < 20 || payload[0]>>4 != 4 {
-		return k, false
+		return k, 0, 0, false
 	}
 
 	protocol := payload[9]
@@ -88,7 +102,7 @@ func flowKeyOf(payload []byte) (flowKey, bool) {
 
 	case protocol == 6 || protocol == 17:
 		if len(payload) < 24 {
-			return k, false
+			return k, 0, 0, false
 		}
 		sport := payload[20:22]
 		dport := payload[22:24]
@@ -107,6 +121,9 @@ func flowKeyOf(payload []byte) (flowKey, bool) {
 		}
 		k.b[n] = protocol
 		k.len = uint8(n + 1)
+		if protocol == 6 && len(payload) >= 34 {
+			flags = payload[33]
+		}
 
 	default:
 		n := copy(k.b[0:4], srcIP)
@@ -114,7 +131,7 @@ func flowKeyOf(payload []byte) (flowKey, bool) {
 		k.b[n] = protocol
 		k.len = uint8(n + 1)
 	}
-	return k, true
+	return k, protocol, flags, true
 }
 
 // endpointLess 按字节序比较两个 (ip, port) 端点，用于把端点对规范化成方向无关。

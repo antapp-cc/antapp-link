@@ -3,6 +3,7 @@ package client
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -31,6 +32,22 @@ func TestDisconnectWithoutConnectIsNoop(t *testing.T) {
 	app := NewApp(testInvite(t), t.TempDir(), nil)
 	if err := app.Disconnect(); err != nil {
 		t.Errorf("没连接时断开应当直接返回，实际 %v", err)
+	}
+}
+
+// 更新交接期间不能再去接管网络：旧版此时已经让出单实例锁（复审第 4 项）。
+func TestConnectRejectedWhileUpdating(t *testing.T) {
+	app := NewApp(testInvite(t), t.TempDir(), nil)
+	app.mu.Lock()
+	app.updating = true
+	app.mu.Unlock()
+
+	err := app.Connect()
+	if err == nil || !strings.Contains(err.Error(), "正在更新") {
+		t.Fatalf("更新期间 Connect 必须被拒绝，实际: %v", err)
+	}
+	if st := app.Status(); !st.Updating {
+		t.Fatal("Status 必须报告更新中")
 	}
 }
 

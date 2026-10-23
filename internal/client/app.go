@@ -57,6 +57,12 @@ type App struct {
 	// DNS 还指着已经拆掉的隧道，解析全超时。有它之后重复断开会真的重试。
 	pendingRestore *pendingRestoreState
 
+	// updating 表示正在做版本交接（断开 → 替换 → 等新版确认）。这段时间旧版
+	// 已经让出单实例锁，必须禁止自动重连和手动连接：再接管网络就可能和新版
+	// 并发改 DNS/路由（复审第 4 项）。收不回锁时会一直保持 true，直到用户关掉
+	// 这个窗口。
+	updating bool
+
 	orderTrace *OrderTracer
 }
 
@@ -213,6 +219,11 @@ func (a *App) HealIfNeeded() error {
 func (a *App) Connect() error {
 	a.mu.Lock()
 	switch {
+	case a.updating:
+		// 旧版已经把单实例锁让给新版（或马上要让），这时再接管网络就可能两个进程
+		// 并发改 DNS/路由。等更新失败恢复所有权后才会放行。
+		a.mu.Unlock()
+		return errors.New("正在更新到新版本，请稍候")
 	case a.disconnecting:
 		a.mu.Unlock()
 		return errors.New("正在断开，请稍候")
@@ -1044,12 +1055,15 @@ type AppStatus struct {
 	DataPathBroken bool
 	Connecting     bool
 	Disconnecting  bool
-	TunnelIP       string
-	Server         string
-	RTT            time.Duration
-	RxBytes        uint64
-	TxBytes        uint64
-	LastError      string
+	// Updating 表示正在做版本交接。界面上的自动重连和手动连接都要看它：
+	// 旧版此时已经让出单实例锁，不能再接管网络。
+	Updating  bool
+	TunnelIP  string
+	Server    string
+	RTT       time.Duration
+	RxBytes   uint64
+	TxBytes   uint64
+	LastError string
 }
 
 func (a *App) Status() AppStatus {
@@ -1073,6 +1087,7 @@ func (a *App) Status() AppStatus {
 		DataPathBroken: dataPathBroken,
 		Connecting:     a.connecting,
 		Disconnecting:  a.disconnecting,
+		Updating:       a.updating,
 		Server:         a.inv.Server,
 		TunnelIP:       a.cfg.TunnelIP,
 		LastError:      a.lastError,
@@ -1124,11 +1139,30 @@ func (a *App) watchRunStats(ctx context.Context, tun *Tunnel) {
 		case <-ticker.C:
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
+			// 每槽队列深度、流表占用和真实写出量要和丢包放在同一时间轴上，否则单看
+			// 某一个数分不清瓶颈在网卡读循环、某条成员连接还是流表。
+			// tx_written_mb 含每帧 4 字节帧头，正常时略大于 tx_mb（纯载荷）；丢包多时
+			// 两者差距会缩小 —— 丢弃量看 drop_mb，别拿两个总数硬减。UDP 模式下它是
+			// 密文长度，口径又不一样。
+			cur, peak := tun.SlotDepthReport()
+			flowSize, flowMax := 0, 0
+			var flowFallbacks, flowReclaimed uint64
+			if ft := tun.FlowSnapshot(); ft != nil {
+				st := ft.Stats()
+				flowSize, flowMax, flowFallbacks, flowReclaimed = st.Size, st.Max, st.Fallbacks, st.Reclaimed
+			}
 			a.log.Info("运行状态",
 				"goroutines", runtime.NumGoroutine(),
 				"heap_mb", m.HeapAlloc/1024/1024,
 				"rx_mb", tun.Stats.RxBytes.Load()/1024/1024,
-				"tx_mb", tun.Stats.TxBytes.Load()/1024/1024)
+				"tx_mb", tun.Stats.TxBytes.Load()/1024/1024,
+				"tx_queued_mb", tun.Stats.TxQueued.Load()/1024/1024,
+				"tx_written_mb", tun.Stats.TxWritten.Load()/1024/1024,
+				"slot_depth", fmt.Sprint(cur),
+				"slot_peak", fmt.Sprint(peak),
+				"flow", fmt.Sprintf("%d/%d", flowSize, flowMax),
+				"flow_fallback", flowFallbacks,
+				"flow_reclaim", flowReclaimed)
 
 			// 四个分类只进 Debug：Pi 节点有 80 多个 peer，上行常态就是满的，
 			// 这行会一直显示「槽队列=几万」—— 用户看不懂，也改变不了什么
@@ -1137,12 +1171,13 @@ func (a *App) watchRunStats(ctx context.Context, tun *Tunnel) {
 			dEmpty := tun.Drops.EmptySlot.Load()
 			dQueue := tun.Drops.SlotQueueFull.Load()
 			dMember := tun.Drops.MemberDrop.Load()
-			if dPkt > 0 || dEmpty > 0 || dQueue > 0 || dMember > 0 {
+			if dPkt > 0 || dEmpty > 0 || dQueue > 0 || dMember > 0 || tun.Drops.UplinkBytes.Load() > 0 {
 				a.log.Debug("丢包统计",
 					"drop_pktch", dPkt,
 					"drop_empty", dEmpty,
 					"drop_queue", dQueue,
-					"drop_member", dMember)
+					"drop_member", dMember,
+					"drop_mb", tun.Drops.UplinkBytes.Load()/1024/1024)
 			}
 		}
 	}
@@ -1231,11 +1266,36 @@ func (a *App) DownloadUpdate(ctx context.Context, m *update.Manifest) (string, e
 //
 // 成功返回后调用方必须立刻退出自己 —— 磁盘上的文件名已经被新版占用了。
 func (a *App) ApplyUpdate(newExe string) error {
+	// 先立起门禁再断开：断开的瞬间 keepConnected 就可能醒来，看到「不在线」就去
+	// 重连 —— 而这时候旧版已经准备让出单实例锁了（复审第 4 项）。
+	a.mu.Lock()
+	a.updating = true
+	a.mu.Unlock()
+
 	if err := a.Disconnect(); err != nil {
+		a.mu.Lock()
+		a.updating = false
+		a.mu.Unlock()
 		// 还原失败还继续替换的话：旧进程带着半接管的网络消失、新进程还没起来，
 		// 用户就直接断网了。宁可这次不更新，让用户手动断开后重试。
 		return fmt.Errorf("更新前还原网络失败，已取消更新: %w", err)
 	}
 	a.log.Info("替换程序并重启", "new", newExe)
-	return update.Apply(newExe)
+	err := update.Apply(newExe)
+	if err == nil {
+		// 成功返回后调用方必须立刻退出自己；updating 保持 true 直到进程结束。
+		return nil
+	}
+	if errors.Is(err, update.ErrHandoffBlocked) {
+		// 新版（或别的实例）已经拿到单实例锁：旧版绝不能回去接管网络，否则两个
+		// 进程并发改 DNS/路由。保持 updating，让 Connect 和自动重连都停手，
+		// 直到用户关掉这个窗口。
+		a.log.Warn("更新交接未确认，且单实例锁已被别的实例持有：本窗口停止接管网络", "err", err)
+		return err
+	}
+	// 新版没起来、锁还在自己手上：恢复可连接状态，用户能继续用旧版。
+	a.mu.Lock()
+	a.updating = false
+	a.mu.Unlock()
+	return err
 }

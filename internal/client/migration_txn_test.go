@@ -88,8 +88,14 @@ func TestMigrationKeepsOldLedgerWhenCleanupFails(t *testing.T) {
 
 	w.reconcile()
 
-	if *updates != 0 {
-		t.Fatal("旧出口没清干净就提交了新现场")
+	// 旧出口没清干净不能算提交：当前生效现场仍是旧出口。
+	// 但新出口的配置已经写到系统上了，这份现场要先落盘 —— 进程这时被杀，
+	// 崩溃恢复才读得到新出口（复审第 2 项）。
+	if w.snap.DefaultGateway != "192.0.2.1" {
+		t.Errorf("没提交成功时当前生效现场不该变，实际 %s", w.snap.DefaultGateway)
+	}
+	if *updates == 0 {
+		t.Error("待办现场必须先落盘，否则崩溃恢复读不到新出口")
 	}
 	if sweeps != 1 {
 		t.Fatalf("迁移应当尝试清理一次旧账本，实际 %d 次", sweeps)
@@ -100,9 +106,6 @@ func TestMigrationKeepsOldLedgerWhenCleanupFails(t *testing.T) {
 	}
 	if p.snap.DefaultGateway != "198.51.100.1" {
 		t.Errorf("待提交的新现场不对: %s", p.snap.DefaultGateway)
-	}
-	if w.snap.DefaultGateway != "192.0.2.1" {
-		t.Errorf("没提交成功时当前生效现场不该变，实际 %s", w.snap.DefaultGateway)
 	}
 
 	// 下一轮事件出口没再变，补完清理后才提交新现场。
@@ -118,8 +121,8 @@ func TestMigrationKeepsOldLedgerWhenCleanupFails(t *testing.T) {
 	if w.pending != nil {
 		t.Fatal("旧出口清理完成后 pending 应当结束")
 	}
-	if *updates != 1 {
-		t.Fatalf("清理完成后应当提交一次新现场，实际 %d 次", *updates)
+	if *updates < 2 {
+		t.Fatalf("待办落盘 + 提交各写一次，实际 %d 次", *updates)
 	}
 	if last.DefaultGateway != "198.51.100.1" || last.DefaultIfIndex != 42 {
 		t.Errorf("提交的现场不对: %s / %d", last.DefaultGateway, last.DefaultIfIndex)
@@ -179,6 +182,40 @@ func TestMigrationDoesNotClaimForeignSplitRoutes(t *testing.T) {
 	}
 	if len(w.snap.Split.Prefixes) != 0 {
 		t.Fatalf("把用户已有的路由记进了账本: %v", w.snap.Split.Prefixes)
+	}
+}
+
+// 旧快照 A 清理成功、热重铺账本 B 失败时，B 必须留在待办里继续重试。
+// 以前 pending 只存旧快照，下一轮只重试 A，B 的残留路由从此失去记录（复审第 1 项）。
+func TestMigrationRetriesFailedLiveLedger(t *testing.T) {
+	old := testOldExitSnapshot()
+	w, _, _ := newMigrationTestWatcher(t, old)
+	live := newSplitOwnership(adapterKey{GUID: "{new}", Index: 42},
+		netip.MustParseAddr(old.DefaultGateway), []string{"2.0.0.0/24"})
+	setLiveSplitOwnership(live)
+	liveSweeps := 0
+	sweepOwnedSplitFn = func(own *splitOwnership) (int, error) {
+		if own == live {
+			liveSweeps++
+			return 0, errors.New("注入：热重铺账本删不掉")
+		}
+		return 1, nil
+	}
+
+	w.reconcile()
+	if w.pending == nil {
+		t.Fatal("旧出口未清干净时不应提交")
+	}
+	if liveSweeps != 1 {
+		t.Fatalf("首次迁移应尝试清理热重铺账本，实际 %d 次", liveSweeps)
+	}
+
+	w.reconcile()
+	if liveSweeps != 2 {
+		t.Fatalf("重试必须再次清理热重铺账本，实际 %d 次（失败的那份从待办里丢了）", liveSweeps)
+	}
+	if w.pending == nil {
+		t.Fatal("热重铺账本没清掉就提交了")
 	}
 }
 

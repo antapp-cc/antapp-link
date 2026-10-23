@@ -112,6 +112,18 @@ func TestEnqueueDropsWhenFullWithoutBlocking(t *testing.T) {
 	if dropped == 0 {
 		t.Fatal("队列满了却没有记录丢弃次数")
 	}
+	if sess.tunnel.Drops.UplinkBytes.Load() == 0 {
+		t.Fatal("丢弃了批次却没记字节数")
+	}
+}
+
+// 入队字节是「读到 → 入队 → 写出」三段里中间那段的量；报告要求的三段口径缺它一条。
+func TestEnqueueCountsQueuedBytes(t *testing.T) {
+	sess := newClientSession(testTunnel(t), newBlockedConn(), "sid", nil, Ack{Members: 2})
+	sess.enqueue(1, []byte{1, 2, 3, 4})
+	if got := sess.stats.TxQueued.Load(); got != 4 {
+		t.Fatalf("入队字节应为 4，实际 %d", got)
+	}
 }
 
 // TxWritten 只在真正写进外层连接之后累加。
@@ -155,5 +167,71 @@ func TestEnqueueFullQueueDoesNotAllocate(t *testing.T) {
 	})
 	if allocs > 0 {
 		t.Fatalf("队列满时仍在分配：%.1f allocs/op（应当为 0）", allocs)
+	}
+}
+
+// 每槽队列深度与峰值要能读出来。
+//
+// 报告要求先有「队列有多深」的数据，才能判断瓶颈在网卡读循环还是某条成员连接；
+// 峰值还要按采样窗口重置，否则跨窗口累积，看不出最近一次区间有没有贴顶。
+func TestSlotDepthTracksCurrentAndPeak(t *testing.T) {
+	tun := testTunnel(t)
+	sess := newClientSession(tun, newBlockedConn(), "sid", nil, Ack{Members: 2})
+
+	for i := 0; i < slotTxLen; i++ {
+		sess.enqueue(1, []byte{byte(i)})
+	}
+	cur, peak := tun.SlotDepthReport()
+	if cur[1] != int64(slotTxLen) {
+		t.Fatalf("当前深度应为 %d，实际 %d", slotTxLen, cur[1])
+	}
+	if peak[1] < int64(slotTxLen) {
+		t.Fatalf("峰值 %d 不该低于当前深度 %d", peak[1], slotTxLen)
+	}
+
+	// 消费一批，让深度降下来。当前深度必须自己跟着队列走，不能靠调用方手动
+	// 刷新 —— 生产路径是写协程消费，没人会替它调用 recordSlotDepth。
+	// 第一次报告返回的 peak 是上一窗口的旧值，第二次报告才只剩这个窗口的峰值。
+	<-sess.slotTx[1]
+	cur, oldPeak := tun.SlotDepthReport()
+	if cur[1] != int64(slotTxLen-1) {
+		t.Fatalf("消费一批后深度应为 %d，实际 %d", slotTxLen-1, cur[1])
+	}
+	if oldPeak[1] != int64(slotTxLen) {
+		t.Fatalf("上一次窗口的峰值应仍为 %d，实际 %d", slotTxLen, oldPeak[1])
+	}
+	_, peak2 := tun.SlotDepthReport()
+	if peak2[1] != cur[1] {
+		t.Fatalf("峰值应被重置为当前值 %d，实际 %d", cur[1], peak2[1])
+	}
+}
+
+// 会话结束后深度必须归零：否则下一次报告会读到上一会话残留的队列深度。
+func TestSlotDepthResetsAfterSessionEnds(t *testing.T) {
+	tun := testTunnel(t)
+	sess := newClientSession(tun, newBlockedConn(), "sid", nil, Ack{Members: 2})
+	for i := 0; i < slotTxLen; i++ {
+		sess.enqueue(1, []byte{byte(i)})
+	}
+	sess.closeAll()
+	cur, _ := tun.SlotDepthReport()
+	if cur[1] != 0 {
+		t.Fatalf("会话结束后深度应为 0，实际 %d", cur[1])
+	}
+}
+
+// 状态日志要从 Tunnel 读到当前会话的流表；会话收尾后必须清空，别读到旧表。
+func TestTunnelExposesCurrentFlowTable(t *testing.T) {
+	tun := testTunnel(t)
+	if tun.FlowSnapshot() != nil {
+		t.Fatal("没有会话时不该有流表")
+	}
+	sess := newClientSession(tun, newBlockedConn(), "sid", nil, Ack{Members: 2})
+	if tun.FlowSnapshot() != sess.flow {
+		t.Fatal("会话建立后应能读到它的流表")
+	}
+	sess.closeAll()
+	if tun.FlowSnapshot() != nil {
+		t.Fatal("会话收尾后应清空流表指针")
 	}
 }

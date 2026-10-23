@@ -46,7 +46,7 @@ func TestUDPSendConcurrentNoDuplicateSeq(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			for j := 0; j < perWorker; j++ {
-				_ = ch.send([]byte{byte(i), byte(j)})
+				_, _ = ch.send([]byte{byte(i), byte(j)})
 			}
 		}(i)
 	}
@@ -79,5 +79,63 @@ func TestUDPSendConcurrentNoDuplicateSeq(t *testing.T) {
 	if len(seen) != total {
 		t.Fatalf("收到 %d 个包，期望 %d（余额被回环队列吞掉的话也会这样，但重复/解不开会先报）",
 			len(seen), total)
+	}
+}
+
+// send 必须返回真正写进 socket 的密文字节数：UDP 数据面的「真实写出」统计靠它。
+// 它一定大于明文长度（GCM 认证开销 + 序号/nonce），拿明文长度记会虚低。
+func TestUDPSendReturnsWrittenBytes(t *testing.T) {
+	srv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("监听: %v", err)
+	}
+	defer srv.Close()
+	conn, err := net.DialUDP("udp", nil, srv.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatalf("拨号: %v", err)
+	}
+	defer conn.Close()
+
+	key := bytes.Repeat([]byte{5}, 32)
+	seal, err := proto.NewCipher(key, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := &udpChannel{conn: conn, sendSeal: seal}
+
+	payload := []byte{1, 2, 3, 4}
+	n, err := ch.send(payload)
+	if err != nil {
+		t.Fatalf("发送失败: %v", err)
+	}
+	if n <= len(payload) {
+		t.Fatalf("返回的写出字节 %d 不该 <= 明文 %d：说明记的是明文长度，不是真正写出的密文",
+			n, len(payload))
+	}
+}
+
+// 连续发送失败要计数：这是「UDP 路径已死」的早期证据。这里只要求计数和告警，
+// 不据此关闭通道 —— 提前判失效需要实测样本，见运行优化报告第 6 项。
+func TestUDPSendTracksErrorStreak(t *testing.T) {
+	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9})
+	if err != nil {
+		t.Fatalf("拨号: %v", err)
+	}
+	_ = conn.Close() // 关掉，之后每次 Write 都会失败
+
+	key := bytes.Repeat([]byte{7}, 32)
+	seal, err := proto.NewCipher(key, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := &udpChannel{conn: conn, sendSeal: seal}
+
+	for i := 0; i < 3; i++ {
+		if _, err := ch.send([]byte{1}); err == nil {
+			t.Fatal("连接已关闭，发送不该成功")
+		}
+	}
+	if got := ch.sendErrStreak.Load(); got != 3 {
+		t.Fatalf("连续失败 3 次，计数应为 3，实际 %d", got)
 	}
 }

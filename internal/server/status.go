@@ -48,6 +48,10 @@ type Status struct {
 	Goroutines int `json:"goroutines,omitempty"`
 	// UDPActive 表示当前会话走的是 UDP 数据通道（mode=udp 且客户端已上报端口）。
 	UDPActive bool `json:"udp_active,omitempty"`
+	// UDP 数据通道实际收发的链路字节（含认证开销）。UDP 模式下行不走槽位，
+	// 没有 Slots 可看，这两个数用来确认数据面是不是真的在动。
+	UDPRxBytes uint64 `json:"udp_rx_bytes,omitempty"`
+	UDPTxBytes uint64 `json:"udp_tx_bytes,omitempty"`
 
 	// PID / InstanceID / StartedAt 标明状态是「哪一次启动」写的。
 	// 只看 UpdatedAt 的秒级时间戳，重启前后两个进程可能落在同一秒里，分不出来。

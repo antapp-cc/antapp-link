@@ -91,3 +91,23 @@ func TestLookupSeparatesIPs(t *testing.T) {
 		t.Fatal("不同 IP 不该命中同一个会话")
 	}
 }
+
+// UDP 下行的发送字节要记在会话上：UDP 模式没有槽位状态可看，这是确认数据面
+// 真的在动的唯一依据。
+func TestUDPSessionCountsTxBytes(t *testing.T) {
+	srv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("监听: %v", err)
+	}
+	defer srv.Close()
+
+	m := &udpMux{conn: srv, sessions: make(map[string]*udpSession), log: slog.Default()}
+	sess := newTestSess(t, "127.0.0.1", srv.LocalAddr().(*net.UDPAddr).Port)
+
+	if err := sess.send(m, []byte{1, 2, 3}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if got := sess.txBytes.Load(); got == 0 {
+		t.Fatal("发送成功后 txBytes 应增长")
+	}
+}

@@ -41,6 +41,11 @@ type udpSession struct {
 	// 下行数据（pumpTun）和保活回包（readLoop）是两个 goroutine 在并发调 send，
 	// 不串行化就会序号重复、nonce 复用 —— 后者是密码学错误，不只是丢包。
 	sendMu sync.Mutex
+
+	// rxBytes/txBytes 是这条 UDP 通道实际收发的链路字节（含认证开销）。UDP 模式
+	// 下行不走槽位，没有 SlotStatus 可看，这两个数是判断「数据到底通没通」的依据。
+	rxBytes atomic.Uint64
+	txBytes atomic.Uint64
 }
 
 func newUDPMux(listen string, tun *TUN, log *slog.Logger) (*udpMux, error) {
@@ -162,6 +167,7 @@ func (m *udpMux) readLoop() {
 		}
 		// 认证通过了，才承认这个来源端口
 		m.confirmPeer(sess, from)
+		sess.rxBytes.Add(uint64(len(plain)))
 		if len(plain) == 0 {
 			// 空负载 = 客户端的保活包。回一个空的加密包，让它的 lastRx 能刷新 ——
 			// 客户端只看"我发出去了"判断不了下行还通不通。
@@ -184,7 +190,10 @@ func (s *udpSession) send(m *udpMux, pkt []byte) error {
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
-	_, err := m.conn.WriteToUDP(s.sendSeal.Seal(pkt), peer)
+	n, err := m.conn.WriteToUDP(s.sendSeal.Seal(pkt), peer)
+	if err == nil {
+		s.txBytes.Add(uint64(n))
+	}
 	return err
 }
 

@@ -428,7 +428,8 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 					st.JoinFailures, joinMaxFail, joinWindow)
 			}
 			if st.UDPActive {
-				fmt.Fprintln(stdout, "数据通道    : UDP（控制仍走 TCP）")
+				fmt.Fprintf(stdout, "数据通道    : UDP（控制仍走 TCP），收 %d / 发 %d 字节\n",
+					st.UDPRxBytes, st.UDPTxBytes)
 			}
 			if st.Goroutines > 0 {
 				fmt.Fprintf(stdout, "goroutine   : %d\n", st.Goroutines)

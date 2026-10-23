@@ -45,8 +45,14 @@ type udpChannel struct {
 	sendMu sync.Mutex
 
 	lastRx atomic.Int64 // UnixNano，判活用
-	closed chan struct{}
-	once   sync.Once
+	// sendErrStreak 是连续发送失败的次数，成功一次归零。
+	//
+	// 只统计、不据此关闭通道：UDP 的 Write 失败通常意味着 socket 或出接口已经坏了
+	// （普通丢包不会让 Write 报错），连续失败是「45 秒判死」之外能提前拿到的证据；
+	// 但要不要据此提前判失效需要实测样本，见运行优化报告第 6 项。
+	sendErrStreak atomic.Int64
+	closed        chan struct{}
+	once          sync.Once
 	// failErr 只在被动失效时写入；读取方必须先等到 closed 关闭（见 failCause），
 	// 所以靠 channel 的 happens-before 就够，不需要再加一把锁。
 	failErr error
@@ -144,7 +150,7 @@ func (c *udpChannel) probe(ctx context.Context, timeout time.Duration) error {
 	start := time.Now()
 	deadline := start.Add(timeout)
 
-	if err := c.send(nil); err != nil {
+	if _, err := c.send(nil); err != nil {
 		return err
 	}
 	next := 0
@@ -164,19 +170,33 @@ func (c *udpChannel) probe(ctx context.Context, timeout time.Duration) error {
 		}
 		if next < len(udpProbeRetryAt) && time.Since(start) >= udpProbeRetryAt[next] {
 			next++
-			if err := c.send(nil); err != nil {
+			if _, err := c.send(nil); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-// send 把一个 IP 包加密后发出去。并发安全：见 sendMu 的注释。
-func (c *udpChannel) send(pkt []byte) error {
+// send 把一个 IP 包加密后发出去，返回真正写进 socket 的字节数（含认证开销）。
+//
+// 返回字节数而不只是错误：数据面的「真正写出」统计要它。TxBytes 记的是明文长度，
+// 这里记的是密文长度，两者口径不同 —— 别拿它们相减当「丢了多少」。
+func (c *udpChannel) send(pkt []byte) (int, error) {
 	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-	_, err := c.conn.Write(c.sendSeal.Seal(pkt))
-	return err
+	n, err := c.conn.Write(c.sendSeal.Seal(pkt))
+	var streak int64
+	if err != nil {
+		streak = c.sendErrStreak.Add(1)
+	} else {
+		c.sendErrStreak.Store(0)
+	}
+	c.sendMu.Unlock()
+
+	// 告警放在锁外：写日志可能落盘，不能让它压着 sendMu 拖慢数据面。
+	if err != nil && streak == 3 && c.log != nil {
+		c.log.Warn("UDP 连续发送失败", "times", streak, "err", err)
+	}
+	return n, err
 }
 
 // recvLoop 收服务端发来的包，解密后写网卡。
@@ -248,7 +268,7 @@ func (c *udpChannel) keepalive(ctx context.Context) {
 					idle.Round(time.Second)))
 				return
 			}
-			_ = c.send(nil)
+			_, _ = c.send(nil)
 		}
 	}
 }

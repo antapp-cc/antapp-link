@@ -79,6 +79,11 @@ type pendingMigration struct {
 	// 三步清理都是幂等的（DNS 写回快照原值、只删账本里的路由、按原下一跳删
 	// /32），所以重试整段就是「未完成清单」，不需要逐条记做到哪一步。
 	old *Snapshot
+
+	// oldLedgers 是还没清理成功的旧分流账本。old.Split 只是其中一份；热重铺
+	// 产生的实时账本可能指向另一张网卡或另一个网关，必须单独记 —— 硬并进 old
+	// 会让失败的那一份在重试时被跳过，残留路由从此没有记录可查。
+	oldLedgers []*splitOwnership
 }
 
 type sessionWatcher struct {
@@ -289,13 +294,28 @@ func (w *sessionWatcher) reconcile() {
 		// 上一次迁移的旧出口没清干净：先接着清，清不完就不提交 —— 旧账本
 		// 还在这笔 pending 里，提交新现场会把唯一的记录冲掉。
 		if p.old != nil {
-			if cerrs := w.cleanOldExit(*p.old, newDef.key(), false); len(cerrs) > 0 {
+			cerrs, clefts := w.cleanOldExit(*p.old, newDef.key(), false)
+			if len(cerrs) > 0 {
 				logf("上次迁移的旧出口仍有 %d 处清理未完成（保留待办，不提交新现场）: %v",
 					len(cerrs), errors.Join(cerrs...))
 				return
 			}
 			p.old = nil
+			p.oldLedgers = append(p.oldLedgers, clefts...)
 			logf("上次迁移遗留的旧出口配置已清理完成")
+		}
+		// 旧快照之外的账本（热重铺那份）cleanOldExit 看不到，单独重试。
+		// 一份没清掉就整笔待办留着 —— 它的网卡/网关还记在这里。
+		if len(p.oldLedgers) > 0 {
+			serrs, sleft := sweepLedgers(p.oldLedgers)
+			if len(serrs) > 0 {
+				p.oldLedgers = sleft
+				logf("上次迁移的旧分流账本仍有 %d 处清理未完成（保留待办，不提交新现场）: %v",
+					len(serrs), errors.Join(serrs...))
+				return
+			}
+			p.oldLedgers = nil
+			logf("上次迁移遗留的旧分流账本已清理完成")
 		}
 
 		// 先补没写完的关键配置。用的是 pending 里那份**第一次捕获的原始现场**，
@@ -378,7 +398,7 @@ func (w *sessionWatcher) reconcile() {
 
 	// 新现场齐了，才开始拆旧的。清理失败不能只记日志：旧网卡的原始 DNS 和
 	// 路由账本只在旧快照里，提交一个只含新出口的快照就等于把它丢了。
-	cleanupErrs := w.cleanOldExit(oldSnap, newDef.key(), true)
+	cleanupErrs, cleanupLeftover := w.cleanOldExit(oldSnap, newDef.key(), true)
 	if len(cleanupErrs) > 0 {
 		logf("迁移时旧出口有 %d 处清理未完成（保留待办，不提交新现场）: %v",
 			len(cleanupErrs), errors.Join(cleanupErrs...))
@@ -455,8 +475,19 @@ func (w *sessionWatcher) reconcile() {
 			// 旧账本连同旧网卡的原始 DNS 一起留在待办里：这套清理下次对账
 			// 还要接着做，现在丢掉就再也没人记得该清哪张网卡。
 			p.old = &oldSnap
+			// 热重铺那份账本不在 old 里，单独保存，否则重试时会被跳过。
+			// old.Split 由 p.old 的重试负责，别重复记在这里。
+			p.oldLedgers = withoutLedger(cleanupLeftover, oldSnap.Split)
 		}
 		w.pending = p
+		// 新出口的配置已经改到系统上了，先把这份现场写进磁盘再等旧出口清完：
+		// 否则进程在这里被结束，下次启动只能按旧快照自愈，新出口上的 DNS 和
+		// 路由就再没有记录可查（复审第 2 项）。
+		if w.update != nil {
+			if uerr := w.update(snap); uerr != nil {
+				logf("迁移待办现场写盘失败（保留待办，下次重试）: %v", uerr)
+			}
+		}
 		logf("网络出口已切换，但迁移事务未完成：保留待提交状态，下次事件继续")
 		if w.kick != nil {
 			w.kick()
@@ -484,7 +515,7 @@ func (w *sessionWatcher) reconcile() {
 		newDef.Name, gw, migrationNote(failed))
 }
 
-// cleanOldExit 把旧出口上的接管痕迹清掉，返回每一处没做成的清理。
+// cleanOldExit 把旧出口上的接管痕迹清掉，返回每一处没做成的清理和没清掉的账本。
 //
 // 三步都幂等：DNS 写回快照里的原值、只删账本里记过的分流、按原下一跳删云服
 // /32。失败重试直接整段重跑，不需要逐条记做到哪一步。
@@ -492,9 +523,7 @@ func (w *sessionWatcher) reconcile() {
 // keep 是这次迁移的新出口网卡。同一张网卡只换了网关时，它身上的 DNS 必须保持
 // 隧道值，不能按旧快照还原。withLive 为 false 时不动进程内的热更新账本 ——
 // 重试和回滚时那份账本已经属于新出口了。
-func (w *sessionWatcher) cleanOldExit(old Snapshot, keep adapterKey, withLive bool) []error {
-	var errs []error
-
+func (w *sessionWatcher) cleanOldExit(old Snapshot, keep adapterKey, withLive bool) (errs []error, leftover []*splitOwnership) {
 	for _, iface := range old.Interfaces {
 		if iface.ref().sameAdapter(keep) {
 			continue
@@ -516,11 +545,9 @@ func (w *sessionWatcher) cleanOldExit(old Snapshot, keep adapterKey, withLive bo
 		}
 	}
 	if len(owns) > 0 {
-		for _, own := range owns {
-			if _, err := sweepOwnedSplitFn(own); err != nil {
-				errs = append(errs, fmt.Errorf("清理旧网卡的国内分流: %w", err))
-			}
-		}
+		sweepErrs, failed := sweepLedgers(owns)
+		errs = append(errs, sweepErrs...)
+		leftover = failed
 	} else if gw, err := netip.ParseAddr(old.DefaultGateway); err == nil {
 		// 旧快照没有所有权记录时只能按形态扫，可能碰到同形态的用户路由 ——
 		// 这是旧版本留下的数据，没有更好的判据。
@@ -538,7 +565,37 @@ func (w *sessionWatcher) cleanOldExit(old Snapshot, keep adapterKey, withLive bo
 			}
 		}
 	}
-	return errs
+	return errs, leftover
+}
+
+// sweepLedgers 逐个清理所有权账本，返回没清掉的那些。失败的那份必须留在待办
+// 里：账本一丢，对应网卡上的分流路由就再没有记录可查。
+func sweepLedgers(owners []*splitOwnership) (errs []error, leftover []*splitOwnership) {
+	for _, own := range owners {
+		if own == nil {
+			continue
+		}
+		if _, err := sweepOwnedSplitFn(own); err != nil {
+			errs = append(errs, fmt.Errorf("清理旧网卡的国内分流: %w", err))
+			leftover = append(leftover, own)
+		}
+	}
+	return errs, leftover
+}
+
+// withoutLedger 从待办账本里去掉由 old 快照负责的那份：重试时 cleanOldExit 会
+// 再清一次 old.Split，留着它会重复 sweep 同一份账本。
+func withoutLedger(ledgers []*splitOwnership, skip *splitOwnership) []*splitOwnership {
+	if skip == nil || len(ledgers) == 0 {
+		return ledgers
+	}
+	out := make([]*splitOwnership, 0, len(ledgers))
+	for _, l := range ledgers {
+		if l != skip {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // pendingKeep 是待提交新现场对应的网卡标识：重试旧出口清理时跳过同一张网卡
@@ -569,10 +626,21 @@ func (w *sessionWatcher) revertPending() error {
 	// 迁移事务里没做完的旧出口清理先补上：pending 一撤销，旧网卡的原始 DNS
 	// 和路由账本就没有别的记录了。
 	if p.old != nil {
-		if oerrs := w.cleanOldExit(*p.old, pendingKeep(p), false); len(oerrs) > 0 {
+		oerrs, olefs := w.cleanOldExit(*p.old, pendingKeep(p), false)
+		if len(oerrs) > 0 {
 			errs = append(errs, oerrs...)
 		} else {
 			p.old = nil
+			p.oldLedgers = append(p.oldLedgers, olefs...)
+		}
+	}
+	if len(p.oldLedgers) > 0 {
+		serrs, sleft := sweepLedgers(p.oldLedgers)
+		if len(serrs) > 0 {
+			errs = append(errs, serrs...)
+			p.oldLedgers = sleft
+		} else {
+			p.oldLedgers = nil
 		}
 	}
 

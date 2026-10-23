@@ -16,6 +16,12 @@ import (
 // 工作目录或日志初始化失败等）。旧进程拿到它要恢复运行，而不是退出。
 var ErrHandoffFailed = errors.New("新版进程报告启动失败")
 
+// ErrHandoffBlocked 表示旧版让出单实例锁后收不回来：新版（或别的实例）已经拿到锁。
+//
+// 旧版收到它必须停止接管网络（见 App.ApplyUpdate）：两个进程同时改 DNS/路由
+// 比「一个都没在跑」更糟。新版是锁持有者，由它继续服务。
+var ErrHandoffBlocked = errors.New("单实例锁已被别的实例持有")
+
 // handoffFileName 是「旧版拉起新版」这次交接的状态文件。
 //
 // 它解决的是第 13 章第 6 项：Start() 返回 nil 只说明进程创建成功，新版完全可能

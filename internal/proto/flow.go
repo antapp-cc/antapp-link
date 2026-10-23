@@ -2,6 +2,7 @@ package proto
 
 import (
 	"sync"
+	"time"
 )
 
 // FlowTable 把内层流固定到某个槽位，供发送端选槽。
@@ -16,24 +17,53 @@ import (
 // 唯一必须守住的约束：同一内层流的所有包永远走同一个槽 —— 内层 TCP 绝不能乱序。
 // 因此映射一旦建立就不再改动（成员数变化的例外见 Slot）。
 //
-// 已知限制：表只增不减，到 maxFlows 之后新流一律退回纯哈希。老条目不能随便淘汰 ——
-// 淘汰谁就等于让那条流换槽、内层 TCP 乱序；要按最后活跃时间淘汰，也得先能确定那条流
-// 已经结束。所以在内层短连接极多的长会话里，均衡能力会逐渐退化。新流选槽仍持全局锁，
-// 高并发建流时是串行的，属于后续工作。
+// 已知限制：TCP 靠 FIN/RST 即时回收、UDP 靠空闲期；异常断开且没发 FIN/RST 的流只能等
+// 空闲兜底。表满时新流一律退回纯哈希（老条目不能随便淘汰 —— 淘汰谁就等于让那条流换槽、
+// 内层 TCP 乱序）。新流选槽仍持全局锁，高并发建流时是串行的，属于后续工作。
+// flowEntry 是一条内层流的选槽映射。
+//
+// lastSeen 只用于回收：TCP 看到 FIN/RST 会立即删映射，这个时间只是异常断开
+// （没发 FIN/RST 就消失）的兜底；UDP 没有结束标记，只能靠它判空闲。
+type flowEntry struct {
+	slot     int
+	lastSeen int64 // UnixNano
+	proto    uint8
+}
+
+// 回收期限。TCP 的短连接大多有 FIN/RST，空闲兜底取长一点，免得误删正在
+// 长跑但暂时安静的流；UDP 没有结束标记，只能靠空闲期，取得保守一些。
+const (
+	tcpFlowIdle   = 5 * time.Minute
+	udpFlowIdle   = 5 * time.Minute
+	sweepInterval = time.Second
+)
+
 type FlowTable struct {
 	mu    sync.Mutex
-	m     map[flowKey]int
+	m     map[flowKey]flowEntry
 	max   int
 	lastN int
+	// fallbacks 是表满后新流退回哈希的次数。只增不减，和 Size 一起看才能判断
+	// 「均衡能力退化了多少」：占用贴顶并且回退一直涨，说明这个会话的流表已经没用了。
+	fallbacks uint64
+	// reclaimed 是因 FIN/RST 或空闲期被回收的映射数。回收生效时它应该持续上涨，
+	// 而 Size 稳定在活跃流数量级。
+	reclaimed uint64
+	// lastSweep 是上一次全表清扫的时间，用来给满表时的兜底回收节流。
+	lastSweep int64
 	// counts[s] 是映射到槽 s 的流数。之所以要单独记：新流分配原先是遍历整张映射
 	// 数一遍，表接近上限后每条新流都是 O(表大小)，累计 O(N²)。计数只随单条映射
 	// 增减而变，选槽就只剩 O(槽数)；计数一旦漂移，某个槽会永远选不到，所以每条
 	// 改映射的路径都必须同步维护它。
 	counts []int
+	// clock 是时间源，测试注入用；nil 表示 time.Now。
+	clock func() time.Time
 }
 
-// maxFlows 是流表容量上限。每条约 40 字节，两万条约 800KB，对两端都不算负担。
-const maxFlows = 20000
+// maxFlows 是流表容量上限。每条 entry 约 24 字节，三万条约 1MB 级（含 map 开销），
+// 对两端都不算负担。上限不是"永不淘汰"的借口：FIN/RST 和空闲期回收才是控制占用的
+// 手段，这个数只是兜底。
+const maxFlows = 30000
 
 // flowKey 是规范化的流标识，可比较。长度随协议类型不同（9~13 字节），用 len 区分。
 type flowKey struct {
@@ -42,7 +72,14 @@ type flowKey struct {
 }
 
 func NewFlowTable() *FlowTable {
-	return &FlowTable{m: make(map[flowKey]int, 256), max: maxFlows}
+	return &FlowTable{m: make(map[flowKey]flowEntry, 256), max: maxFlows}
+}
+
+func (t *FlowTable) now() time.Time {
+	if t.clock != nil {
+		return t.clock()
+	}
+	return time.Now()
 }
 
 // Slot 返回该包应走的槽位（1..n-1）。
@@ -57,11 +94,12 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 	if n <= 1 {
 		return 0
 	}
-	key, ok := flowKeyOf(payload)
+	key, proto, flags, ok := flowKeyMeta(payload)
 	if !ok {
 		// 畸形包/短包：沿用纯哈希兜底，绝不 panic
 		return Slot(payload, n)
 	}
+	now := t.now()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -73,17 +111,17 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 	// 计数只在槽集合变化时按映射重建：这一步仍是 O(表大小)，但成员补拨很少发生；平时
 	// 每次分配只碰单条计数，不再扫全表。
 	if t.lastN != n {
-		for k, s := range t.m {
-			if s >= n {
+		for k, e := range t.m {
+			if e.slot >= n {
 				delete(t.m, k)
 			}
 		}
 		t.lastN = n
 		t.counts = growCounts(t.counts, n)
 		clear(t.counts)
-		for _, s := range t.m {
-			if s > 0 && s < n {
-				t.counts[s]++
+		for _, e := range t.m {
+			if e.slot > 0 && e.slot < n {
+				t.counts[e.slot]++
 			}
 		}
 	} else if len(t.counts) < n {
@@ -91,25 +129,43 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 		t.counts = growCounts(t.counts, n)
 	}
 
-	if s, ok := t.m[key]; ok {
+	if e, ok := t.m[key]; ok {
+		// TCP FIN/RST：连接正在结束。本包仍走原槽（不制造这一次乱序），随后删掉
+		// 映射，让后续同 key 的包（如果有）重新分配。短连接靠这一条回收 ——
+		// 不回收的话，长会话里的表会被已经关闭的连接吃满，新流只能退回哈希。
+		if proto == 6 && flags&(tcpFlagFIN|tcpFlagRST) != 0 {
+			delete(t.m, key)
+			t.counts[e.slot]--
+			t.reclaimed++
+			return e.slot
+		}
 		// 映射指向的槽可能已经死了（成员断开还没补上）。原来这里直接返回它，那条流
 		// 就持续往死槽发、被 flushBatch 整批丢掉，直到那个槽补拨回来 —— 实测能黑到
 		// 几十秒，用户看到的是「显示已连接、延迟在跳，但这条流就是不动」。
 		//
 		// 迁移一次：只迁一次（迁完映射立刻更新），内层 TCP 的乱序只发生在这一刻，
 		// 比持续黑洞好得多。这也是本表唯一允许改映射的情形。
-		if alive == nil || alive(s) {
-			return s
+		if alive == nil || alive(e.slot) {
+			t.m[key] = flowEntry{slot: e.slot, lastSeen: now.UnixNano(), proto: e.proto}
+			return e.slot
 		}
 		delete(t.m, key)
-		t.counts[s]--
+		t.counts[e.slot]--
 		// 落到下面重新选槽
 	}
-	// 表满：新流不插入（老流的映射绝不能动 —— 那会让内层 TCP 乱序），但仍必须
-	// 在**活槽**里选。直接纯哈希会把这批新流分到已经断开的成员槽上：那条流失效，
-	// 而健康成员明明还有空位。这正是复审第三轮问题五复现的那条。
+	// 表满：先回收过期项（异常断开、没发 FIN/RST 的 TCP，或空闲的 UDP），仍满才回退。
+	// 节流：满表时新流可能每秒几十条，全表扫描不能每条都做。
 	if len(t.m) >= t.max {
-		return hashToAlive(payload, n, alive)
+		if now.UnixNano()-t.lastSweep > int64(sweepInterval) {
+			t.lastSweep = now.UnixNano()
+			t.sweepLocked(now)
+		}
+		// 新流不插入（老流的映射绝不能动 —— 那会让内层 TCP 乱序），但仍必须
+		// 在**活槽**里选，直接纯哈希会把这批新流分到已经断开的成员槽上。
+		if len(t.m) >= t.max {
+			t.fallbacks++
+			return hashToAlive(payload, n, alive)
+		}
 	}
 
 	best := 0
@@ -129,9 +185,48 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 		// 后台补），内层 TCP 自己会重传。调用方要为空槽批次计数，别像以前那样静默。
 		return Slot(payload, n)
 	}
-	t.m[key] = best
+	t.m[key] = flowEntry{slot: best, lastSeen: now.UnixNano(), proto: proto}
 	t.counts[best]++
 	return best
+}
+
+// sweepLocked 回收所有超过空闲期的映射。只在表满时兜底调用，由 lastSweep 节流。
+func (t *FlowTable) sweepLocked(now time.Time) {
+	for k, e := range t.m {
+		limit := tcpFlowIdle
+		if e.proto == 17 {
+			limit = udpFlowIdle
+		}
+		if now.Sub(time.Unix(0, e.lastSeen)) <= limit {
+			continue
+		}
+		delete(t.m, k)
+		if e.slot > 0 && e.slot < len(t.counts) {
+			t.counts[e.slot]--
+		}
+		t.reclaimed++
+	}
+}
+
+// FlowStats 是流表当前状态的快照，只给诊断输出用。
+//
+// 报告要求先量「占用率、满表回退次数、各槽活跃映射数」再决定要不要做 FIN/RST 回收：
+// 没有这三个数，谁也说不清长会话里的短连接到底有没有把表吃满。
+type FlowStats struct {
+	Size      int    // 已建立的映射数
+	Max       int    // 容量上限
+	Fallbacks uint64 // 表满后新流退回哈希的次数
+	Reclaimed uint64 // 因 FIN/RST 或空闲期回收的映射数
+	PerSlot   []int  // 各槽承载的流数，下标即槽号
+}
+
+// Stats 返回流表快照。锁开销可忽略：调用方是 10 分钟一次的状态日志。
+func (t *FlowTable) Stats() FlowStats {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	per := make([]int, len(t.counts))
+	copy(per, t.counts)
+	return FlowStats{Size: len(t.m), Max: t.max, Fallbacks: t.fallbacks, Reclaimed: t.reclaimed, PerSlot: per}
 }
 
 // growCounts 保证计数切片至少覆盖 n 个槽，已有计数原样保留。

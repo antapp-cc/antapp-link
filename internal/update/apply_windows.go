@@ -121,7 +121,8 @@ func awaitHandoff(dir string, h *Handoff, newProc *exec.Cmd, self string) error 
 		// 不退出、也不回滚：新旧两版里只有旧版在跑，磁盘上的文件名属于新版，
 		// 回滚需要用户重新启动时才安全。
 		if !reclaimed {
-			return fmt.Errorf("新版没有确认启动（%v），且单实例互斥体已被别的实例持有：请从托盘确认当前在跑的是哪一个", werr)
+			return fmt.Errorf("新版没有确认启动（%v），且单实例互斥体已被别的实例持有：本窗口停止接管网络，请关闭它（%w）",
+				werr, ErrHandoffBlocked)
 		}
 		return fmt.Errorf("新版已拉起，但没有在 %v 内确认启动（回滚副本仍保留在 %s.old，可重试更新）",
 			applyWaitReady, self)
@@ -144,8 +145,8 @@ func awaitHandoff(dir string, h *Handoff, newProc *exec.Cmd, self string) error 
 		return fmt.Errorf("新版在确认启动后 %v 内退出，已恢复旧版并继续运行", applyPostReadyGrace)
 	}
 	recordLifecycle(LifecycleEvent{Event: EventHandoffTimeout, Detail: "新版确认后退出，但单实例互斥体已被别的实例持有"})
-	return fmt.Errorf("新版在确认启动后 %v 内退出，且单实例互斥体已被别的实例持有：请从托盘确认当前在跑的是哪一个",
-		applyPostReadyGrace)
+	return fmt.Errorf("新版在确认启动后 %v 内退出，且单实例互斥体已被别的实例持有：本窗口停止接管网络，请关闭它（%w）",
+		applyPostReadyGrace, ErrHandoffBlocked)
 }
 
 // newProcessExited 在 grace 内观察新进程是否退出；返回 true 表示它已经死了。

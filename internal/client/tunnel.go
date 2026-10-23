@@ -94,12 +94,14 @@ type Stats struct {
 	// TxBytes 是「网卡读到、尝试发送」的字节数，保持原语义（界面显示的是它）。
 	// 队列满丢掉的包也算在里面，所以它是上界，不是真正发出去的量。
 	TxBytes atomic.Uint64
-	// TxWritten 是真正写进外层连接的字节数，由写循环在 Write 成功后累加。
-	// 和 TxBytes 的差值就是「读到了但没发出去」的部分 —— 排「面板显示在发、
-	// 对方却收不到」时看这个差值，比看总数有用；recycleAt 的忙碌判断也改用它，
-	// 免得把丢掉的数据算成"正在忙"从而无限推迟重建。
+	// TxWritten 是真正写进外层连接的字节数（含每帧 4 字节帧头），由写循环在
+	// Write 成功后累加。它和 TxBytes（纯载荷）不是同一口径，别直接相减；
+	// 排「面板显示在发、对方却收不到」时看丢弃字节的统计。
 	TxWritten atomic.Uint64
-	RTTNanos  atomic.Int64
+	// TxQueued 是成功投递进每槽写队列的字节数。它和 TxWritten 的差额是「进了队列
+	// 但还没写出或写失败」的部分。UDP 模式不经槽队列，该值恒为 0，看 TxWritten。
+	TxQueued atomic.Uint64
+	RTTNanos atomic.Int64
 }
 
 func (s *Stats) RTT() time.Duration { return time.Duration(s.RTTNanos.Load()) }
@@ -141,6 +143,9 @@ type DropStats struct {
 	SlotQueueFull atomic.Int64
 	// MemberDrop 是成员连接被摘掉的次数（含主动摘除与对端断开）。
 	MemberDrop atomic.Int64
+	// UplinkBytes 是上述各类原因丢弃的上行字节总数。包数按原因分，字节数只记总量：
+	// 量级够判断「丢的是零头还是大头」，再细就得看包数分布了。
+	UplinkBytes atomic.Int64
 }
 
 type Tunnel struct {
@@ -184,6 +189,23 @@ type Tunnel struct {
 	// 存在的理由：界面要能区分「控制连接在、数据面已经不通」。UDP 模式下控制走 TCP，
 	// 光看 Stats.Connected 会一直显示「已连接」，而业务包早就发不出去了。
 	udpCh atomic.Pointer[udpChannel]
+
+	// slotDepth / slotDepthPeak 是每槽上行队列的当前深度与采样区间峰值。
+	//
+	// 「丢了多少」看不出「队列有多深」：深度长期贴顶说明瓶颈在那条成员连接，而不在
+	// 网卡读循环。放在 Tunnel 而不是会话里：会话重拨时统计不该清零，否则 10 分钟
+	// 采样会周期性地只看到刚建连的 0。
+	slotDepth     [maxMembers]atomic.Int64
+	slotDepthPeak [maxMembers]atomic.Int64
+
+	// flow 指向当前会话的流表，供 10 分钟状态日志读占用与满表回退次数。
+	// 会话收尾时清空，别让日志读到已结束会话的旧表。
+	flow atomic.Pointer[proto.FlowTable]
+
+	// session 指向当前活动会话，供 SlotDepthReport 直接读各槽队列的实时长度。
+	// 只靠入队时采样的话，写协程消费之后深度会停在旧值 —— 把「已经排空」误报成
+	// 「还在排队」。
+	activeSession atomic.Pointer[clientSession]
 }
 
 func NewTunnel(inv pki.Invite, dev Device, logger *slog.Logger) *Tunnel {
@@ -211,6 +233,45 @@ func (t *Tunnel) Kick() {
 	default:
 	}
 }
+
+// recordSlotDepth 记一次某槽的写队列深度，并抬高采样区间峰值。
+func (t *Tunnel) recordSlotDepth(k, depth int) {
+	if k < 0 || k >= len(t.slotDepth) {
+		return
+	}
+	d := int64(depth)
+	t.slotDepth[k].Store(d)
+	for {
+		p := t.slotDepthPeak[k].Load()
+		if d <= p || t.slotDepthPeak[k].CompareAndSwap(p, d) {
+			return
+		}
+	}
+}
+
+// SlotDepthReport 返回各槽当前深度与自上次调用以来的峰值，并把峰值重置为当前值。
+// 调用方是 10 分钟一次的状态日志：不重置的话峰值会跨窗口累积，看不出「最近一次
+// 采样区间里有没有接近满队」。
+//
+// 当前深度直接读活动会话的队列长度，不走采样值：入队时的记录在写协程消费后不会
+// 自动下降。峰值仍由 recordSlotDepth 在入队/丢弃时维护。
+func (t *Tunnel) SlotDepthReport() (current, peak []int64) {
+	sess := t.activeSession.Load()
+	current = make([]int64, len(t.slotDepth))
+	peak = make([]int64, len(t.slotDepth))
+	for i := range t.slotDepth {
+		c := t.slotDepth[i].Load()
+		if sess != nil && i < len(sess.slotTx) {
+			c = int64(len(sess.slotTx[i]))
+		}
+		current[i] = c
+		peak[i] = t.slotDepthPeak[i].Swap(c)
+	}
+	return current, peak
+}
+
+// FlowSnapshot 返回当前会话的流表；没有活动会话时为 nil。
+func (t *Tunnel) FlowSnapshot() *proto.FlowTable { return t.flow.Load() }
 
 // sessionEndInfo 把会话结束的错误归类成日志级别和人话原因，
 // 让「会话结束」这行日志一眼能看出断线是什么造成的。
@@ -456,6 +517,7 @@ func (t *Tunnel) readPump(ctx context.Context, onFatal context.CancelFunc) {
 		// 让内层 TCP 重传，比在这里白分配好。len/cap 是近似值，下面仍留非阻塞
 		// select 兜底并发变化。
 		if len(t.pktCh) >= cap(t.pktCh) {
+			t.Drops.UplinkBytes.Add(int64(n))
 			if d := t.Drops.PktChFull.Add(1); d == 100 || d%1000 == 0 {
 				t.log.Warn(fmt.Sprintf("上行拥塞，累计丢弃 %d 个包", d))
 			}
@@ -476,8 +538,9 @@ func (t *Tunnel) readPump(ctx context.Context, onFatal context.CancelFunc) {
 		default:
 			// 丢一两个包是常态（调度抖动），持续丢才说明下游真的跟不上。
 			// 阈值取 100：一次突发就能丢几十个，报到用户面前必须是「一直在丢」。
-			if n := t.Drops.PktChFull.Add(1); n == 100 || n%1000 == 0 {
-				t.log.Warn(fmt.Sprintf("上行拥塞，累计丢弃 %d 个包", n))
+			t.Drops.UplinkBytes.Add(int64(n))
+			if d := t.Drops.PktChFull.Add(1); d == 100 || d%1000 == 0 {
+				t.log.Warn(fmt.Sprintf("上行拥塞，累计丢弃 %d 个包", d))
 			}
 		}
 	}
@@ -702,6 +765,8 @@ func newClientSession(t *Tunnel, conn net.Conn, sid string, tlsCfg *tls.Config, 
 		sess.slotTx[i] = make(chan []byte, slotTxLen)
 	}
 	sess.slots[0] = conn
+	t.activeSession.Store(sess)
+	t.flow.Store(sess.flow)
 	return sess
 }
 
@@ -719,6 +784,7 @@ func (s *clientSession) enqueue(k int, batch []byte) {
 	}
 	if k < 0 || k >= len(s.slotTx) {
 		s.tunnel.Drops.EmptySlot.Add(1)
+		s.tunnel.Drops.UplinkBytes.Add(int64(len(batch)))
 		return
 	}
 	// 队列满时先返回，不做那次必然被丢掉的复制。
@@ -727,7 +793,9 @@ func (s *clientSession) enqueue(k int, batch []byte) {
 	// 丢 8000 批，等于每秒白分配 266KB，白交 GC。len/cap 是近似值（并发下可能
 	// 刚判完又满），所以下面仍保留非阻塞 select 兜底。
 	if len(s.slotTx[k]) >= cap(s.slotTx[k]) {
+		s.tunnel.recordSlotDepth(k, len(s.slotTx[k]))
 		n := s.tunnel.Drops.SlotQueueFull.Add(1)
+		s.tunnel.Drops.UplinkBytes.Add(int64(len(batch)))
 		s.log.Debug("槽位写队列满，丢弃一批", "slot", k, "drops", n)
 		return
 	}
@@ -736,7 +804,11 @@ func (s *clientSession) enqueue(k int, batch []byte) {
 	copy(cp, batch)
 	select {
 	case s.slotTx[k] <- cp:
+		s.tunnel.recordSlotDepth(k, len(s.slotTx[k]))
+		s.stats.TxQueued.Add(uint64(len(cp)))
 	default:
+		s.tunnel.recordSlotDepth(k, len(s.slotTx[k]))
+		s.tunnel.Drops.UplinkBytes.Add(int64(len(batch)))
 		// 只进 Debug，不报 Warn。这条在 Pi 节点上会持续触发（几十个 peer 的上行
 		// 把管道吃满，每分钟都在丢），刷屏之后反而看不出真正的问题。计数仍然保留，
 		// 排障时开 Debug 就能看到；「丢包统计」那行也按原因汇总了同样的数字。
@@ -772,6 +844,9 @@ type clientSession struct {
 	dev    Device
 	log    *slog.Logger
 	stats  *Stats
+	// recycleDeferrals 是本次会话因「正在传输」推迟重建的次数。只被 recycleAt
+	// 那条协程写，日志和诊断读。
+	recycleDeferrals int
 	// ctrlSeen 只由控制连接（槽 0）的收帧刷新。判死必须看会话命脉那一条连接：
 	// 成员连接的下行数据不刷新它，否则控制连接单向半开时，只要成员槽还有流量
 	// 就永远不判死，哈希到槽 0 的内层流全部黑洞。
@@ -819,6 +894,14 @@ func (s *clientSession) sessionEnded() bool {
 func (s *clientSession) closeAll() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
+		// 会话结束后队列里可能还留着没写出的批：把采样值清掉，别让下一次报告
+		// 读到上一会话的深度。
+		if s.tunnel.activeSession.CompareAndSwap(s, nil) {
+			for k := range s.tunnel.slotDepth {
+				s.tunnel.slotDepth[k].Store(0)
+			}
+		}
+		s.tunnel.flow.CompareAndSwap(s.flow, nil)
 
 		s.mu.Lock()
 		members := make([]net.Conn, 0, len(s.slots))
@@ -1343,8 +1426,14 @@ func (s *clientSession) recycleAt(ctx context.Context) error {
 		}
 		busy := s.stats.TxWritten.Load() - tx0 + s.stats.RxBytes.Load() - rx0
 		if busy >= recycleBusyBytes {
-			// 推迟这条要单独打：它是唯一能解释「为什么本该 8 小时断一次却没断」的线索。
-			s.log.Info("正在传输数据，推迟自动重建连接")
+			s.recycleDeferrals++
+			// 推迟这条要单独打：它是唯一能解释「为什么本该 12 小时断一次却没断」的线索。
+			// 带推迟次数、本次采样量和 RTT —— 只看次数分不清是「一直有人用」还是
+			// 「链路劣化但流量刚好越线」，后者才需要人工介入。
+			s.log.Info("正在传输数据，推迟自动重建连接",
+				"deferrals", s.recycleDeferrals,
+				"sampled_mb", busy/(1<<20),
+				"rtt_ms", s.stats.RTT().Milliseconds())
 			timer.Reset(recycleRetry)
 			continue
 		}
@@ -1364,9 +1453,11 @@ func (s *clientSession) recycleAt(ctx context.Context) error {
 // 这里只观察、不改行为，把两种可疑状态写进日志：
 //   - 有上行却长时间收不到任何下行（下行那条路断了）
 //   - 成员连接持续不足（上行正在被丢）
+// dataPathSample 是数据面观察的采样间隔。var 而不是 const：测试要把它压到毫秒级。
+var dataPathSample = 30 * time.Second
+
 func (s *clientSession) watchDataPath(ctx context.Context) {
-	const sample = 30 * time.Second
-	ticker := time.NewTicker(sample)
+	ticker := time.NewTicker(dataPathSample)
 	defer ticker.Stop()
 
 	var lastTx, lastRx uint64
@@ -1395,11 +1486,14 @@ func (s *clientSession) watchDataPath(ctx context.Context) {
 			}
 
 			// 连续两个采样（60 秒）才报，避免短暂波动吵人；之后每 5 分钟提醒一次。
-			// 只带两个关键数字：成员存活比和空槽丢弃数。收发量状态栏一直显示着，
-			// 再写进日志会让这一行折成三截。
+			// 三个丢包数字都要带上：只报空槽的话，队列满导致的「上行明明在发却收不到」
+			// 会显示成「丢 0 批」，把人引向下行链路，而真正原因是成员写不动。
 			if noRxSamples == 2 || (noRxSamples > 2 && noRxSamples%10 == 0) {
-				s.log.Warn(fmt.Sprintf("数据面单向：有上行无下行（连接 %d/%d，丢 %d 批）",
-					live, s.members, s.tunnel.Drops.EmptySlot.Load()))
+				s.log.Warn(fmt.Sprintf("数据面单向：有上行无下行（连接 %d/%d，丢 槽空%d 队列%d 读%d）",
+					live, s.members,
+					s.tunnel.Drops.EmptySlot.Load(),
+					s.tunnel.Drops.SlotQueueFull.Load(),
+					s.tunnel.Drops.PktChFull.Load()))
 			}
 			if lowMemberSamples == 2 || (lowMemberSamples > 2 && lowMemberSamples%20 == 0) {
 				s.log.Warn(fmt.Sprintf("成员不足，上行在丢（连接 %d/%d，丢 %d 批）",
@@ -1473,13 +1567,20 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 		if s.udp != nil {
 			s.trace.Record("tx", 0, pkt)
 			s.stats.TxBytes.Add(uint64(pktLen))
-			if err := s.udp.send(pkt); err != nil {
+			n, err := s.udp.send(pkt)
+			if err != nil {
 				if s.udp.isClosed() {
 					// keepalive 已经判定这条 UDP 通道失效并关掉了它。结束会话让 Run
 					// 重建 —— 重建出来的仍是 UDP 通道，不切 TCP。
 					return fmt.Errorf("UDP 数据通道已失效（准备重建）: %w", err)
 				}
 				s.log.Debug("UDP 上行发送失败", "err", err)
+				s.tunnel.Drops.UplinkBytes.Add(int64(pktLen))
+			} else {
+				// 真正写进 UDP socket 的密文字节。UDP 路径没有队列满/空槽，
+				// 这里是唯一能判断「数据到底发出去没有」的量。TxBytes 记明文长度、
+				// 这里记密文长度，两者不可相减。
+				s.stats.TxWritten.Add(uint64(n))
 			}
 			continue
 		}
@@ -1538,6 +1639,7 @@ func flushBatch(s *clientSession, k int, batch []byte) error {
 		// 关键的两个数字（几条连上、丢了多少批）反而看不见。和 watchDataPath 里
 		// 同类告警用同一句话，两个场景看起来才是一回事。
 		n := s.tunnel.Drops.EmptySlot.Add(1)
+		s.tunnel.Drops.UplinkBytes.Add(int64(len(batch)))
 		if n == 200 || (n > 200 && n%1000 == 0) {
 			s.log.Warn(fmt.Sprintf("成员不足，上行在丢（连接 %d/%d，丢 %d 批）",
 				s.liveCount(), s.members, n))

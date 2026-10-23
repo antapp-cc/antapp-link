@@ -260,6 +260,23 @@ fi
 [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ]] || die "BBR 启用失败——内核不支持且模块加载不了"
 log "BBR 已生效（$(sysctl -n net.ipv4.tcp_congestion_control) + $(sysctl -n net.core.default_qdisc)）"
 
+# default_qdisc=fq 只决定新建设备的队列，已经存在的出口网卡不会变（发行版默认多是
+# fq_codel）。BBR 的 pacing 和 fq 搭配更顺：实测这条跨境线路下行从 0.23 提到 0.40+
+# MB/s，上行不变（上行发送端在节点机上，云服的 qdisc 管不到那个方向）。
+# 切失败只警告：老内核/容器里 sch_fq 可能不可用，不影响隧道功能本身。
+wan_iface="$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')" || true
+if [[ -n "$wan_iface" ]]; then
+  modprobe sch_fq 2>/dev/null || true
+  if tc qdisc replace dev "$wan_iface" root fq 2>/dev/null &&
+     tc qdisc show dev "$wan_iface" 2>/dev/null | head -1 | grep -q 'qdisc fq '; then
+    log "出口 qdisc 已切换：$wan_iface -> fq"
+  else
+    log "警告: $wan_iface 的 qdisc 切不到 fq（继续用现有 qdisc，不影响功能）"
+  fi
+else
+  log "警告: 找不到默认出口网卡，跳过 qdisc 切换"
+fi
+
 log "调优内核缓冲（多连接数据面）"
 apply_sysctl() {
   sysctl -w "$1" >/dev/null 2>&1
