@@ -113,3 +113,47 @@ func TestEnqueueDropsWhenFullWithoutBlocking(t *testing.T) {
 		t.Fatal("队列满了却没有记录丢弃次数")
 	}
 }
+
+// TxWritten 只在真正写进外层连接之后累加。
+//
+// 以前界面上的「发送」读的是 TxBytes，它在入队之前就加了 —— 队列满丢掉的那批
+// 也算「发送成功」。Pi 节点上行常年打满，这个差值能有几百 MB，看起来在发、实际
+// 对方收不到。现在两者分开记，差值就是「读到了但没发出去」。
+func TestTxWrittenOnlyCountsActuallyWritten(t *testing.T) {
+	sess := newClientSession(testTunnel(t), newBlockedConn(), "sid", nil, Ack{Members: 2})
+
+	// 队列只有 slotTxLen 深，塞满之后剩下的全会被丢
+	before := sess.stats.TxWritten.Load()
+	for i := 0; i < slotTxLen*3; i++ {
+		sess.enqueue(1, []byte{byte(i)})
+	}
+	// 没有写协程消费，所以一个字节都不该算「写出」
+	if got := sess.stats.TxWritten.Load(); got != before {
+		t.Fatalf("没写出任何数据，TxWritten 却涨了 %d -> %d", before, got)
+	}
+	// 但排队满导致的丢弃必须被记下来
+	if sess.tunnel.Drops.SlotQueueFull.Load() == 0 {
+		t.Fatal("队列满却没有记录丢弃")
+	}
+}
+
+// 队列满时不该做那次必然被丢掉的复制。
+//
+// 拥塞时这条路径每批都要 make 一个 20KB 切片再扔掉：Pi 节点实测 10 分钟丢 8000 批，
+// 等于每秒白分配 266KB，白交 GC。这个用例钉住「满队列路径零分配」。
+func TestEnqueueFullQueueDoesNotAllocate(t *testing.T) {
+	sess := newClientSession(testTunnel(t), newBlockedConn(), "sid", nil, Ack{Members: 2})
+
+	// 先把队列灌满（这一步有分配，不算在内）
+	for len(sess.slotTx[1]) < cap(sess.slotTx[1]) {
+		sess.enqueue(1, make([]byte, 64))
+	}
+	payload := make([]byte, 64)
+
+	allocs := testing.AllocsPerRun(100, func() {
+		sess.enqueue(1, payload) // 队列始终是满的，应当直接返回
+	})
+	if allocs > 0 {
+		t.Fatalf("队列满时仍在分配：%.1f allocs/op（应当为 0）", allocs)
+	}
+}

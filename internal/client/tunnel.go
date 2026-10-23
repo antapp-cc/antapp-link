@@ -91,7 +91,14 @@ type Ack struct {
 type Stats struct {
 	Connected atomic.Bool
 	RxBytes   atomic.Uint64
-	TxBytes   atomic.Uint64
+	// TxBytes 是「网卡读到、尝试发送」的字节数，保持原语义（界面显示的是它）。
+	// 队列满丢掉的包也算在里面，所以它是上界，不是真正发出去的量。
+	TxBytes atomic.Uint64
+	// TxWritten 是真正写进外层连接的字节数，由写循环在 Write 成功后累加。
+	// 和 TxBytes 的差值就是「读到了但没发出去」的部分 —— 排「面板显示在发、
+	// 对方却收不到」时看这个差值，比看总数有用；recycleAt 的忙碌判断也改用它，
+	// 免得把丢掉的数据算成"正在忙"从而无限推迟重建。
+	TxWritten atomic.Uint64
 	RTTNanos  atomic.Int64
 }
 
@@ -443,6 +450,17 @@ func (t *Tunnel) readPump(ctx context.Context, onFatal context.CancelFunc) {
 			t.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", n, "max", proto.MaxPayload)
 			continue
 		}
+		// 队列满时直接丢，先不复制。
+		//
+		// 拥塞时这个位置上每包都要 make 一次再扔掉。IP 层本就尽力而为，丢一个包
+		// 让内层 TCP 重传，比在这里白分配好。len/cap 是近似值，下面仍留非阻塞
+		// select 兜底并发变化。
+		if len(t.pktCh) >= cap(t.pktCh) {
+			if d := t.Drops.PktChFull.Add(1); d == 100 || d%1000 == 0 {
+				t.log.Warn(fmt.Sprintf("上行拥塞，累计丢弃 %d 个包", d))
+			}
+			continue
+		}
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
 		// 非阻塞投递：pktCh 满了宁可丢这个包，也不能把网卡读循环卡住。
@@ -701,6 +719,16 @@ func (s *clientSession) enqueue(k int, batch []byte) {
 	}
 	if k < 0 || k >= len(s.slotTx) {
 		s.tunnel.Drops.EmptySlot.Add(1)
+		return
+	}
+	// 队列满时先返回，不做那次必然被丢掉的复制。
+	//
+	// 拥塞时这条路径每批都要 make 一个 20KB 的切片再扔掉：Pi 节点实测 10 分钟
+	// 丢 8000 批，等于每秒白分配 266KB，白交 GC。len/cap 是近似值（并发下可能
+	// 刚判完又满），所以下面仍保留非阻塞 select 兜底。
+	if len(s.slotTx[k]) >= cap(s.slotTx[k]) {
+		n := s.tunnel.Drops.SlotQueueFull.Add(1)
+		s.log.Debug("槽位写队列满，丢弃一批", "slot", k, "drops", n)
 		return
 	}
 	// 批缓冲由 pumpFromDevice 复用，投递后马上会被覆盖，所以必须在这里拷一份。
@@ -1307,13 +1335,13 @@ func (s *clientSession) recycleAt(ctx context.Context) error {
 		case <-timer.C:
 		}
 
-		tx0, rx0 := s.stats.TxBytes.Load(), s.stats.RxBytes.Load()
+		tx0, rx0 := s.stats.TxWritten.Load(), s.stats.RxBytes.Load()
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(recycleBusyProbe):
 		}
-		busy := s.stats.TxBytes.Load() - tx0 + s.stats.RxBytes.Load() - rx0
+		busy := s.stats.TxWritten.Load() - tx0 + s.stats.RxBytes.Load() - rx0
 		if busy >= recycleBusyBytes {
 			// 推迟这条要单独打：它是唯一能解释「为什么本该 8 小时断一次却没断」的线索。
 			s.log.Info("正在传输数据，推迟自动重建连接")
@@ -1521,8 +1549,14 @@ func flushBatch(s *clientSession, k int, batch []byte) error {
 	// SetWriteDeadline 在连接已关时就会失败，所以它和 Write 的失败要一起分流：
 	// 只处理 Write 的话，"对端已经关了"这条最常见的路径会绕过日志与摘槽。
 	werr := conn.SetWriteDeadline(time.Now().Add(slotWriteTimeout))
+	var wrote int
 	if werr == nil {
-		_, werr = conn.Write(batch)
+		wrote, werr = conn.Write(batch)
+	}
+	if wrote > 0 {
+		// 真正落到外层连接的字节。和 TxBytes（网卡读到的量）分开记，差值就是
+		// 「读到了但没发出去」—— 队列满、空槽、写失败都会体现在这个差值里。
+		s.stats.TxWritten.Add(uint64(wrote))
 	}
 	if werr != nil {
 		if s.sessionEnded() {

@@ -67,7 +67,7 @@ func TestRecycleAtDefersWhenBusy(t *testing.T) {
 			case <-ctx.Done():
 				return
 			default:
-				s.stats.TxBytes.Add(10_000)
+				s.stats.TxWritten.Add(10_000)
 				time.Sleep(2 * time.Millisecond)
 			}
 		}
