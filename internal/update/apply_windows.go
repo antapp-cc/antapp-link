@@ -18,6 +18,13 @@ import (
 // 超时后旧版不退出：磁盘上虽然是新版，但让用户手上立刻什么都没有更糟。
 var applyWaitReady = 15 * time.Second
 
+// applyPostReadyGrace 是拿到 ready 之后继续盯着新进程的时间。
+//
+// ready 只能证明界面和托盘建起来了，证明不了它站得住。新版确认后立刻退出时，
+// 旧进程如果马上跟着走，就再没有人能恢复现场；多盯这一小会儿，它还在才真的放手。
+// 代价是旧窗口要多留这么久（新版窗口此时已经出现），所以别拉长到用户能察觉。
+var applyPostReadyGrace = 2 * time.Second
+
 // applyHandoffDir 是交接状态目录。用临时目录而不是安装目录：它是跨进程的短命
 // 状态，不该跟 Program Files 的权限和清理策略绑在一起。
 func applyHandoffDir() string {
@@ -60,12 +67,17 @@ func apply(self, newExePath string) error {
 		return fmt.Errorf("无法建立更新交接状态，已中止更新（旧版继续运行）: %w", err)
 	}
 
+	var launched *exec.Cmd
 	err = swapExe(self, newExePath, func(p string) error {
 		cmd := exec.Command(p)
 		cmd.Env = append(os.Environ(),
 			handoffDirEnv+"="+applyHandoffDir(),
 			handoffInvocationEnv+"="+handoff.InvocationID)
-		return cmd.Start()
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		launched = cmd
+		return nil
 	})
 	if err != nil {
 		_ = FailHandoff(applyHandoffDir(), handoff.InvocationID, err)
@@ -77,17 +89,24 @@ func apply(self, newExePath string) error {
 	// 否则新版卡在单实例闸门、旧进程卡在这里，两边一起超时 —— 这不是保守，是死锁。
 	relinquishInstance()
 
-	// 只确认进程起来了还不够：Start 成功之后新版仍可能在初始化阶段退出。
+	return awaitHandoff(applyHandoffDir(), handoff, launched, self)
+}
+
+// awaitHandoff 等新版确认接手，并在确认之后再盯一小段时间。
+//
+// 等待失败（超时 / 新版自报失败）和「确认后立刻退出」都算交接没完成：旧进程必须
+// 把单实例互斥体收回来继续跑，它一退出用户手上就什么都不剩。
+func awaitHandoff(dir string, h *Handoff, newProc *exec.Cmd, self string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), applyWaitReady)
 	defer cancel()
-	if _, werr := WaitReady(ctx, applyHandoffDir(), handoff.InvocationID, 50*time.Millisecond); werr != nil {
+	if _, werr := WaitReady(ctx, dir, h.InvocationID, 50*time.Millisecond); werr != nil {
 		// 新版没接手，旧进程还得继续跑：先把互斥体收回来，确认自己仍是唯一实例。
 		// 收不回来通常意味着新版已经拿到锁并在跑，或者用户又起了一个实例。
 		reclaimed := reclaimInstance()
 		// 新版自己报过失败时保留第一手原因，别用「没收到确认」覆盖掉
 		// 「拿不到互斥体」这类真正有用的信息。
 		if !errors.Is(werr, ErrHandoffFailed) {
-			_ = FailHandoff(applyHandoffDir(), handoff.InvocationID,
+			_ = FailHandoff(dir, h.InvocationID,
 				fmt.Errorf("%v 内没有收到新版的启动确认: %w", applyWaitReady, werr))
 		}
 		detail := "新版没有确认启动，保留回滚副本"
@@ -107,6 +126,69 @@ func apply(self, newExePath string) error {
 		return fmt.Errorf("新版已拉起，但没有在 %v 内确认启动（回滚副本仍保留在 %s.old，可重试更新）",
 			applyWaitReady, self)
 	}
+
+	// ready 只覆盖「图标、窗口、托盘都建好了」这一刻。新版确认后马上崩掉的话，
+	// 旧进程如果已经走了，就没有任何人能恢复磁盘上的回滚副本。
+	if !newProcessExited(newProc, applyPostReadyGrace) {
+		return nil
+	}
+
+	reclaimed := reclaimInstance()
+	if reclaimed {
+		if rerr := restoreOldExe(self); rerr != nil {
+			recordLifecycle(LifecycleEvent{Event: EventRollback, Detail: "新版确认后退出，恢复旧版失败", Err: rerr.Error()})
+			return fmt.Errorf("新版在确认启动后 %v 内退出，且恢复旧版失败（旧版仍在 %s.old，可手动改回）: %w",
+				applyPostReadyGrace, self, rerr)
+		}
+		recordLifecycle(LifecycleEvent{Event: EventRollback, Detail: "新版确认后退出，已恢复旧版"})
+		return fmt.Errorf("新版在确认启动后 %v 内退出，已恢复旧版并继续运行", applyPostReadyGrace)
+	}
+	recordLifecycle(LifecycleEvent{Event: EventHandoffTimeout, Detail: "新版确认后退出，但单实例互斥体已被别的实例持有"})
+	return fmt.Errorf("新版在确认启动后 %v 内退出，且单实例互斥体已被别的实例持有：请从托盘确认当前在跑的是哪一个",
+		applyPostReadyGrace)
+}
+
+// newProcessExited 在 grace 内观察新进程是否退出；返回 true 表示它已经死了。
+//
+// 用 goroutine 等 Wait：Windows 上没有可靠的「查一下就返回」的进程存活接口，
+// 而 Wait 正是回收进程句柄的那次调用。
+func newProcessExited(cmd *exec.Cmd, grace time.Duration) bool {
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+	t := time.NewTimer(grace)
+	defer t.Stop()
+	select {
+	case <-exited:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
+// restoreOldExe 把 .old 改回程序路径。
+//
+// 只用在「新版已经确认接手却又退出」之后：旧进程还在内存里跑，但磁盘上的正常路径
+// 已经被新版占了。不换回来的话，用户下次启动拿到的还是那个刚崩过的版本。
+func restoreOldExe(self string) error {
+	old := self + ".old"
+	if _, err := os.Stat(old); err != nil {
+		return err
+	}
+	failed := self + ".failed"
+	_ = os.Remove(failed)
+	if err := os.Rename(self, failed); err != nil {
+		return err
+	}
+	if err := os.Rename(old, self); err != nil {
+		// 退回去：正常路径上必须留着一个能启动的程序。
+		_ = os.Rename(failed, self)
+		return err
+	}
+	// 崩掉的那一版没有保留价值，下次更新会重新下载。
+	_ = os.Remove(failed)
 	return nil
 }
 

@@ -46,10 +46,12 @@ func main() {
 }
 
 func run() int {
-	// 更新拉起的新版一旦没走到「初始化完成」就退出，旧进程必须收到 failed 才能
+	// 更新拉起的新版一旦没走到「界面真的起来了」就退出，旧进程必须收到 failed 才能
 	// 恢复运行。兜底放在最前面：单实例检查本身就可能失败，而那条路径以前会让
 	// 旧进程一直等到超时。
-	startupConfirmed := false
+	//
+	// ready 不在这里写：它由 client.RunUI 在窗口和托盘都建好之后写。已经 ready 的
+	// 交接是终态，所以正常退出时下面这个兜底是 no-op，不会把成功改写成失败。
 	failureReported := false
 	failStartup := func(err error) {
 		if failureReported {
@@ -59,9 +61,7 @@ func run() int {
 		update.FailStartup(err)
 	}
 	defer func() {
-		if !startupConfirmed {
-			failStartup(errors.New("启动未完成"))
-		}
+		failStartup(errors.New("启动未完成"))
 	}()
 
 	var (
@@ -206,14 +206,6 @@ func run() int {
 		return 0
 	}
 
-	// 到这一步互斥体、工作目录、日志、网络自愈都完成了，才敢让旧进程退出。
-	// 顺序不能再往前挪：init 阶段能证明的只有「二进制加载了」，那正是问题 1 的坑。
-	// 写状态失败不算致命：旧进程会按超时处理（不退出、保留回滚副本）。
-	if err := update.MarkStartupReady(); err != nil {
-		logger.Warn("写更新交接状态失败，旧进程会把这次更新当作未确认", "err", err)
-	}
-	startupConfirmed = true
-
 	if *once {
 		// 命令行一次性模式：config 里必须恰好有一个连接码文件（联调用，不做选择界面）
 		cands := client.ListInviteFiles(dataDir)
@@ -243,6 +235,10 @@ func run() int {
 	}
 
 	// 连不连、连哪个，由界面扫描 config\*.antapp 决定：一个直接连，多个弹窗让用户挑。
+	//
+	// 交接确认不在这里：RunUI 还要加载图标、创建窗口、创建托盘，这些失败的话新版
+	// 根本用不了，而提前写下的 ready 已经让旧进程放手了。ready 由 RunUI 在界面
+	// 建好之后写，见 client/ui_windows.go 的 buildUIThenConfirm。
 	go waitHealthyThenCleanup(app)
 	if err := client.RunUI(app, logs, dataDir); err != nil {
 		logger.Error("界面启动失败", "err", err)

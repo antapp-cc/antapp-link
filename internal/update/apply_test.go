@@ -5,6 +5,7 @@ package update
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -119,6 +120,160 @@ func TestApplyAbortsWhenHandoffCannotBeCreated(t *testing.T) {
 	}
 	if _, serr := os.Stat(self + ".old"); !os.IsNotExist(serr) {
 		t.Errorf("中止更新时不该改名程序文件，.old 实际 err=%v", serr)
+	}
+}
+
+// writeFakeExePair 准备一对「新版在正常路径、旧版在 .old」的假程序文件，
+// 让回滚测试不必碰真正的测试二进制。
+func writeFakeExePair(t *testing.T, self string) {
+	t.Helper()
+	if err := os.WriteFile(self, []byte("new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(self+".old", []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// startHandoffChild 拉起一个真实子进程模拟「新版」，由子进程自己写交接状态。
+func startHandoffChild(t *testing.T, dir, invocation, envKey, testName string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run="+testName)
+	cmd.Env = append(os.Environ(),
+		envKey+"=1",
+		handoffDirEnv+"="+dir,
+		handoffInvocationEnv+"="+invocation)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("拉起子进程: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	return cmd
+}
+
+// 模拟「界面刚建好就崩」的新版：确认接手后立刻退出。
+func TestHandoffHelperReadyThenExit(t *testing.T) {
+	if os.Getenv("GO_WANT_HANDOFF_READY_EXIT") != "1" {
+		return
+	}
+	if err := MarkStartupReady(); err != nil {
+		os.Exit(3)
+	}
+	os.Exit(0)
+}
+
+// 模拟正常站得住的新版：确认接手后继续跑。
+func TestHandoffHelperReadyThenStay(t *testing.T) {
+	if os.Getenv("GO_WANT_HANDOFF_READY_STAY") != "1" {
+		return
+	}
+	if err := MarkStartupReady(); err != nil {
+		os.Exit(3)
+	}
+	time.Sleep(10 * time.Second)
+	os.Exit(0)
+}
+
+// 模拟「根本没走到确认点」的新版。
+func TestHandoffHelperNeverReady(t *testing.T) {
+	if os.Getenv("GO_WANT_HANDOFF_NEVER_READY") != "1" {
+		return
+	}
+	time.Sleep(10 * time.Second)
+	os.Exit(0)
+}
+
+// 新版确认接手后立刻退出（界面刚起来就崩）时，旧进程必须发现并恢复旧版，
+// 而不是把 ready 当成更新成功然后退出。
+func TestAwaitHandoffDetectsExitRightAfterReady(t *testing.T) {
+	stubLifecycle(t)
+	dir, h := newTestHandoff(t)
+	self := filepath.Join(t.TempDir(), "app.exe")
+	writeFakeExePair(t, self)
+
+	prevGrace := applyPostReadyGrace
+	applyPostReadyGrace = time.Second
+	t.Cleanup(func() { applyPostReadyGrace = prevGrace })
+
+	reclaimed := false
+	SetInstanceHandoffHooks(func() {}, func() bool { reclaimed = true; return true })
+	t.Cleanup(func() { SetInstanceHandoffHooks(func() {}, func() bool { return true }) })
+
+	cmd := startHandoffChild(t, dir, h.InvocationID, "GO_WANT_HANDOFF_READY_EXIT", "TestHandoffHelperReadyThenExit")
+	err := awaitHandoff(dir, h, cmd, self)
+	if err == nil {
+		t.Fatal("新版确认后立刻退出时，旧进程不能认为更新成功")
+	}
+	if !reclaimed {
+		t.Error("旧进程必须把单实例互斥体收回来")
+	}
+	if !strings.Contains(err.Error(), "已恢复旧版") {
+		t.Errorf("应说明已恢复旧版，实际: %v", err)
+	}
+	got, rerr := os.ReadFile(self)
+	if rerr != nil || string(got) != "old" {
+		t.Errorf("程序路径上应恢复成旧版，实际 %q (err=%v)", got, rerr)
+	}
+	if _, serr := os.Stat(self + ".old"); !os.IsNotExist(serr) {
+		t.Errorf("恢复成功后 .old 不该还在，实际 err=%v", serr)
+	}
+}
+
+// 确认之后新版还活着才是真的成功：旧进程什么都不该回收、不该回滚。
+func TestAwaitHandoffAcceptsNewProcessThatStaysUp(t *testing.T) {
+	stubLifecycle(t)
+	dir, h := newTestHandoff(t)
+	self := filepath.Join(t.TempDir(), "app.exe")
+	writeFakeExePair(t, self)
+
+	prevGrace := applyPostReadyGrace
+	applyPostReadyGrace = 300 * time.Millisecond
+	t.Cleanup(func() { applyPostReadyGrace = prevGrace })
+
+	SetInstanceHandoffHooks(func() {}, func() bool {
+		t.Error("成功路径不该收回互斥体")
+		return true
+	})
+	t.Cleanup(func() { SetInstanceHandoffHooks(func() {}, func() bool { return true }) })
+
+	cmd := startHandoffChild(t, dir, h.InvocationID, "GO_WANT_HANDOFF_READY_STAY", "TestHandoffHelperReadyThenStay")
+	if err := awaitHandoff(dir, h, cmd, self); err != nil {
+		t.Fatalf("新版站住了就不该报错: %v", err)
+	}
+	if got, rerr := os.ReadFile(self); rerr != nil || string(got) != "new" {
+		t.Errorf("成功路径不该动程序文件，实际 %q (err=%v)", got, rerr)
+	}
+	if _, serr := os.Stat(self + ".old"); serr != nil {
+		t.Errorf("成功路径要留着回滚副本给新进程清理，实际 err=%v", serr)
+	}
+}
+
+// 新版没走确认点：旧进程照旧不退出、不回滚，保留回滚副本等用户重试。
+func TestAwaitHandoffKeepsOldRunningWhenNoConfirmation(t *testing.T) {
+	stubLifecycle(t)
+	dir, h := newTestHandoff(t)
+	self := filepath.Join(t.TempDir(), "app.exe")
+	writeFakeExePair(t, self)
+
+	prevWait := applyWaitReady
+	applyWaitReady = 300 * time.Millisecond
+	t.Cleanup(func() { applyWaitReady = prevWait })
+
+	reclaimed := false
+	SetInstanceHandoffHooks(func() {}, func() bool { reclaimed = true; return true })
+	t.Cleanup(func() { SetInstanceHandoffHooks(func() {}, func() bool { return true }) })
+
+	cmd := startHandoffChild(t, dir, h.InvocationID, "GO_WANT_HANDOFF_NEVER_READY", "TestHandoffHelperNeverReady")
+	if err := awaitHandoff(dir, h, cmd, self); err == nil {
+		t.Fatal("没有 ready 时必须报错")
+	}
+	if !reclaimed {
+		t.Error("旧进程必须把单实例互斥体收回来")
+	}
+	if got, rerr := os.ReadFile(self); rerr != nil || string(got) != "new" {
+		t.Errorf("超时路径不该动程序文件，实际 %q (err=%v)", got, rerr)
+	}
+	if _, serr := os.Stat(self + ".old"); serr != nil {
+		t.Errorf("超时路径要保留回滚副本，实际 err=%v", serr)
 	}
 }
 

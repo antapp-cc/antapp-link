@@ -25,9 +25,9 @@ const handoffFileName = "handoff.json"
 
 const (
 	handoffLaunching = "launching"
-	// loaded 只说明二进制加载了、update 包 init 执行到了；ready 才说明关键初始化
-	// 都过了。旧进程只能凭 ready 退出：在真实案例里新版以 exit 17 死在 main 中途，
-	// 而 init 阶段写的状态让旧进程以为交接成功，结果更新完一个客户端都不剩。
+	// loaded 只说明二进制加载了、update 包 init 执行到了；ready 才说明关键初始化和
+	// 界面都起来了。旧进程只能凭 ready 退出：在真实案例里新版以 exit 17 死在 main
+	// 中途，而 init 阶段写的状态让旧进程以为交接成功，结果更新完一个客户端都不剩。
 	handoffLoaded = "loaded"
 	handoffReady  = "ready"
 	handoffFailed = "failed"
@@ -263,8 +263,10 @@ var (
 // HandoffPending 报告本进程是被旧版拉起来接手的，且还没走到确认点。
 func HandoffPending() bool { return handoffEnvID != "" }
 
-// MarkStartupReady 由 main 在单实例互斥体、工作目录、日志、网络自愈都完成之后调用。
-// 这是旧进程唯一会据以退出的信号，放在这些步骤之前就等于重演问题 1。
+// MarkStartupReady 由新版在「单实例互斥体、工作目录、日志、网络自愈都完成，
+// 且图标、窗口、托盘也建起来」之后调用；现在这个时点在 client.RunUI 里。
+// 这是旧进程唯一会据以退出的信号，任何更早的时点都等于重演问题 1：
+// 界面起不来的新版被当成更新成功，旧进程退出后用户手上什么都没有。
 func MarkStartupReady() error {
 	if handoffEnvID == "" {
 		return nil
@@ -304,8 +306,8 @@ func SetInstanceHandoffHooks(relinquish func(), reclaim func() bool) {
 }
 
 // consumeHandoffEnv 是新版进程的自动确认点：Go 运行时执行到这里时，二进制已经
-// 成功加载、依赖包也初始化完毕 —— 比 Start() 返回 nil 强，但仍不等于「数据面已就绪」。
-// 所以这里只写 loaded，ready 留给 main 的 MarkStartupReady。
+// 成功加载、依赖包也初始化完毕 —— 比 Start() 返回 nil 强，但仍不等于「界面可用」。
+// 所以这里只写 loaded，ready 留给界面建好之后的 MarkStartupReady。
 func consumeHandoffEnv() {
 	dir := os.Getenv(handoffDirEnv)
 	id := os.Getenv(handoffInvocationEnv)

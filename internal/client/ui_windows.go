@@ -126,13 +126,30 @@ func RunUI(app *App, logs *LogBuffer, rootDir string) error {
 	}
 
 	u := &UI{app: app, logs: logs, icon: icon, iconGray: iconGray, iconGreen: iconGreen, done: make(chan struct{})}
-	if err := u.build(); err != nil {
+	if err := buildUIThenConfirm(u.build, update.MarkStartupReady, func(err error) {
+		app.Log().Warn("写更新交接状态失败，旧进程会把这次更新当作未确认", "err", err)
+	}); err != nil {
 		return err
 	}
 	defer close(u.done)
 	defer u.ni.Dispose()
 
 	u.mw.Run()
+	return nil
+}
+
+// buildUIThenConfirm 按固定顺序完成「界面初始化 → 交接确认」。
+//
+// ready 必须等图标、窗口、托盘都建好之后才写：任何一步失败都会让新版随后退出，
+// 而提前写下的 ready 会让旧进程立刻放手 —— 更新完用户手上就没有能用的客户端了。
+// 单独抽出来，是因为真实的 walk 界面在测试里起不来，而顺序本身正是要守住的东西。
+func buildUIThenConfirm(build func() error, confirm func() error, warn func(error)) error {
+	if err := build(); err != nil {
+		return err
+	}
+	if err := confirm(); err != nil && warn != nil {
+		warn(err)
+	}
 	return nil
 }
 
