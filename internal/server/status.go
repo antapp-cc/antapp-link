@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/antapp-cc/antapp-link/internal/proto"
 )
 
 // StatusPath 是 run 进程写给 status 子命令看的运行时状态。
@@ -86,6 +88,20 @@ type Status struct {
 	TUNRxDropped  uint64 `json:"tun_rx_dropped,omitempty"`
 	TUNTxDropped  uint64 `json:"tun_tx_dropped,omitempty"`
 	TUNDropsKnown bool   `json:"tun_drops_known,omitempty"`
+}
+
+// fillFlowStatus 把会话流表快照写进 Status。单独拆出来是为了能被测试直接覆盖：
+// reportStatus 依赖整个 server，构造成本太高。
+func fillFlowStatus(st *Status, ft *proto.FlowTable) {
+	if ft == nil {
+		return
+	}
+	fs := ft.Stats()
+	st.FlowSize = fs.Size
+	st.FlowMax = fs.Max
+	st.FlowFallback = fs.Fallbacks
+	st.FlowReclaim = fs.Reclaimed
+	st.FlowPerSlot = fs.PerSlot
 }
 
 // reportStatus 每 5 秒刷新一次状态文件，超过这个阈值就说明写它的进程已经不在了。

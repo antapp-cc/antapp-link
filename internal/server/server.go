@@ -998,12 +998,7 @@ func (s *Server) reportStatus(ctx context.Context) {
 				st.UDPTxBytes = u.txBytes.Load()
 			}
 			if sess.flow != nil {
-				fs := sess.flow.Stats()
-				st.FlowSize = fs.Size
-				st.FlowMax = fs.Max
-				st.FlowFallback = fs.Fallbacks
-				st.FlowReclaim = fs.Reclaimed
-				st.FlowPerSlot = fs.PerSlot
+				fillFlowStatus(&st, sess.flow)
 			}
 		}
 		if err := WriteStatus(st); err != nil {

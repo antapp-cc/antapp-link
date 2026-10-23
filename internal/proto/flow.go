@@ -32,7 +32,7 @@ type flowEntry struct {
 
 // recentFlow 是被空闲清扫删掉、但短期内可能还有包回来的映射。
 //
-// 直接删会让下一包重新选槽，内层 TCP 乱序一次。留一个 30 秒的墓碑，同 key 的包
+// 直接删会让下一包重新选槽，内层 TCP 乱序一次。留一个 60 秒的墓碑，同 key 的包
 // 在这段时间内回来就恢复原槽；超过就彻底忘掉。
 type recentFlow struct {
 	slot      int
@@ -47,7 +47,7 @@ const (
 	udpFlowIdle   = 5 * time.Minute
 	sweepInterval = time.Second
 	// recentTTL 是删除后保留原槽的时间窗口；窗口内同 key 的包恢复原槽。
-	recentTTL = 30 * time.Second
+	recentTTL = 60 * time.Second
 	// recentMax 限制墓碑数量，避免大量短连接把内存吃穿。
 	recentMax = 8192
 )
@@ -182,14 +182,21 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 	}
 	// 刚被空闲清扫删掉的流又回来了：恢复原槽，避免这一次换槽乱序。
 	if r, ok := t.recent[key]; ok {
-		if len(t.m) < t.max && now.UnixNano()-r.deletedAt <= int64(recentTTL) &&
+		if now.UnixNano()-r.deletedAt <= int64(recentTTL) &&
 			r.slot > 0 && r.slot < len(t.counts) &&
 			(alive == nil || alive(r.slot)) {
-			t.m[key] = flowEntry{slot: r.slot, lastSeen: now.UnixNano(), proto: r.proto}
-			t.counts[r.slot]++
-			t.addCounts(r.proto, 1)
-			delete(t.recent, key)
-			return r.slot
+			// 表满时先清一次过期项：墓碑恢复不该因为短时间满载而换槽。
+			if len(t.m) >= t.max {
+				t.lastSweep = now.UnixNano()
+				t.sweepLocked(now)
+			}
+			if len(t.m) < t.max {
+				t.m[key] = flowEntry{slot: r.slot, lastSeen: now.UnixNano(), proto: r.proto}
+				t.counts[r.slot]++
+				t.addCounts(r.proto, 1)
+				delete(t.recent, key)
+				return r.slot
+			}
 		}
 		delete(t.recent, key)
 	}
@@ -249,7 +256,14 @@ func (t *FlowTable) sweepLocked(now time.Time) {
 		t.reclaimed++
 		// 墓碑：下一包在近期回来还能恢复原槽，超过窗口就忘掉。
 		if len(t.recent) >= recentMax {
-			t.recent = make(map[flowKey]recentFlow, 256)
+			// 丢一半最老的墓碑，保住另一半；全清会让刚删掉的流全部失去恢复机会。
+			drop := len(t.recent) / 2
+			for k := range t.recent {
+				delete(t.recent, k)
+				if drop--; drop <= 0 {
+					break
+				}
+			}
 		}
 		t.recent[k] = recentFlow{slot: e.slot, deletedAt: now.UnixNano(), proto: e.proto}
 	}
