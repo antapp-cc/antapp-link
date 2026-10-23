@@ -451,6 +451,9 @@ func (a *App) updateSnapshot(s Snapshot) error {
 		a.log.Error("迁移后的网络快照写盘失败，崩溃恢复可能用到旧现场", "err", err)
 		return err
 	}
+	// 迁移提交也是「网络状态变了」：热重铺可能正拿着旧出口排队，代际不前进
+	// 它就发现不了手里的现场已经过期，会把分流铺到已经换掉的网卡上。
+	netEpoch.Add(1)
 	return nil
 }
 
@@ -487,14 +490,24 @@ func (a *App) runningFast() bool {
 	return a.running
 }
 
+// afterHotSnapshot 是「读完现场、还没拿到网络事务锁」这个窗口的注入点。
+// 单测用它把一次出口迁移插进来，验证持锁后不会再用旧出口铺路由；生产为 nil。
+var afterHotSnapshot func()
+
 // hotApplyRouteTable 连接状态下按最新网段表热重铺国内分流。
 func (a *App) hotApplyRouteTable() {
+	// 代际必须在读快照之前取：读完到拿锁之间发生的迁移提交或还原都会让它前进，
+	// 持锁后再比一次就能发现手里这份出口已经过期。
+	epoch := netEpoch.Load()
 	a.mu.Lock()
 	running := a.running
 	gw := a.snapshot.DefaultGateway
 	ifIndex := a.snapshot.DefaultIfIndex
 	table := ActiveCNRoutes()
 	a.mu.Unlock()
+	if afterHotSnapshot != nil {
+		afterHotSnapshot()
+	}
 	if !running || gw == "" || ifIndex == 0 || refreshSplitRoutesHook == nil {
 		return
 	}
@@ -505,10 +518,17 @@ func (a *App) hotApplyRouteTable() {
 		return
 	}
 	defer netTxnMu.Unlock()
+	a.applySplitRoutes(epoch, gw, ifIndex, table)
+}
 
-	// 排队期间网络可能已经被还原过 —— 此时再把分流路由铺回去，用户点了断开
-	// 却发现流量还在走隧道。代际变了就直接放弃。
-	epoch := netEpoch.Load()
+// applySplitRoutes 在持有网络事务锁后做最后一道校验再铺。
+//
+// 代际变了说明排队期间有迁移提交了新出口或还原撤了网络，手里的网关和网卡
+// 不再是当前的 —— 宁可不铺，下一轮会读到新值。
+func (a *App) applySplitRoutes(epoch uint64, gw string, ifIndex int, table []string) {
+	if netEpoch.Load() != epoch {
+		return
+	}
 	if !a.stillRunning() {
 		return
 	}
