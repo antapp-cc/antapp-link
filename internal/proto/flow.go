@@ -75,6 +75,8 @@ type FlowTable struct {
 	udpCount int
 	// recent 是被空闲清扫删掉、短时间内可恢复原槽的映射。
 	recent map[flowKey]recentFlow
+	// recentOrder 按插入顺序记录墓碑 key，用于淘汰最旧的一条；可能含已删除的 key（惰性）。
+	recentOrder []flowKey
 	// clock 是时间源，测试注入用；nil 表示 time.Now。
 	clock func() time.Time
 }
@@ -191,7 +193,9 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 				t.lastSweep = now.UnixNano()
 				t.sweepLocked(now)
 			}
-			if len(t.m) < t.max {
+			// 允许比上限多一条：这一条是恢复的旧流，不是新流；后续新流仍走回退，
+			// 等清扫腾出空间。宁可短暂超限，也不让内层 TCP 在墓碑窗口内换槽。
+			if len(t.m) <= t.max {
 				t.m[key] = flowEntry{slot: r.slot, lastSeen: now.UnixNano(), proto: r.proto}
 				t.counts[r.slot]++
 				t.addCounts(r.proto, 1)
@@ -256,23 +260,35 @@ func (t *FlowTable) sweepLocked(now time.Time) {
 		t.addCounts(e.proto, -1)
 		t.reclaimed++
 		// 墓碑：下一包在近期回来还能恢复原槽，超过窗口就忘掉。
-		if len(t.recent) >= recentMax {
-			// 丢一半墓碑（map 遍历顺序，不保证最老），保住另一半；全清会让刚删掉的
-			// 流全部失去恢复机会。
-			drop := len(t.recent) / 2
-			for k := range t.recent {
-				delete(t.recent, k)
-				if drop--; drop <= 0 {
-					break
-				}
-			}
-		}
-		t.recent[k] = recentFlow{slot: e.slot, deletedAt: now.UnixNano(), proto: e.proto}
+		t.addRecentLocked(k, recentFlow{slot: e.slot, deletedAt: now.UnixNano(), proto: e.proto})
 	}
 	for k, r := range t.recent {
 		if now.UnixNano()-r.deletedAt > int64(recentTTL) {
 			delete(t.recent, k)
 		}
+	}
+}
+
+// addRecentLocked 添加墓碑并按插入顺序淘汰最旧的一条。
+//
+// recentOrder 可能含已经恢复/过期的 key（惰性删除），淘汰时跳过它们。
+func (t *FlowTable) addRecentLocked(k flowKey, r recentFlow) {
+	t.recent[k] = r
+	t.recentOrder = append(t.recentOrder, k)
+	for len(t.recent) >= recentMax && len(t.recentOrder) > 0 {
+		old := t.recentOrder[0]
+		t.recentOrder = t.recentOrder[1:]
+		if _, ok := t.recent[old]; ok {
+			delete(t.recent, old)
+		}
+	}
+	// 大量恢复/过期后 order 会带着已删除的 key 变长，定期重建避免底层数组膨胀。
+	if len(t.recentOrder) > recentMax*2 {
+		rebuilt := make([]flowKey, 0, len(t.recent))
+		for key := range t.recent {
+			rebuilt = append(rebuilt, key)
+		}
+		t.recentOrder = rebuilt
 	}
 }
 

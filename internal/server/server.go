@@ -997,9 +997,7 @@ func (s *Server) reportStatus(ctx context.Context) {
 				st.UDPRxBytes = u.rxBytes.Load()
 				st.UDPTxBytes = u.txBytes.Load()
 			}
-			if sess.flow != nil {
-				fillFlowStatus(&st, sess.flow)
-			}
+			fillFlowStatus(&st, sess.flow)
 		}
 		if err := WriteStatus(st); err != nil {
 			s.log.Debug("写状态文件失败", "err", err)

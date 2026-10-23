@@ -293,3 +293,58 @@ func TestFlowTableRecentRestoresWhenFull(t *testing.T) {
 		t.Fatalf("清扫腾出位置后恢复，Size 应为 2，实际 %d", st.Size)
 	}
 }
+
+// 表里全是活跃流、清扫也腾不出空间时，墓碑仍恢复原槽（表最多超上限一条），
+// 避免换槽；后续新流继续走回退，等清扫腾空间。
+func TestFlowTableRecentRestoresOverFull(t *testing.T) {
+	base := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	ft := NewFlowTable()
+	ft.max = 1
+	ft.clock = func() time.Time { return base }
+	a := buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50000, 443, 0x10)
+	ft.Slot(a, 4, nil) // 表满（max=1）
+
+	c := buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50001, 443, 0x10)
+	ck, _, _, _ := flowKeyMeta(c)
+	ft.mu.Lock()
+	ft.recent[ck] = recentFlow{slot: 2, deletedAt: base.UnixNano(), proto: 6}
+	ft.lastSweep = base.UnixNano() // 节流内，不触发清扫
+	ft.mu.Unlock()
+
+	if got := ft.Slot(c, 4, nil); got != 2 {
+		t.Fatalf("真满时也应恢复原槽 2，实际 %d", got)
+	}
+	if st := ft.Stats(); st.Size != 2 {
+		t.Fatalf("恢复后 Size 应为 2（超上限一条），实际 %d", st.Size)
+	}
+}
+
+// 墓碑满时淘汰最旧的一条，保留新墓碑（不是随机丢一半）。
+func TestFlowTableRecentEvictsOldest(t *testing.T) {
+	ft := NewFlowTable()
+	first := flowKey{len: 1}
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	for i := 0; i < recentMax; i++ {
+		var k flowKey
+		k.b[0] = byte(i)
+		k.b[1] = byte(i >> 8)
+		k.len = 2
+		if i == 0 {
+			first = k
+		}
+		ft.addRecentLocked(k, recentFlow{slot: 1, deletedAt: int64(i + 1), proto: 6})
+	}
+	if got := len(ft.recent); got != recentMax-1 {
+		t.Fatalf("添加 recentMax 条后应淘汰一条，剩 %d 条", got)
+	}
+	extra := flowKey{len: 2}
+	extra.b[0], extra.b[1] = 0xFF, 0xFF
+	ft.addRecentLocked(extra, recentFlow{slot: 2, deletedAt: int64(recentMax + 1), proto: 6})
+	if _, ok := ft.recent[first]; ok {
+		t.Fatal("最旧的墓碑应被淘汰")
+	}
+	if _, ok := ft.recent[extra]; !ok {
+		t.Fatal("最新的墓碑应保留")
+	}
+}
