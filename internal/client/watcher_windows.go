@@ -15,6 +15,26 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
+// 出口探测与网卡查找的注入点：单测里没有第二张可切换的网卡，也没法让本机
+// 默认路由真的变过去，只能伪造一次「出口已变」；同时保证回滚失败的分支
+// 不会真去动另一张网卡。
+var (
+	bestDefaultRouteFn = bestDefaultRoute
+	adapterByIndexFn   = adapterByIndex
+)
+
+func init() {
+	// 撤不干净时把 pending 的现场一并交出去：App 会把它落盘，下次启动自愈
+	// 还能照着清那张网卡。默认实现读不到 watcher 的 pending。
+	revertPendingFn = func(w *sessionWatcher) (Snapshot, error) {
+		err := w.revertPending()
+		if w.pending != nil {
+			return w.pending.snap, err
+		}
+		return Snapshot{}, err
+	}
+}
+
 const (
 	// debounce：网络切换时系统会连续吐出一串事件，等安静下来再对账。
 	debounce = 700 * time.Millisecond
@@ -206,7 +226,7 @@ func (w *sessionWatcher) reconcile() {
 	defer netTxnMu.Unlock()
 
 	tunLUID := w.tunLUID()
-	gw, ifIndex, err := bestDefaultRoute(tunLUID)
+	gw, ifIndex, err := bestDefaultRouteFn(tunLUID)
 	if err != nil || gw.IsUnspecified() {
 		return // 眼下没有出口（断网中），等下次事件
 	}
@@ -227,7 +247,11 @@ func (w *sessionWatcher) reconcile() {
 	// 时很容易撞上。
 	if w.pending != nil && (w.pending.snap.DefaultIfIndex != int(ifIndex) ||
 		w.pending.snap.DefaultGateway != gw.Unmap().String()) {
-		w.revertPending()
+		if _, rerr := revertPendingFn(w); rerr != nil {
+			// 上一笔迁移没撤干净就不要再往新出口迁：残留会摊在两张网卡上，
+			// 现场却只有一份，之后谁也说不清该还原哪一张。
+			return
+		}
 	}
 
 	// 上一次迁移已经把配置改到系统上，只是快照没写进磁盘：这次只补写盘，不重跑迁移。
@@ -238,7 +262,7 @@ func (w *sessionWatcher) reconcile() {
 	if w.pending != nil && w.pending.snap.DefaultIfIndex == int(ifIndex) &&
 		w.pending.snap.DefaultGateway == gw.Unmap().String() {
 		p := w.pending
-		newDef, ok, err := adapterByIndex(ifIndex)
+		newDef, ok, err := adapterByIndexFn(ifIndex)
 		if err != nil || !ok {
 			return
 		}
@@ -292,7 +316,7 @@ func (w *sessionWatcher) reconcile() {
 	// 顺序反了的话（先拆旧的、再抓新的），中途任何一步失败都会留下「旧配置已删、
 	// 新配置没建」的半迁移状态，内存快照和真实系统也对不上。现在抓不到就直接返回，
 	// 用户那条本来能用的隧道一点没被动过。
-	newDef, ok, err := adapterByIndex(ifIndex)
+	newDef, ok, err := adapterByIndexFn(ifIndex)
 	if err != nil || !ok {
 		// 抓不到新网卡也要把旧网卡的 DNS 还原：否则它会一直指着隧道网关，
 		// 用户切回那张网卡时解析全超时（这是迁移失败时唯一还有副作用的残留）。

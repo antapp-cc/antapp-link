@@ -65,6 +65,17 @@ type pendingRestoreState struct {
 	snap     Snapshot
 	cfg      NetConfig
 	noNetCfg bool
+
+	// watch 是还记着一笔未完成迁移的出口守护。App 已经把它从运行状态里摘掉了，
+	// 只有留在这里，下一次断开才能接着把那张网卡上的残留撤干净。
+	watch *sessionWatcher
+}
+
+// revertPendingFn 撤掉 watcher 手里那笔没完成的迁移，并交出那张网卡还没撤干净的
+// 原始现场（App 要落盘给下次启动自愈用）。Windows 上的实现在 watcher_windows.go
+// 的 init 里，它能读到 pending；其它平台没有迁移这回事。
+var revertPendingFn = func(w *sessionWatcher) (Snapshot, error) {
+	return Snapshot{}, w.revertPending()
 }
 
 type Option func(*App)
@@ -751,7 +762,7 @@ func (a *App) Disconnect() error {
 		a.disconnecting = true
 		a.mu.Unlock()
 
-		err := a.restoreNetwork(pending.snap, pending.cfg, pending.noNetCfg)
+		err := a.restorePending(pending)
 		a.mu.Lock()
 		a.disconnecting = false
 		if err == nil {
@@ -770,6 +781,8 @@ func (a *App) Disconnect() error {
 	a.running = false
 	a.mu.Unlock()
 
+	var leftover Snapshot
+	var revertErr error
 	// 先停 watcher：它可能正在把快照迁移到新出口，停完再取才是终态。
 	if watcher != nil {
 		watcher.Stop()
@@ -778,7 +791,7 @@ func (a *App) Disconnect() error {
 		// 停完还要看一眼有没有未完成的迁移：那笔 pending 指向的可能是另一张网卡
 		// （A→B 失败后用户切到 C 又立刻断开），它的隧道 DNS 和云服绕行路由不在
 		// 最终快照里 —— 不在这里清就会一直留在那张网卡上。
-		watcher.revertPending()
+		leftover, revertErr = revertPendingFn(watcher)
 	}
 	a.mu.Lock()
 	snap, cfg, noNetCfg := a.snapshot, a.cfg, a.noNetCfg
@@ -796,21 +809,75 @@ func (a *App) Disconnect() error {
 	}
 
 	restoreErr := a.restoreNetwork(snap, cfg, noNetCfg)
+	err := joinNetworkErrors(restoreErr, revertErr)
+
+	// 主快照已还原干净、但迁移残留没撤掉：磁盘上该留的是那张没撤干净的网卡，
+	// 下次启动自愈才能照着它清。写盘在锁外做，别把界面拖住。
+	if revertErr != nil && restoreErr == nil && leftover.DefaultGateway != "" {
+		if serr := SaveSnapshot(a.statePath, leftover); serr != nil {
+			a.log.Warn("待回滚迁移的现场写盘失败（下次启动可能清不掉那张网卡）", "err", serr)
+		}
+	}
 
 	a.mu.Lock()
 	a.disconnecting = false
-	if restoreErr != nil {
+	if err != nil {
 		// 保留现场：下一次 Disconnect 会拿它重试，而不是当成「已经断开」
-		a.pendingRestore = &pendingRestoreState{snap: snap, cfg: cfg, noNetCfg: noNetCfg}
-		a.lastError = restoreErr.Error()
+		p := &pendingRestoreState{snap: snap, cfg: cfg, noNetCfg: noNetCfg}
+		if revertErr != nil {
+			// 那张网卡上的残留只有这个 watcher 还记得：App 已经把它从运行状态
+			// 摘掉了，不留在待还原里就再也没人去撤。
+			p.watch = watcher
+		}
+		a.pendingRestore = p
+		a.lastError = err.Error()
 	} else {
 		a.pendingRestore = nil
 	}
 	a.mu.Unlock()
-	return restoreErr
+	if err == nil {
+		a.dropStateFile()
+	}
+	return err
 }
 
-// restoreNetwork 把接管过的网络还回去。失败时调用方负责保留现场以便重试。
+// restorePending 把一笔「还欠一次还原」的现场补做完：先撤未完成迁移留在某张
+// 网卡上的残留，再还原主快照。两件都完成才删状态文件 —— 只还原主快照就删的话，
+// 那张网卡上的隧道 DNS 还留在系统里，而 App 已经不再记得它。
+func (a *App) restorePending(p *pendingRestoreState) error {
+	var revertErr error
+	if p.watch != nil {
+		_, revertErr = revertPendingFn(p.watch)
+	}
+	restoreErr := a.restoreNetwork(p.snap, p.cfg, p.noNetCfg)
+	err := joinNetworkErrors(restoreErr, revertErr)
+	if err == nil {
+		a.dropStateFile()
+	}
+	return err
+}
+
+// joinNetworkErrors 合并「主还原」和「迁移回滚」的错误，保持单行文案：
+// 两者都失败时用一句话说清，免得 lastError 在状态栏里折行。
+func joinNetworkErrors(restoreErr, revertErr error) error {
+	if restoreErr == nil {
+		return revertErr
+	}
+	if revertErr == nil {
+		return restoreErr
+	}
+	return fmt.Errorf("%v；另有未完成的出口迁移回滚失败: %w", restoreErr, revertErr)
+}
+
+// dropStateFile 只在网络全部还原完成后调用：文件还在就代表还欠一次还原。
+func (a *App) dropStateFile() {
+	if err := RemoveSnapshot(a.statePath); err != nil {
+		a.log.Warn("删除状态文件失败", "err", err)
+	}
+}
+
+// restoreNetwork 把接管过的网络还回去，但不碰状态文件：文件要等所有待还原
+// 现场都清理完（见 restorePending）才能删。失败时调用方负责保留现场以便重试。
 func (a *App) restoreNetwork(snap Snapshot, cfg NetConfig, noNetCfg bool) error {
 	// 联调模式本来就没动过路由和 DNS，没什么可还原的
 	if noNetCfg {
@@ -826,9 +893,6 @@ func (a *App) restoreNetwork(snap Snapshot, cfg NetConfig, noNetCfg bool) error 
 	if err := snap.Restore(cfg); err != nil {
 		// 留着 state.json：下次启动自愈还会再试一次
 		return fmt.Errorf("还原网络配置失败: %w", err)
-	}
-	if err := RemoveSnapshot(a.statePath); err != nil {
-		a.log.Warn("删除状态文件失败", "err", err)
 	}
 	a.log.Info("已断开")
 	return nil
