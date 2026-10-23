@@ -186,7 +186,8 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 			r.slot > 0 && r.slot < len(t.counts) &&
 			(alive == nil || alive(r.slot)) {
 			// 表满时先清一次过期项：墓碑恢复不该因为短时间满载而换槽。
-			if len(t.m) >= t.max {
+			// 同样受 1 秒节流，避免大量墓碑同时恢复时反复全表扫描。
+			if len(t.m) >= t.max && now.UnixNano()-t.lastSweep > int64(sweepInterval) {
 				t.lastSweep = now.UnixNano()
 				t.sweepLocked(now)
 			}
@@ -256,7 +257,8 @@ func (t *FlowTable) sweepLocked(now time.Time) {
 		t.reclaimed++
 		// 墓碑：下一包在近期回来还能恢复原槽，超过窗口就忘掉。
 		if len(t.recent) >= recentMax {
-			// 丢一半最老的墓碑，保住另一半；全清会让刚删掉的流全部失去恢复机会。
+			// 丢一半墓碑（map 遍历顺序，不保证最老），保住另一半；全清会让刚删掉的
+			// 流全部失去恢复机会。
 			drop := len(t.recent) / 2
 			for k := range t.recent {
 				delete(t.recent, k)

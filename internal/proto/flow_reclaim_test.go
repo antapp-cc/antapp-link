@@ -262,3 +262,34 @@ func TestFlowTableSweepThrottled(t *testing.T) {
 		t.Fatalf("超过 1 秒应清扫过期流：Size=%d Reclaimed=%d", st.Size, st.Reclaimed)
 	}
 }
+
+// 表满时墓碑恢复要先清扫腾空间：sweep 能腾出位置就恢复原槽，不再换槽。
+func TestFlowTableRecentRestoresWhenFull(t *testing.T) {
+	base := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	ft := NewFlowTable()
+	ft.max = 2
+	ft.clock = func() time.Time { return base }
+	a := buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50000, 443, 0x10)
+	b := buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50001, 443, 0x10)
+	ft.Slot(a, 4, nil)
+	ft.Slot(b, 4, nil) // 表满
+
+	// b 设成过期、lastSweep 拨回 2 秒前：恢复 c 时应先清扫掉 b，再腾出位置。
+	c := buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 50002, 443, 0x10)
+	bk, _, _, _ := flowKeyMeta(b)
+	ck, _, _, _ := flowKeyMeta(c)
+	ft.mu.Lock()
+	be := ft.m[bk]
+	be.lastSeen = base.Add(-tcpFlowIdle - time.Second).UnixNano()
+	ft.m[bk] = be
+	ft.recent[ck] = recentFlow{slot: 1, deletedAt: base.UnixNano(), proto: 6}
+	ft.lastSweep = base.Add(-2 * time.Second).UnixNano()
+	ft.mu.Unlock()
+
+	if got := ft.Slot(c, 4, nil); got != 1 {
+		t.Fatalf("墓碑应恢复到原槽 1，实际 %d", got)
+	}
+	if st := ft.Stats(); st.Size != 2 {
+		t.Fatalf("清扫腾出位置后恢复，Size 应为 2，实际 %d", st.Size)
+	}
+}
