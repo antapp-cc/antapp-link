@@ -36,38 +36,42 @@ func Apply(newExePath string) error {
 	if err != nil {
 		return fmt.Errorf("取当前程序路径: %w", err)
 	}
+	return apply(self, newExePath)
+}
+
+// apply 是 Apply 里不依赖「当前进程是谁」的那部分：测试可以拿临时文件当程序路径，
+// 不必真的去改名正在运行的测试二进制。
+func apply(self, newExePath string) error {
 	recordLifecycle(LifecycleEvent{
 		Event:  EventUpdateStart,
 		Detail: fmt.Sprintf("替换 %s", self),
 	})
 
-	// 交接状态建不起来也照常更新：它只影响「能否确认新版真的起来了」，
-	// 没有它时退回原行为（调用方退出，由用户或下一次启动兜底）。
-	handoff, handoffErr := NewHandoff(applyHandoffDir(), "", "", applyWaitReady)
-	if handoffErr != nil {
-		recordLifecycle(LifecycleEvent{Event: EventUpdateFailed, Detail: "写交接状态失败，跳过就绪确认", Err: handoffErr.Error()})
+	// 交接状态建不起来就中止更新：没有它，旧进程无法确认新版是否真的接手，
+	// 只能退回「Start() 成功即成功」—— 那正是这一轮要消灭的行为。临时目录不可写、
+	// 空间不足都会走到这里；宁可这次不更新，也不能让旧版在无法确认的情况下退出。
+	handoff, err := NewHandoff(applyHandoffDir(), "", "", applyWaitReady)
+	if err != nil {
+		recordLifecycle(LifecycleEvent{
+			Event:  EventUpdateFailed,
+			Detail: "无法建立更新交接状态，已中止更新",
+			Err:    err.Error(),
+		})
+		return fmt.Errorf("无法建立更新交接状态，已中止更新（旧版继续运行）: %w", err)
 	}
 
 	err = swapExe(self, newExePath, func(p string) error {
 		cmd := exec.Command(p)
-		if handoffErr == nil {
-			cmd.Env = append(os.Environ(),
-				handoffDirEnv+"="+applyHandoffDir(),
-				handoffInvocationEnv+"="+handoff.InvocationID)
-		}
+		cmd.Env = append(os.Environ(),
+			handoffDirEnv+"="+applyHandoffDir(),
+			handoffInvocationEnv+"="+handoff.InvocationID)
 		return cmd.Start()
 	})
 	if err != nil {
-		if handoffErr == nil {
-			_ = FailHandoff(applyHandoffDir(), handoff.InvocationID, err)
-		}
+		_ = FailHandoff(applyHandoffDir(), handoff.InvocationID, err)
 		return err
 	}
 	recordLifecycle(LifecycleEvent{Event: EventUpdateLaunched, Detail: "新版进程已创建"})
-
-	if handoffErr != nil {
-		return nil
-	}
 
 	// 旧进程此刻还握着单实例互斥体，而新版要拿到它才写 ready。等待之前必须先让出去，
 	// 否则新版卡在单实例闸门、旧进程卡在这里，两边一起超时 —— 这不是保守，是死锁。

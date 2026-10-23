@@ -83,6 +83,45 @@ func TestCleanupOldWaitsForHealthyUptime(t *testing.T) {
 	}
 }
 
+// 交接状态建不起来（临时目录不可写 / 空间不足）时必须中止更新：旧版继续运行，
+// 程序文件一个字节都不动。否则旧版只能退回「Start() 成功即成功」，正是这轮要
+// 消灭的行为。
+func TestApplyAbortsWhenHandoffCannotBeCreated(t *testing.T) {
+	stubLifecycle(t)
+	dir := t.TempDir()
+	self := filepath.Join(dir, "app.exe")
+	newExe := filepath.Join(dir, "app.exe.new")
+	if err := os.WriteFile(self, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newExe, []byte("new"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// 把系统临时目录指到一个普通文件上：交接目录必然建不出来，等价于磁盘不可写，
+	// 又不用真的把机器上的临时目录弄坏。必须在 t.TempDir() 之后再改。
+	blocker := filepath.Join(dir, "tmp-is-a-file")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMP", blocker)
+	t.Setenv("TEMP", blocker)
+
+	err := apply(self, newExe)
+	if err == nil {
+		t.Fatal("交接状态建不起来时必须报错，不能照常替换程序")
+	}
+	if !strings.Contains(err.Error(), "交接状态") {
+		t.Errorf("错误应说明是交接状态建不起来，实际: %v", err)
+	}
+	if got, rerr := os.ReadFile(self); rerr != nil || string(got) != "old" {
+		t.Errorf("中止更新时程序文件必须保持旧版，实际 %q (err=%v)", got, rerr)
+	}
+	if _, serr := os.Stat(self + ".old"); !os.IsNotExist(serr) {
+		t.Errorf("中止更新时不该改名程序文件，.old 实际 err=%v", serr)
+	}
+}
+
 func TestSwapExeSucceeds(t *testing.T) {
 	dir := t.TempDir()
 	self := filepath.Join(dir, "app.exe")
