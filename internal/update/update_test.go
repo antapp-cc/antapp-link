@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -248,5 +250,57 @@ func TestDownloadRejectsHTTPError(t *testing.T) {
 	m := &Manifest{Version: "1.0.0", Client: Asset{URL: srv.URL, SHA256: strings.Repeat("ab", 32)}}
 	if _, err := c.Download(context.Background(), m, t.TempDir(), nil); err == nil {
 		t.Error("HTTP 404 时必须报错")
+	}
+}
+
+// 自动与手动更新可能同时下载同一个目标名：每次下载写独立临时文件、落盘重算、
+// 原子改名，两条路径都不该留下坏文件或互相截断。
+func TestDownloadConcurrentSameTarget(t *testing.T) {
+	payload := []byte("concurrent update payload")
+	sum := sha256.Sum256(payload)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // 两个请求都到齐后再一起返回，放大交错窗口
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	c := &Checker{HTTP: srv.Client()}
+	m := &Manifest{Version: "1.0.0", Client: Asset{
+		URL: srv.URL, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(payload)),
+	}}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := c.Download(context.Background(), m, dir, nil)
+			errs <- err
+		}()
+	}
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("并发下载失败: %v", err)
+		}
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "antapp-link.exe.new"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, payload) {
+		t.Error("最终文件内容不完整")
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".part") {
+			t.Errorf("残留临时文件: %s", e.Name())
+		}
 	}
 }

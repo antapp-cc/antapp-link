@@ -79,8 +79,12 @@ type UI struct {
 	trayConnected bool
 	wasOnline     bool
 	hideAt        time.Time
-	logSeq        uint64
-	done          chan struct{}
+
+	// updateBusy 是自动更新与手动更新的 single-flight 门禁：两条路径都会下载并应用
+	// 同一个待更新文件，并发进入会互相截断/覆盖，门禁覆盖下载到退出整段流程。
+	updateBusy atomic.Bool
+	logSeq     uint64
+	done       chan struct{}
 	// wantConnected 记录用户是否期望连接。点「断开连接」后置 false，自动重连守护据此
 	// 收手 —— 否则修好「连上又掉没人管」之后会变成「用户点了断开它又自己连回来」。
 	wantConnected atomic.Bool
@@ -1149,6 +1153,10 @@ func (u *UI) askUpdate() {
 	if m == nil {
 		return
 	}
+	if !u.beginUpdate() {
+		walk.MsgBox(u.mw, "正在更新", "另一个更新流程正在进行，请稍候再试。", walk.MsgBoxIconInformation)
+		return
+	}
 	notes := strings.TrimSpace(m.Notes)
 	if notes != "" {
 		notes = "\n\n更新说明：\n" + truncateRunes(notes, 300)
@@ -1158,11 +1166,13 @@ func (u *UI) askUpdate() {
 			"下载并更新吗？更新会先断开连接、还原网络，随后自动重启。",
 			Version, m.Version, notes),
 		walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
+		u.endUpdate()
 		return
 	}
 
 	u.btnUpdate.SetEnabled(false)
 	go func() {
+		defer u.endUpdate()
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 		defer cancel()
 
@@ -1187,9 +1197,20 @@ func (u *UI) askUpdate() {
 	}()
 }
 
+// beginUpdate 申请更新门禁：自动与手动更新共用，同一时刻只允许一条流程。
+// 门禁覆盖「下载 → 应用 → 退出」整段，不能只锁下载。
+func (u *UI) beginUpdate() bool { return u.updateBusy.CompareAndSwap(false, true) }
+
+func (u *UI) endUpdate() { u.updateBusy.Store(false) }
+
 // autoApplyUpdate 静默自动更新：下载 → 校验 → 应用重启，全程无交互。
 // 失败只记日志，界面按钮保留供手动重试。
 func (u *UI) autoApplyUpdate(m *update.Manifest) {
+	if !u.beginUpdate() {
+		u.app.Log().Info("已有更新流程在进行，跳过本次自动更新")
+		return
+	}
+	defer u.endUpdate()
 	u.app.Log().Info(fmt.Sprintf("检测到新版本 %s，开始自动更新", m.Version))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()

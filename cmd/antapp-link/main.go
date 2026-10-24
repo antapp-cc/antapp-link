@@ -262,6 +262,8 @@ func run() int {
 	go func() {
 		time.Sleep(2 * time.Minute)
 		_ = update.MarkHealthy(client.Version)
+		// 健康版本不再需要回滚副本：留着只会让后续启动误判。
+		update.CleanupOldAfterHealthy()
 	}()
 	if err := client.RunUI(app, logs, dataDir); err != nil {
 		logger.Error("界面启动失败", "err", err)

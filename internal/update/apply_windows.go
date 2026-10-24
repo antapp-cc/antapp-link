@@ -216,6 +216,12 @@ func RollbackIfUnhealthyUpdate(self, currentVersion string) (bool, error) {
 	if _, err := os.Stat(old); err != nil {
 		return false, nil // 没有回滚副本
 	}
+	// 这个版本已经确认过健康：.old 只是还没清理的备份，不能因为后续两次启动
+	// 异常就把它当崩溃版回滚掉。
+	if healthyMarkedVersion() == currentVersion {
+		clearStartupMark()
+		return false, nil
+	}
 
 	count := 1
 	if prev, ok := readStartupMark(); ok && prev.Version == currentVersion {
@@ -224,11 +230,20 @@ func RollbackIfUnhealthyUpdate(self, currentVersion string) (bool, error) {
 		}
 	}
 	// 先记下「本次启动正在进行、尚未确认健康」。MarkHealthy 会清掉它。
-	writeStartupMark(startupMark{Version: currentVersion, Count: count, At: time.Now().Format(time.RFC3339)})
+	//
+	// 写失败必须 fail-closed：没有可靠的启动计数，崩溃版永远不会被认出来，
+	// 用户会一直对着一个每次启动都崩的版本。恢复旧版比继续跑更安全。
+	if err := writeStartupMark(startupMark{Version: currentVersion, Count: count, At: time.Now().Format(time.RFC3339)}); err != nil {
+		return rollbackToOld(self, old, currentVersion, "启动状态无法持久化，已恢复旧版: "+err.Error())
+	}
 	if count < 2 {
 		return false, nil // 更新后的第一次启动：给新版机会
 	}
+	return rollbackToOld(self, old, currentVersion, "同一版本连续两次启动都未确认健康，已恢复旧版")
+}
 
+// rollbackToOld 把磁盘恢复成 .old，并记录失败版本、清启动标记。
+func rollbackToOld(self, old, currentVersion, reason string) (bool, error) {
 	failed := self + ".failed"
 	_ = os.Remove(failed)
 	if err := os.Rename(self, failed); err != nil {
@@ -244,7 +259,7 @@ func RollbackIfUnhealthyUpdate(self, currentVersion string) (bool, error) {
 	recordLifecycle(LifecycleEvent{
 		Event:   EventRollback,
 		Version: currentVersion,
-		Detail:  "同一版本连续两次启动都未确认健康，已恢复旧版",
+		Detail:  reason,
 	})
 	return true, nil
 }

@@ -51,16 +51,35 @@ func readStartupMark() (startupMark, bool) {
 	return m, true
 }
 
-func writeStartupMark(m startupMark) {
+func writeStartupMark(m startupMark) error {
 	path := startupMarkPathFn()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return
+		return err
 	}
 	raw, err := json.Marshal(m)
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(path, append(raw, '\n'), 0o600)
+	// 同目录临时文件 + Sync + 原子改名：进程崩溃或断电时不能留下半截 JSON，
+	// 否则下次启动读不到计数，回滚永远不会触发。
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".startup-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(append(raw, '\n')); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func clearStartupMark() { _ = os.Remove(startupMarkPathFn()) }

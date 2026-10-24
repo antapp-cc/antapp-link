@@ -565,3 +565,55 @@ func TestRollbackIfUnhealthyUpdateIgnoresStaleStartupMark(t *testing.T) {
 		t.Fatalf("过期启动标记不该触发回滚: rolled=%v err=%v", rolled, err)
 	}
 }
+
+// 已确认健康的版本即使 .old 还在，也不该因为后续两次启动异常被回滚。
+func TestRollbackIfUnhealthyUpdateKeepsHealthyVersion(t *testing.T) {
+	stubLifecycle(t)
+	stubRolloutPaths(t)
+	self := filepath.Join(t.TempDir(), "app.exe")
+	writeFakeExePair(t, self)
+
+	if err := MarkHealthy("0.5.0"); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟「健康过、但随后两次启动都异常退出」留下的启动标记。
+	writeStartupMark(startupMark{Version: "0.5.0", Count: 1, At: time.Now().Format(time.RFC3339)})
+	rolled, err := RollbackIfUnhealthyUpdate(self, "0.5.0")
+	if err != nil || rolled {
+		t.Fatalf("已确认健康的版本不该回滚: rolled=%v err=%v", rolled, err)
+	}
+	if got, _ := os.ReadFile(self); string(got) != "new" {
+		t.Errorf("健康版本不该被改动，实际 %q", got)
+	}
+}
+
+// 启动标记写不进去时必须 fail-closed：恢复旧版，而不是让崩溃版静默继续跑。
+func TestRollbackIfUnhealthyUpdateFailsClosedWhenStartupMarkUnwritable(t *testing.T) {
+	stubLifecycle(t)
+	stubRolloutPaths(t)
+	self := filepath.Join(t.TempDir(), "app.exe")
+	writeFakeExePair(t, self)
+
+	// 把启动标记指到一个「父路径是文件」的位置，MkdirAll 必定失败。
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prev := startupMarkPathFn
+	startupMarkPathFn = func() string { return filepath.Join(blocker, "update-starting") }
+	t.Cleanup(func() { startupMarkPathFn = prev })
+
+	rolled, err := RollbackIfUnhealthyUpdate(self, "0.5.0")
+	if err != nil {
+		t.Fatalf("fail-closed 回滚不应报错: %v", err)
+	}
+	if !rolled {
+		t.Fatal("启动标记无法持久化时应恢复旧版")
+	}
+	if got, _ := os.ReadFile(self); string(got) != "old" {
+		t.Errorf("应恢复成旧版，实际 %q", got)
+	}
+	if got := FailedVersion(); got != "0.5.0" {
+		t.Errorf("应记录失败版本，实际 %q", got)
+	}
+}

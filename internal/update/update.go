@@ -270,16 +270,18 @@ func (c *Checker) DownloadAsset(ctx context.Context, a Asset, dir, name string,
 	}
 
 	target := filepath.Join(dir, name)
-	f, err := os.Create(target)
+	// 每次下载写自己的临时文件：自动与手动更新可能并发，固定目标名会互相截断。
+	tmp, err := os.CreateTemp(dir, "."+name+".*.part")
 	if err != nil {
 		return "", err
 	}
+	tmpName := tmp.Name()
 
 	ok := false
 	defer func() {
-		_ = f.Close()
+		_ = tmp.Close()
 		if !ok {
-			_ = os.Remove(target)
+			_ = os.Remove(tmpName)
 		}
 	}()
 
@@ -288,7 +290,6 @@ func (c *Checker) DownloadAsset(ctx context.Context, a Asset, dir, name string,
 		total = a.Size
 	}
 
-	digest := sha256.New()
 	var done int64
 	buf := make([]byte, 64<<10)
 	for {
@@ -298,10 +299,9 @@ func (c *Checker) DownloadAsset(ctx context.Context, a Asset, dir, name string,
 			if done > exeLimit {
 				return "", fmt.Errorf("更新包超过 %d MB，拒绝继续", exeLimit>>20)
 			}
-			if _, werr := f.Write(buf[:n]); werr != nil {
+			if _, werr := tmp.Write(buf[:n]); werr != nil {
 				return "", werr
 			}
-			digest.Write(buf[:n])
 			if progress != nil {
 				progress(done, total)
 			}
@@ -313,17 +313,50 @@ func (c *Checker) DownloadAsset(ctx context.Context, a Asset, dir, name string,
 			return "", rerr
 		}
 	}
-	if err := f.Close(); err != nil {
+	// 先落盘再校验：SHA-256 必须对最终写入磁盘的字节算，而不是对 HTTP 流 ——
+	// 流校验挡不住写入时的磁盘错误/安全软件改写，也挡不住并发写同一个文件。
+	if err := tmp.Sync(); err != nil {
 		return "", err
 	}
-
-	got := hex.EncodeToString(digest.Sum(nil))
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	got, err := fileSHA256(tmpName)
+	if err != nil {
+		return "", err
+	}
 	if !strings.EqualFold(got, a.SHA256) {
 		return "", fmt.Errorf("sha256 不匹配（清单 %s，实际 %s…），更新包损坏或被替换过",
-			shortHash(a.SHA256), got[:12])
+			shortHash(a.SHA256), shortHash(got))
+	}
+	// 并发下载同一资产时，另一个流程可能已经原子落好文件：内容一致就直接复用。
+	// Windows 上 rename 覆盖被占用的目标会失败，单靠 rename 会把并发下载变成报错。
+	if existing, eerr := fileSHA256(target); eerr == nil && strings.EqualFold(existing, a.SHA256) {
+		return target, nil
+	}
+	// 原子改名：应用阶段看到的永远是完整文件，不会读到半截下载。
+	if err := os.Rename(tmpName, target); err != nil {
+		if existing, eerr := fileSHA256(target); eerr == nil && strings.EqualFold(existing, a.SHA256) {
+			return target, nil
+		}
+		return "", err
 	}
 	ok = true
 	return target, nil
+}
+
+// fileSHA256 对落盘文件重算摘要。下载校验以它为准，而不是边下载边算的流摘要。
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // shortHash 截前 12 位给日志用。清单字段可能残缺（Validate 已经挡了一道，这里是最后
