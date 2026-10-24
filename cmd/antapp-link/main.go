@@ -34,8 +34,10 @@ func waitHealthyThenCleanup(app *client.App) {
 	deadline := time.Now().Add(cleanupHealthyWait)
 	for time.Now().Before(deadline) {
 		if app.Status().Online {
-			_ = update.MarkHealthy(client.Version)
-			update.CleanupOldAfterHealthy()
+			// 标记写不进去就保留 .old：没有健康证明的版本还得靠它兜底回滚。
+			if err := update.MarkHealthy(client.Version); err == nil {
+				update.CleanupOldAfterHealthy()
+			}
 			return
 		}
 		time.Sleep(time.Second)
@@ -267,9 +269,10 @@ func run() int {
 	// 下次启动把新版回滚掉。
 	go func() {
 		time.Sleep(2 * time.Minute)
-		_ = update.MarkHealthy(client.Version)
-		// 健康版本不再需要回滚副本：留着只会让后续启动误判。
-		update.CleanupOldAfterHealthy()
+		// 标记写不进去就保留 .old：没有健康证明的版本还得靠它兜底回滚。
+		if err := update.MarkHealthy(client.Version); err == nil {
+			update.CleanupOldAfterHealthy()
+		}
 	}()
 	if err := client.RunUI(app, logs, dataDir); err != nil {
 		logger.Error("界面启动失败", "err", err)
@@ -278,7 +281,9 @@ func run() int {
 		return 1
 	}
 	// 用户正常关闭：新版至少成功运行到主动退出，标记健康，下次启动不回滚。
-	_ = update.MarkHealthy(client.Version)
+	if err := update.MarkHealthy(client.Version); err == nil {
+		update.CleanupOldAfterHealthy()
+	}
 	return 0
 }
 
