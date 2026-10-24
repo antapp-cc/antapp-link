@@ -111,3 +111,44 @@ func TestTakeOverKeepsRetryStateWhenRollbackAlsoFails(t *testing.T) {
 		t.Fatal("还欠还原时状态文件必须保留")
 	}
 }
+
+// Apply 中途失败、Restore 也失败：同样要登记内存待还原现场。
+//
+// 只保留磁盘上的旧快照不够 —— 下一次 Connect 会先 Capture 当前半接管现场再
+// SaveSnapshot，把「重启自愈」唯一的原始依据覆盖掉。这条和账本写盘失败走的是
+// 同一个恢复契约，不能一个登记、一个不登记。
+func TestTakeOverKeepsRetryStateWhenApplyAndRollbackFail(t *testing.T) {
+	a := NewApp(testInvite(t), t.TempDir(), nil)
+	snap := testSnapshot()
+	if err := SaveSnapshot(a.statePath, snap); err != nil {
+		t.Fatalf("准备状态文件: %v", err)
+	}
+
+	apply := func(s *Snapshot, _ NetConfig) error {
+		// Apply 可能已经改了一半才失败（比如分流账本已填好）
+		s.Split = testSplitLedger()
+		return errors.New("注入：Apply 中途失败")
+	}
+	restore := func(Snapshot, NetConfig) error { return errors.New("注入：还原失败") }
+
+	err := a.takeOver(&snap, testNetConfig(), a.statePath, apply, SaveSnapshot, restore)
+	if err == nil {
+		t.Fatal("Apply 与还原都失败时必须报错")
+	}
+
+	p := a.pendingRestore
+	if p == nil {
+		t.Fatal("Apply 失败且还原失败时也必须登记待还原现场")
+	}
+	if p.snap.Split == nil {
+		t.Error("待还原现场要带 Apply 已写入的分流账本")
+	}
+	// 磁盘上也要补写 Apply 后的所有权：重启自愈据此精确清理，而不是退回形态扫描。
+	got, exists, lerr := LoadSnapshot(a.statePath)
+	if lerr != nil || !exists {
+		t.Fatalf("还欠还原时状态文件必须保留: exists=%v err=%v", exists, lerr)
+	}
+	if got.Split == nil {
+		t.Error("磁盘现场要带 Apply 已写入的分流账本（否则重启自愈会退回形态扫描）")
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -389,8 +390,18 @@ func (a *App) takeOver(snap *Snapshot, cfg NetConfig, statePath string,
 		// 网络已经改了一半，立刻还原，别把用户留在半截状态
 		restoreErr := restore(*snap, cfg)
 		if restoreErr != nil {
-			// 还原也没成功：留住状态文件让下次启动接着自愈。删掉它等于把唯一的
-			// 线索也丢了，用户就只能手动改 DNS —— 与 Disconnect 的处理保持一致。
+			// 还原也没成功：现场是「半接管」，必须和账本写盘失败走同一条契约，
+			// 登记内存待还原 —— 否则下一次 Connect 会先 Capture 半接管现场再
+			// SaveSnapshot，把磁盘上正确的恢复依据覆盖掉。
+			// 状态文件也保留：下次启动自愈还能照着它恢复。
+			a.mu.Lock()
+			a.pendingRestore = &pendingRestoreState{snap: *snap, cfg: cfg}
+			a.mu.Unlock()
+			// 尽力把 Apply 已经生效的所有权（Split）写盘：重启自愈拿着它才能精确
+			// 清掉自己写进去的路由；写不进去就退回形态扫描，内存现场不受影响。
+			if serr := save(statePath, *snap); serr != nil {
+				a.log.Warn("接管失败后的现场写盘失败（重启自愈将退回形态扫描）", "err", serr)
+			}
 			return fmt.Errorf("接管网络失败，且还原未完全成功（状态文件已保留，下次启动会重试）: %v / %w",
 				restoreErr, err)
 		}
@@ -449,6 +460,13 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 			a.log.Warn("隧道循环退出", connLogAttrs(err, nil)...)
 		}
 	}()
+	// 定期重建的当前取值必须进日志：验证期正是靠它关掉兜底的，事后翻日志要能
+	// 确认这次跑的是「关了兜底」的版本，而不是环境变量没设上。
+	if recycleEvery > 0 {
+		a.log.Info("定期重建连接已启用", "every", recycleEvery.String())
+	} else {
+		a.log.Info("定期重建连接已关闭（ANTAPP_RECYCLE 可开启）")
+	}
 	// 定期把运行状态写进日志，给「用着用着没网」留现场。
 	//
 	// 这类故障（20G 上下、不固定阈值）通常是某类资源随流量累积：goroutine 泄漏、
@@ -477,6 +495,8 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 	}
 
 	go a.watchHealth(ctx)
+	// 连接建立后还要一直盯着：一次性自检管不到「用着用着才坏」的那一类
+	go a.watchHealthLoop(ctx)
 	return nil
 }
 
@@ -724,6 +744,100 @@ func (a *App) watchHealth(ctx context.Context) {
 	}
 }
 
+// 长期运行时的出网自检参数。用 var 而不是 const：测试要把节奏压到毫秒级。
+var (
+	// healthProbeInterval 是自检间隔。
+	//
+	// 10 分钟足够短：真失效时最晚半小时内就会重建；又足够长，不会让一条跨境链路
+	// 的抖动误判成故障（自检本身要占隧道带宽，Pi 节点上行常态是满的）。
+	healthProbeInterval = 10 * time.Minute
+	// healthProbeFailLimit 是连续失败多少次才动手。
+	//
+	// 3 次 = 30 分钟：DNS 中继偶尔抽一下、链路丢包连续丢两轮都可能，不值得为此
+	// 断一次网；连续三轮都失败才说明数据面真的不动了。
+	healthProbeFailLimit = 3
+	// healthProbeTimeout 是周期自检的外层预算。healthCheck 自己还有更紧的
+	// healthCheckBudget（55 秒）封顶，这里只是给 ctx 兜底，防止某层实现卡死。
+	healthProbeTimeout = 90 * time.Second
+
+	// healthProbe 抽成变量只为测试注入。
+	healthProbe = func(a *App, ctx context.Context) error { return a.healthCheck(ctx) }
+	// healthRebuildHook 是测试注入点；生产为 nil，走下面的完整重建。
+	healthRebuildHook func(*App)
+)
+
+// healthRebuild 是连续自检失败后的动作：断开再连，和用户手动点一次「断开/连接」相同。
+// 不直接关隧道而走 App 的完整流程，是为了把路由、DNS、网卡一起重建 ——
+// 这些恰恰是「隧道显示已连接却上不了网」最常见的坏掉的一层。
+//
+// 写成函数而不是包级变量：var 初始化会引用 Connect，而 Connect 的方法链又会回到
+// watchHealthLoop，Go 会判成初始化循环。
+func healthRebuild(a *App) error {
+	if healthRebuildHook != nil {
+		healthRebuildHook(a)
+		return nil
+	}
+	return rebuildTunnel(a.Disconnect, a.Connect)
+}
+
+// rebuildTunnel 先断开再连接。断开失败（网络没还原干净）时不再 Connect：
+// Connect 在待还原状态下会被拒绝，而且它之前的 Capture 会把半接管现场写盘、
+// 覆盖待恢复依据。抽成函数只为让这条规则可单测。
+func rebuildTunnel(disconnect, connect func() error) error {
+	if err := disconnect(); err != nil {
+		return fmt.Errorf("重建前断开失败（网络未还原，等重试恢复）: %w", err)
+	}
+	return connect()
+}
+
+// watchHealthLoop 在长期运行中周期性确认「真的还能出去」。
+//
+// watchHealth 只在连接建立时跑一次。之后如果系统路由/DNS 被外力改掉，或者数据面
+// 悄悄失效（成员槽半死、服务端转发卡住），面板会一直显示已连接，等到用户发现
+// 「用着用着没网」时，日志里没有任何对应的一刻，只能靠 12 小时定期重建兜着。
+//
+// 这里每 10 分钟做一次真实的端到端探测（隧道内 TCP + 隧道 DNS + 经隧道出口的
+// 公网 HTTP），失败写进日志；连续 3 次失败才主动重建，避免链路抖动被当成故障。
+func (a *App) watchHealthLoop(ctx context.Context) {
+	ticker := time.NewTicker(healthProbeInterval)
+	defer ticker.Stop()
+	fails := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		pctx, cancel := context.WithTimeout(ctx, healthProbeTimeout)
+		err := healthProbe(a, pctx)
+		cancel()
+		if err == nil {
+			if fails > 0 {
+				a.log.Info("出网自检恢复正常", "before_fails", fails)
+			}
+			fails = 0
+			continue
+		}
+		fails++
+		if fails < healthProbeFailLimit {
+			// 带原因：只报「自检失败」的话，下次看日志分不清是隧道内不通还是 DNS 坏了。
+			a.log.Warn("出网自检失败（数据面可能已失效）",
+				append([]any{"fails", fails}, connLogAttrs(err, nil)...)...)
+			continue
+		}
+		a.log.Warn(fmt.Sprintf("出网自检连续 %d 次失败，主动重建连接", fails),
+			connLogAttrs(err, nil)...)
+		fails = 0
+		if rerr := healthRebuild(a); rerr != nil {
+			a.log.Warn("主动重建未完成，交给自动重连守护接着处理",
+				connLogAttrs(rerr, nil)...)
+		}
+	}
+}
+
 // probeServer 只做一次 TLS 握手，用来确认「服务端可达且证书可信」。
 //
 // 它存在的意义是保住顺序：连不上服务端时，一点都不要碰用户的网络。
@@ -758,37 +872,104 @@ func (a *App) probeServer(inv pki.Invite, ctx context.Context) error {
 	return nil
 }
 
-// healthCheck 探两件事：隧道内通不通，以及下发的 DNS 能不能真的解析。
+// 健康自检的三层探针。抽成变量只为测试注入：真实实现分别走隧道、DNS、公网 HTTP。
+var (
+	controlProbe = func(ctx context.Context, addr string, timeout time.Duration) error {
+		return probeTCP(ctx, addr, timeout)
+	}
+	dnsProbe    = probeTunnelDNS
+	publicProbe = probePublicHTTP
+)
+
+// probeDomains 是 DNS 自检的域名。两个而不是一个：单个域名被过滤/故障时不该
+// 把一条好隧道判成坏。
+var probeDomains = []string{"www.baidu.com", "www.qq.com"}
+
+// healthCheckBudget 是单次三层自检的总预算。
 //
-// 调用方须保证此刻隧道仍在运行；读 a.inv 是安全的（不持锁读单个字段，
-// 而 inv 只会被 UpdateInvite 换掉，换的时候会先断开）。
+// 必须小于 watchHealth 的 60 秒：连接建立时那次自检如果拖过 60 秒，用户点完
+// 连接要等一分多钟才看到失败。层内超时各自生效，这个只做总封顶。
+var healthCheckBudget = 55 * time.Second
+
+// publicProbeURLs 是公网数据面自检的目标。任一收到响应即算通过 —— 目标本身
+// 返回 3xx 也算，这一层只证明「业务包出得去、回得来」。
+//
+// 必须是「一定走隧道」的境外目标。客户端装了国内分流（国内网段直连、其余走隧道），
+// 探测目标如果解析到国内 IP 就会绕过隧道、直接走本地宽带 —— 那样隧道数据面坏了
+// 这一层照样通过，等于没测。1.1.1.1 是固定境外 IP，不会命中分流表，证书也带 IP SAN；
+// google 作为域名兜底，解析结果同样在境外。
+var publicProbeURLs = []string{"https://1.1.1.1/", "https://www.google.com/"}
+
+// publicProbeClient 走隧道直连，显式关掉系统代理：探测的是隧道出口，
+// 不能被 HTTP_PROXY 之类劫到别的路径上；也不复用连接，避免把探测连接挂在池里。
+var publicProbeClient = &http.Client{
+	Timeout: 12 * time.Second,
+	Transport: &http.Transport{
+		Proxy:             nil,
+		DisableKeepAlives: true,
+	},
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
+// healthCheck 分三层验证「真的还能出去」：
+//
+//  1. 控制面：隧道内服务端监听端口可达。走隧道，不经过服务端 NAT。
+//  2. DNS：下发的 DNS 能解析。
+//  3. 数据面：经隧道出口做一次真实 HTTP 请求能拿到响应。
+//
+// 前两层都过、第三层失败是真实存在的故障形态：服务端 NAT 规则没了、上游路由
+// 断了，但隧道内端口和 dnsmasq 还好好的 —— 那时界面显示在线，用户却打不开网页。
+// 调用方须保证此刻隧道仍在运行；读 a.inv 是安全的（inv 只在断开时换）。
 func (a *App) healthCheck(ctx context.Context) error {
+	// 总预算封顶：三层各自有超时，叠起来最坏能到 87 秒，必须压在连接自检的
+	// 60 秒预算之内，否则用户点完连接要等一分多钟才看到失败。
+	hctx, cancel := context.WithTimeout(ctx, healthCheckBudget)
+	defer cancel()
+
 	a.mu.Lock()
 	inv := a.inv
+	cfgDNS := append([]string(nil), a.cfg.DNS...)
 	a.mu.Unlock()
 
-	// 第一级：连服务端在隧道里的监听地址 —— 这条一定走隧道，不受出口影响
-	// 这里的超时按跨境链路的实际成本给：隧道内 RTT 就是链路 RTT（晚高峰 250ms 且会重传），
-	// 原来给的 5 秒只够 SYN 重传两次，一旦赶上就要误判成「出网自检失败」—— 而那条路的代价
-	// 是把好好的隧道断掉、再还原用户网络。宁宽勿紧。
+	// 第一级超时按跨境链路的实际成本给：隧道内 RTT 就是链路 RTT（晚高峰 250ms
+	// 且会重传），5 秒只够 SYN 重传两次，一旦赶上就要误判成「出网自检失败」——
+	// 而那条路的代价是把好好的隧道断掉、再还原用户网络。宁宽勿紧。
 	tunnelAddr := net.JoinHostPort(inv.Gateway, tunnelPortOf(inv))
-	if err := probeTCP(ctx, tunnelAddr, 15*time.Second); err != nil {
+	if err := controlProbe(hctx, tunnelAddr, 15*time.Second); err != nil {
 		return fmt.Errorf("隧道内不通（%s）：%s", tunnelAddr, humanReason(err))
 	}
 
-	// 第二级：用下发的 DNS 真解析一次。这正是整套方案存在的理由 ——
-	// DNS 查不通，用户看到的就是「连上了但网页打不开」。
-	//
-	// 多 DNS × 多域名：只试第一个 DNS + 固定 www.baidu.com 时，单个 DNS 短暂不可用
-	// 或那个域名恰好被过滤，就会误判成"出网失败"并拆掉一条本来能用的隧道 —— 而拆隧道
-	// 的代价是断网 + 还原，远比多试几次贵。
-	dnsServers := inv.DNS
+	// 必须探测「实际配给系统的 DNS」，不是连接码里那份：接管时 resolveClientDNS
+	// 默认把系统 DNS 换成公共解析器（223.5.5.5 等），连接码里的 10.10.0.1 只是
+	// 隧道网关。拿 inv.DNS 去测，测的是用户实际不用的那条路 —— 公共 DNS 坏了
+	// 自检照样通过，用户却解析不了。
+	dnsServers := cfgDNS
+	if len(dnsServers) == 0 {
+		// 连接还没登记配置（极早的自检）：按连接码算一份，与接管时同源。
+		dnsServers = BuildNetConfig(inv).DNS
+	}
 	if len(dnsServers) == 0 {
 		dnsServers = []string{"8.8.8.8"}
 	}
-	probeDomains := []string{"www.baidu.com", "www.qq.com"}
+	if err := dnsProbe(hctx, dnsServers); err != nil {
+		return fmt.Errorf("DNS 解析失败（试过 %d 个服务器 × %d 个域名）：%s",
+			len(dnsServers), len(probeDomains), humanReason(err))
+	}
+
+	if err := publicProbe(hctx); err != nil {
+		return fmt.Errorf("公网数据面不通（隧道出口）：%s", humanReason(err))
+	}
+	return nil
+}
+
+// probeTunnelDNS 用下发的 DNS 真解析一次。
+//
+// 多服务器 × 多域名：只试第一个 DNS + 固定 www.baidu.com 时，单个 DNS 短暂不可用
+// 或那个域名恰好被过滤，就会误判成"出网失败"并拆掉一条本来能用的隧道 —— 而拆隧道
+// 的代价是断网 + 还原，远比多试几次贵。
+func probeTunnelDNS(ctx context.Context, servers []string) error {
 	var lastErr error
-	for _, srv := range dnsServers {
+	for _, srv := range servers {
 		for _, domain := range probeDomains {
 			resolver := &net.Resolver{
 				PreferGo: true,
@@ -806,8 +987,38 @@ func (a *App) healthCheck(ctx context.Context) error {
 			lastErr = err
 		}
 	}
-	return fmt.Errorf("DNS 解析失败（试过 %d 个服务器 × %d 个域名）：%s",
-		len(dnsServers), len(probeDomains), humanReason(lastErr))
+	return lastErr
+}
+
+// probePublicHTTP 经隧道出口做一次真实 HTTP 请求。
+//
+// 控制面端口可达 + DNS 能解析，都不代表服务端 NAT 与上游路由能把业务包送出去
+// 再带回来 —— 这一层专门补这个洞。两个目标任一成功即通过。
+func probePublicHTTP(ctx context.Context) error {
+	var lastErr error
+	for _, u := range publicProbeURLs {
+		if err := probeOneHTTP(ctx, u); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func probeOneHTTP(ctx context.Context, u string) error {
+	reqCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodHead, u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := publicProbeClient.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
 }
 
 // humanReason 把底层错误翻成一个短中文短语。
@@ -1064,6 +1275,10 @@ type AppStatus struct {
 	RxBytes   uint64
 	TxBytes   uint64
 	LastError string
+	// PendingRestore 表示还有一笔网络还原没做完（上次断开失败）。这种状态下
+	// Connect 会被拒绝，自动重连守护必须先调 Disconnect 重试还原，否则只会
+	// 反复撞在「请再点一次断开连接」的拒绝上。
+	PendingRestore bool
 }
 
 func (a *App) Status() AppStatus {
@@ -1091,6 +1306,7 @@ func (a *App) Status() AppStatus {
 		Server:         a.inv.Server,
 		TunnelIP:       a.cfg.TunnelIP,
 		LastError:      a.lastError,
+		PendingRestore: a.pendingRestore != nil,
 	}
 	if a.tunnel != nil {
 		st.RTT = a.tunnel.Stats.RTT()
@@ -1160,8 +1376,15 @@ func (a *App) watchRunStats(ctx context.Context, tun *Tunnel) {
 				"tx_mb", tun.Stats.TxBytes.Load()/1024/1024,
 				"tx_queued_mb", tun.Stats.TxQueued.Load()/1024/1024,
 				"tx_written_mb", tun.Stats.TxWritten.Load()/1024/1024,
+				// 控制连接心跳的往返时延。链路劣化（ECMP 乱序、跨境拥塞）时它会先涨，
+				// 而流量和丢包统计可能还是正常的 —— 定期重建关掉之后，这是唯一能提前
+				// 看出「通但慢了」的量。
+				"rtt_ms", tun.Stats.RTT().Milliseconds(),
 				"slot_depth", fmt.Sprint(cur),
 				"slot_peak", fmt.Sprint(peak),
+				// 每槽距上次收到帧的秒数（-1=还没收到过）。故障后翻这行：某条槽的
+				// 静默时长一路涨到几百秒，就说明那条成员连接的下行早就死了。
+				"slot_silence", fmt.Sprint(tun.SlotSilenceReport()),
 				"flow", fmt.Sprintf("%d/%d", flowSize, flowMax),
 				"flow_tcp", flowTCP,
 				"flow_udp", flowUDP,

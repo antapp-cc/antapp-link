@@ -145,6 +145,39 @@ func contains(s, sub string) bool {
 	})()
 }
 
+// 验证期靠环境变量关掉定期重建；解析写错时必须退回「关闭」而不是悄悄恢复 12 小时。
+func TestEnvRecycleEvery(t *testing.T) {
+	cases := []struct {
+		v    string
+		want time.Duration
+	}{
+		{"", defaultRecycleEvery},
+		{"0", 0},
+		{"off", 0},
+		{"OFF", 0},
+		{"8h", 8 * time.Hour},
+		{"12h", 12 * time.Hour},
+		{"30m", 30 * time.Minute},
+		{"bogus", defaultRecycleEvery},
+		{"-1h", defaultRecycleEvery},
+	}
+	for _, c := range cases {
+		t.Run(c.v, func(t *testing.T) {
+			t.Setenv("ANTAPP_RECYCLE", c.v)
+			if got := envRecycleEvery(); got != c.want {
+				t.Fatalf("ANTAPP_RECYCLE=%q 应解析成 %v，实际 %v", c.v, c.want, got)
+			}
+		})
+	}
+}
+
+// 默认必须关闭：验证新检测够不够用的前提是兜底不参与。
+func TestRecycleDisabledByDefault(t *testing.T) {
+	if defaultRecycleEvery != 0 {
+		t.Fatalf("默认周期应为 0（关闭），实际 %v", defaultRecycleEvery)
+	}
+}
+
 // 定期重建的等待必须比常规退避短：常规 Backoff 的 10 秒起步是为
 // 「对端刚崩、内核还在收尾」设计的，主动断开不会撞上那种情况，
 // 干等 10 秒只是白白拉低 uptime（对外部节点来说端口是关的）。

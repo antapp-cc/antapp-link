@@ -273,6 +273,33 @@ func (t *Tunnel) SlotDepthReport() (current, peak []int64) {
 // FlowSnapshot 返回当前会话的流表；没有活动会话时为 nil。
 func (t *Tunnel) FlowSnapshot() *proto.FlowTable { return t.flow.Load() }
 
+// SlotSilenceReport 返回每槽距上次收到帧的秒数，-1 表示这条连接还没收到过任何帧。
+//
+// 「用着用着没网」的事后现场：如果某条成员槽的静默时长在故障前就一路涨上去，
+// 说明那条连接的下行早就断了（而不是整个网络的问题）；槽 0 的静默时长同时是
+// 控制连接的心跳余量，接近 deadAfter 就该重连。
+func (t *Tunnel) SlotSilenceReport() []int64 {
+	sess := t.activeSession.Load()
+	if sess == nil {
+		return nil
+	}
+	out := make([]int64, len(sess.slotSeen))
+	for k := range sess.slotSeen {
+		v := sess.slotSeen[k].Load()
+		// 槽 0 的帧由 pumpFromTunnel 处理，只刷新 ctrlSeen（心跳判死的依据），
+		// 不经过 dialMember 的 touchSlot —— 报告里要拿它顶上，否则永远是 -1。
+		if k == 0 {
+			v = sess.ctrlSeen.Load()
+		}
+		if v == 0 {
+			out[k] = -1
+			continue
+		}
+		out[k] = int64(time.Since(time.Unix(0, v)).Seconds())
+	}
+	return out
+}
+
 // sessionEndInfo 把会话结束的错误归类成日志级别和人话原因，
 // 让「会话结束」这行日志一眼能看出断线是什么造成的。
 func sessionEndInfo(err error) (slog.Level, string) {
@@ -780,9 +807,10 @@ func newClientSession(t *Tunnel, conn net.Conn, sid string, tlsCfg *tls.Config, 
 	sess := &clientSession{
 		tunnel: t, dev: t.dev, log: t.log, stats: &t.Stats,
 		sid: sid, members: n, tlsCfg: tlsCfg, closed: make(chan struct{}),
-		slots:  make([]net.Conn, n),
-		writes: make([]sync.Mutex, n),
-		flow:   proto.NewFlowTable(),
+		slots:    make([]net.Conn, n),
+		writes:   make([]sync.Mutex, n),
+		slotSeen: make([]atomic.Int64, n),
+		flow:     proto.NewFlowTable(),
 	}
 	sess.slotTx = make([]chan []byte, n)
 	for i := range sess.slotTx {
@@ -875,6 +903,14 @@ type clientSession struct {
 	// 成员连接的下行数据不刷新它，否则控制连接单向半开时，只要成员槽还有流量
 	// 就永远不判死，哈希到槽 0 的内层流全部黑洞。
 	ctrlSeen atomic.Int64
+
+	// slotSeen 记每槽最近一次收到任何帧的时间（UnixNano，0 = 还没收到过）。
+	//
+	// 成员连接以前只有写超时能摘槽：下行单向死掉时上行写照样成功（数据进了本机
+	// 发送缓冲），槽位一直"活着"继续接流，而分到它的流全部黑洞 —— 这时控制连接
+	// 心跳正常、面板显示已连接，用户只会觉得"突然没网"，日志里一条线索都没有。
+	// memberHeartbeat 靠这个时间戳判活，watchRunStats 把它写进日志。
+	slotSeen []atomic.Int64
 
 	sid     string // 逻辑会话 ID
 	members int    // 生效连接数（含控制连接）
@@ -1051,6 +1087,17 @@ func (s *clientSession) memberHeartbeat(ctx context.Context, k int, conn net.Con
 			if s.slotConn(k) != conn {
 				return
 			}
+			// 下行判活：心跳发出去了不代表对方回了。上行还通、下行已死时写永远
+			// 成功，这条槽会一直看起来"活着"，被分到它的流全部黑洞。只对收到过
+			// 帧的连接判（老服务端不回 PONG，不能误杀）。
+			if seen := s.slotSeen[k].Load(); seen != 0 {
+				if idle := time.Since(time.Unix(0, seen)); idle > memberDeadAfter {
+					s.log.Warn(fmt.Sprintf("成员连接下行 %s 无回音，摘除重拨（成员 %d）",
+						idle.Round(time.Second), k))
+					s.dropSlot(k, conn)
+					return
+				}
+			}
 			if err := s.pingMember(k); err != nil {
 				// 写失败不在这里收尾：读循环会摘槽、维护协程会补拨
 				return
@@ -1069,7 +1116,34 @@ var (
 	//
 	// 是 var 而不是 const 只为让测试能临时调小它；生产路径没人写它。
 	memberPingInterval = 15 * time.Second
+
+	// memberDeadAfter 是成员连接「下行多久没回音就判死」的阈值。
+	//
+	// 取 3 个心跳周期：服务端每收到一个 PING 就回一个 PONG，正常情况下这个时间戳
+	// 每 15 秒刷新一次；45 秒没刷新说明连续两个 PONG 都没回来，不是抖动。
+	//
+	// 必须显著小于服务端的 memberIdleTimeout（120 秒）：那边判的是「上行没数据」，
+	// 这边判的是「下行没回包」，两个方向都可能单独死掉。
+	//
+	// 只在收到过至少一帧之后才启用（见 memberHeartbeat）：老服务端不回 PONG，
+	// 加这个判据之前没人验证过这一点，不能把兼容版本误杀成死连接。
+	memberDeadAfter = 45 * time.Second
 )
+
+// touchSlot 记录「这条连接」刚收到一帧，返回它是否仍拥有该槽。
+//
+// 必须校验连接身份：旧读循环可能在摘槽之后才恢复执行（ReadFrame 已经返回、
+// 调度器把它挂起，心跳摘槽、新连接入槽后才轮到它），不校验就会把旧连接的
+// 收帧时间写到新连接上，让新连接的下行判死被推迟。
+func (s *clientSession) touchSlot(k int, conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if k < 0 || k >= len(s.slots) || s.slots[k] != conn {
+		return false
+	}
+	s.slotSeen[k].Store(time.Now().UnixNano())
+	return true
+}
 
 // slotConn 返回槽位 k 上此刻的连接；空槽或越界返回 nil（不像 slot 那样兜底到控制连接）。
 func (s *clientSession) slotConn(k int) net.Conn {
@@ -1079,6 +1153,24 @@ func (s *clientSession) slotConn(k int) net.Conn {
 		return nil
 	}
 	return s.slots[k]
+}
+
+// attachSlot 把新连接放进槽位 k，并把判活时间重置为现在。
+//
+// 时间必须重置：槽位是复用的，上一条连接留下的 slotSeen 会被 memberHeartbeat
+// 当成新连接的静默时长；而判活排在发 PING 之前，旧值超过阈值就会在第一个周期
+// 直接摘掉刚补上来的连接 —— PONG 都没机会回来，形成「拨通→15 秒→掉」的循环。
+func (s *clientSession) attachSlot(k int, conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if k < 0 || k >= len(s.slots) || s.slots[k] != nil {
+		return false
+	}
+	s.slots[k] = conn
+	// 和入槽放在同一个临界区：新连接的判活基线必须从这条连接开始算，
+	// 不能沿用上一条连接留下的时间。这里直接写，不能调用会再次加锁的 touchSlot。
+	s.slotSeen[k].Store(time.Now().UnixNano())
+	return true
 }
 
 // slot 返回槽位 k 的连接；越界或空槽 → 控制连接兜底。
@@ -1176,13 +1268,9 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) (ti
 		return 0, fmt.Errorf("成员连接 %d 期望就绪 ACK 收到 %s", k, typ2.String())
 	}
 
-	sess.mu.Lock()
-	if k >= len(sess.slots) || sess.slots[k] != nil {
-		sess.mu.Unlock()
+	if !sess.attachSlot(k, conn) {
 		return 0, fmt.Errorf("成员连接 %d 槽位不可用", k)
 	}
-	sess.slots[k] = conn
-	sess.mu.Unlock()
 	joinedAt := time.Now()
 	// 逐条报「就位」而不是只在凑齐时报一条：哪一条卡住了、补了几次才上来，
 	// 都要能一眼看出来。现在日志区是单行模式，一条一行不会挤。
@@ -1211,6 +1299,15 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) (ti
 					"drops", n, "live", sess.liveCount())
 			}
 			return time.Since(joinedAt), err
+		}
+		// 任何帧都算「这条连接的下行还活着」：PONG 证明心跳被应答，IP 帧证明业务
+		// 下行还在动。memberHeartbeat 靠它判死。
+		//
+		// 这里顺带校验槽位归属：槽位可能已经被新连接接管（旧连接被心跳摘除后
+		// 补拨上来），这条是旧读循环的迟到帧 —— 不能再刷新新连接的判活时间，
+		// 也不能把过期 IP 包提交给网卡。
+		if !sess.touchSlot(k, conn) {
+			return time.Since(joinedAt), fmt.Errorf("成员连接 %d 已不在槽位上", k)
 		}
 		switch typ {
 		case proto.TypeIP:
@@ -1406,20 +1503,19 @@ var errScheduledRecycle = errors.New("定期重建连接")
 
 // 自动重建会话的阈值。用 var 而不是 const：测试要把周期压到毫秒级。
 var (
-	// recycleEvery 是自动重建会话的周期。
+	// recycleEvery 是自动重建会话的周期。默认 0 = 关闭，需要时用环境变量
+	// ANTAPP_RECYCLE=12h 打开（见 envRecycleEvery）。
 	//
-	// 起因：链路做了 ECMP，同一条 TCP 流的包固定哈希到某条物理路径上。一旦那条路径
+	// 历史：链路做了 ECMP，同一条 TCP 流的包固定哈希到某条物理路径上。一旦那条路径
 	// 乱序严重（实测 rcv_ooopack 到过 20 万、乱序率 20%+），这条连接在整个生命周期
 	// 里都换不出去 —— 表现为「连上了但什么都打不开，重启云服或点重连立刻恢复」。
 	// 重连会换一个源端口，等于重新抽签选路径，这是客户端唯一能做的缓解。
 	//
-	// 12 小时：用户实测劣化到不可用约需 2 天，取 1/4 余量，一天断 2 次。
-	// 每次断线约 4 秒（recycleDelay 3 秒 + 握手），一天共约 7 秒，基本无感。
-	//
-	// 没取更长（24h）是因为「2 天」只观察过一次、且不知道精确起点；12 小时留了
-	// 4 倍余量，即使实际劣化只要 1 天也能兜住。先用 12 小时跑一段时间，如果仍出现
-	// 「需要手动点重连」就退回 8 小时。
-	recycleEvery = 12 * time.Hour
+	// 为什么先关掉：成员连接现在有下行判活（memberDeadAfter），App 层有每 10 分钟的
+	// 端到端自检 —— 「数据面已经失效」这类问题能自己发现并重建，不必靠定时断线兜。
+	// 验证期就让它关着跑：真出问题时日志里会有 slot_silence 或自检失败记录，能分清
+	// 是新检测不够用，还是问题根本不在数据面（比如控制面正常、只是链路劣化）。
+	recycleEvery = envRecycleEvery()
 
 	// recycleBusyBytes 是「正在传大量数据」的门槛：采样一分钟超过这个数就推迟。
 	//
@@ -1443,6 +1539,29 @@ var (
 	// 转发端口是关的，入站连接会失败重试。8 小时断 3 秒 ≈ 99.99%，断 10 秒 ≈ 99.97%。
 	recycleDelay = 3 * time.Second
 )
+
+// defaultRecycleEvery 是定期重建的默认周期，0 = 关闭。
+const defaultRecycleEvery = 0
+
+// envRecycleEvery 从 ANTAPP_RECYCLE 读取定期重建周期：0 / off 关闭，
+// 其余按 Go duration 解析（8h、12h、30m）。
+//
+// 非法值退回默认（关闭）而不是退回 12 小时：验证期设错了就该是「没开」，
+// 而且启动日志会把实际生效的值打出来，一眼能看出环境变量有没有生效。
+func envRecycleEvery() time.Duration {
+	v := strings.TrimSpace(os.Getenv("ANTAPP_RECYCLE"))
+	if v == "" {
+		return defaultRecycleEvery
+	}
+	if v == "0" || strings.EqualFold(v, "off") {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		return defaultRecycleEvery
+	}
+	return d
+}
 
 // recycleAt 到点返回 errScheduledRecycle，让上层把会话重建一次。
 //
@@ -1497,6 +1616,7 @@ func (s *clientSession) recycleAt(ctx context.Context) error {
 // 这里只观察、不改行为，把两种可疑状态写进日志：
 //   - 有上行却长时间收不到任何下行（下行那条路断了）
 //   - 成员连接持续不足（上行正在被丢）
+//
 // dataPathSample 是数据面观察的采样间隔。var 而不是 const：测试要把它压到毫秒级。
 var dataPathSample = 30 * time.Second
 

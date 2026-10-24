@@ -640,6 +640,10 @@ func (u *UI) refresh() {
 		state = "当前状态: 正在测试节点端口…"
 	case busyOp == "connect" || busyOp == "reconnect":
 		state = "当前状态: 正在连接…"
+	case st.PendingRestore:
+		// 上次断开没还原干净：自动守护在重试还原，Connect 此时会被拒绝。
+		// 不单独说明的话用户只会看到「未连接」，不知道系统里还留着隧道路由/DNS。
+		state = "当前状态: 网络配置待恢复（重试还原中）"
 	case !st.Running:
 		state = "当前状态: 未连接"
 	case st.Online:
@@ -888,38 +892,73 @@ func (u *UI) keepConnected() {
 		if !u.waitBeforeReconnect(delay) {
 			return
 		}
-		if !u.wantConnected.Load() {
-			// 绝不能 return：用户点「断开连接」只表示现在不想连着，之后再点「连接」
-			// 时守护必须还在。同时把退避重置，否则断开很久后再点连接要等很久才试。
-			delay = 30 * time.Second
-			lastFailed = false
-			continue
-		}
 		st := u.app.Status()
-		if st.Updating {
-			// 旧版正在把单实例锁让给新版：绝不能在这时重新接管网络，否则两个
-			// 进程会并发改 DNS/路由（复审第 4 项）。
+		switch reconnectStepFor(st, u.wantConnected.Load()) {
+		case stepReset:
+			// 用户不想连 / 正在更新 / 已经在线：退避清零，继续盯着。
 			delay = 30 * time.Second
 			lastFailed = false
-			continue
+		case stepWait:
+			// 上一次连接或断开还没结束，等它收尾，本轮不动退避。
+		case stepRecover:
+			// 上次断开没把网络还原干净：Connect 会被拒绝，只能重试 Disconnect。
+			if lastFailed && delay < 5*time.Minute {
+				delay *= 2
+			}
+			u.app.Log().Warn(fmt.Sprintf("网络配置待恢复，%d 秒后重试还原", int(delay.Seconds())))
+			if err := u.app.Disconnect(); err != nil {
+				u.app.Log().Warn("重试还原网络失败", "err", err)
+			}
+			lastFailed = true
+		case stepConnect:
+			if lastFailed && delay < 5*time.Minute {
+				delay *= 2
+			}
+			u.app.Log().Info(fmt.Sprintf("隧道不在线，%d 秒后自动重连 %s",
+				int(delay.Seconds()), u.app.CurrentSource()))
+			_ = u.app.Connect()
+			lastFailed = true // 下一轮若已 Online 会清零，否则继续退避
 		}
-		if st.Online {
-			delay = 30 * time.Second // 真的在线了：退避清零，继续盯着
-			lastFailed = false
-			continue
-		}
-		// 上一次连接或断开还没结束：Connect() 会立刻返回「正在连接/正在断开，请稍候」，
-		// 那不是一次失败，等它结束再来。
-		if st.Connecting || st.Disconnecting {
-			continue
-		}
-		if lastFailed && delay < 5*time.Minute {
-			delay *= 2
-		}
-		u.app.Log().Info(fmt.Sprintf("隧道不在线，%d 秒后自动重连 %s",
-			int(delay.Seconds()), u.app.CurrentSource()))
-		_ = u.app.Connect()
-		lastFailed = true // 下一轮若已 Online 会清零，否则继续退避
+	}
+}
+
+// reconnectStep 是自动守护在某一轮该做什么。
+type reconnectStep int
+
+const (
+	// stepReset：没有动作，退避清零后继续盯（用户不想连、正在更新、已在线）。
+	stepReset reconnectStep = iota
+	// stepWait：上一次连接/断开还没结束，等下一轮。
+	stepWait
+	// stepConnect：不在线且可以连。
+	stepConnect
+	// stepRecover：还有一笔网络还原没做完，先重试还原再谈连接。
+	stepRecover
+)
+
+// reconnectStepFor 决定自动守护这一轮做什么。
+//
+// 抽成纯函数是为了能测「待还原时先恢复、而不是反复撞 Connect 的拒绝」这条规则 ——
+// 它在真实界面里没法自动化触发，靠人眼审查容易漏。
+func reconnectStepFor(st AppStatus, wantConnected bool) reconnectStep {
+	switch {
+	case st.Updating:
+		// 更新交接期间绝不动网络：旧版已经让出单实例锁，新版马上要接管。
+		// ApplyUpdate 在 Disconnect 失败时会立刻复位 updating，下一轮就会走
+		// stepRecover，不会把待还原现场一直晾着。
+		return stepReset
+	case st.PendingRestore:
+		// 待还原优先于「用户不想连」：用户点的是「断开隧道」，不是「把半接管的
+		// 路由/DNS 留在系统里」。恢复只调 Disconnect，不会反手把隧道连上。
+		return stepRecover
+	case !wantConnected:
+		return stepReset
+	case st.Online:
+		return stepReset
+	case st.Connecting || st.Disconnecting:
+		return stepWait
+	default:
+		return stepConnect
 	}
 }
 

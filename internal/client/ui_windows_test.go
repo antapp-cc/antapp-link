@@ -72,3 +72,58 @@ func TestBuildUIThenConfirmWarnsWhenConfirmFails(t *testing.T) {
 		t.Errorf("确认失败必须上报，实际: %v", warned)
 	}
 }
+
+// 有待还原现场时必须先恢复：反复调 Connect 只会一直撞「请再点一次断开连接」。
+func TestReconnectStepPrefersRecoverOverConnect(t *testing.T) {
+	if got := reconnectStepFor(AppStatus{PendingRestore: true}, true); got != stepRecover {
+		t.Fatalf("待还原时应先恢复，实际 %v", got)
+	}
+	// 用户点「断开连接」之后也一样：隧道可以不要，半接管的路由/DNS 必须还原，
+	// 否则用户既连不上、也没人把系统网络改回去。
+	if got := reconnectStepFor(AppStatus{PendingRestore: true}, false); got != stepRecover {
+		t.Fatalf("用户断开后仍应先把网络还原干净，实际 %v", got)
+	}
+}
+
+// 更新交接期间不动网络：ApplyUpdate 在断开失败时会立刻复位 updating，
+// 下一轮自然走 stepRecover，不会把待还原现场一直晾着。
+func TestReconnectStepLeavesNetworkAloneWhileUpdating(t *testing.T) {
+	if got := reconnectStepFor(AppStatus{Updating: true, PendingRestore: true}, true); got != stepReset {
+		t.Fatalf("更新交接期间不该动网络，实际 %v", got)
+	}
+}
+
+// 用户不想连 / 更新中 / 已在线：都只重置退避，不做任何网络动作。
+func TestReconnectStepResetsWhenIdle(t *testing.T) {
+	cases := []struct {
+		name string
+		st   AppStatus
+		want bool
+	}{
+		{"用户断开", AppStatus{}, false},
+		{"更新中", AppStatus{Updating: true}, true},
+		{"已在线", AppStatus{Online: true}, true},
+	}
+	for _, c := range cases {
+		if got := reconnectStepFor(c.st, c.want); got != stepReset {
+			t.Errorf("%s: 应为 stepReset，实际 %v", c.name, got)
+		}
+	}
+}
+
+// 正在连接/断开：等它收尾，不要插一脚。
+func TestReconnectStepWaitsWhileBusy(t *testing.T) {
+	if got := reconnectStepFor(AppStatus{Connecting: true}, true); got != stepWait {
+		t.Errorf("连接中应为 stepWait，实际 %v", got)
+	}
+	if got := reconnectStepFor(AppStatus{Disconnecting: true}, true); got != stepWait {
+		t.Errorf("断开中应为 stepWait，实际 %v", got)
+	}
+}
+
+// 普通离线：去连接。
+func TestReconnectStepConnectsWhenOffline(t *testing.T) {
+	if got := reconnectStepFor(AppStatus{Running: true}, true); got != stepConnect {
+		t.Fatalf("离线时应去连接，实际 %v", got)
+	}
+}
