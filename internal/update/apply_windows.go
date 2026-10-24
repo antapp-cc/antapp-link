@@ -203,21 +203,32 @@ func restoreOldExe(self string) error {
 	return nil
 }
 
-// RollbackIfUnhealthyUpdate 在启动早期检查「上次更新是否留下了从未健康运行过的新版」。
+// RollbackIfUnhealthyUpdate 在启动早期检查「上次更新是否留下了启动即崩的新版」。
 //
-// 判据：安装目录旁边有 .old（上次更新替换掉旧版的副本），而健康标记不是当前版本 ——
-// 说明新版启动后从未确认健康（旧进程 2 秒窗口没覆盖到的崩溃，或进程被强杀）。
-// 此时把磁盘恢复成 .old，并把这个版本记成失败版本，避免旧版下次又把它装回来。
+// 判据：安装目录旁边有 .old（上次更新替换掉旧版的副本），且同一版本在
+// startupCrashWindow 内连续两次启动都没确认健康（没有 MarkHealthy 清掉启动标记）。
+// 第一次启动总是放行：正常更新后的新版刚起来，还没机会证明自己；只有它「启动后
+// 没健康、下次又起来」才回滚，这样才不会把正常更新自己回滚掉。
 //
 // 返回 true 表示执行了回滚。当前进程是内存里的新版，回滚只影响下次启动。
 func RollbackIfUnhealthyUpdate(self, currentVersion string) (bool, error) {
 	old := self + ".old"
 	if _, err := os.Stat(old); err != nil {
-		return false, nil
+		return false, nil // 没有回滚副本
 	}
-	if healthyMarkedVersion() == currentVersion {
-		return false, nil // 当前版本健康过，.old 只是还没清理的备份
+
+	count := 1
+	if prev, ok := readStartupMark(); ok && prev.Version == currentVersion {
+		if at, err := time.Parse(time.RFC3339, prev.At); err == nil && time.Since(at) <= startupCrashWindow {
+			count = prev.Count + 1
+		}
 	}
+	// 先记下「本次启动正在进行、尚未确认健康」。MarkHealthy 会清掉它。
+	writeStartupMark(startupMark{Version: currentVersion, Count: count, At: time.Now().Format(time.RFC3339)})
+	if count < 2 {
+		return false, nil // 更新后的第一次启动：给新版机会
+	}
+
 	failed := self + ".failed"
 	_ = os.Remove(failed)
 	if err := os.Rename(self, failed); err != nil {
@@ -229,10 +240,11 @@ func RollbackIfUnhealthyUpdate(self, currentVersion string) (bool, error) {
 		return false, err
 	}
 	MarkFailedVersion(currentVersion)
+	clearStartupMark()
 	recordLifecycle(LifecycleEvent{
 		Event:   EventRollback,
 		Version: currentVersion,
-		Detail:  "上次更新后新版从未健康运行，已恢复旧版",
+		Detail:  "同一版本连续两次启动都未确认健康，已恢复旧版",
 	})
 	return true, nil
 }

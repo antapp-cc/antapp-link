@@ -5,14 +5,17 @@ import (
 	"testing"
 )
 
-// stubRolloutPaths 把健康标记与失败版本记录指到临时目录，测试不污染真实用户目录。
+// stubRolloutPaths 把健康标记、启动标记与失败版本记录指到临时目录，测试不污染真实用户目录。
 func stubRolloutPaths(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
-	prevHealthy, prevFailed := healthyMarkPathFn, failedVersionPathFn
+	prevHealthy, prevFailed, prevStarting := healthyMarkPathFn, failedVersionPathFn, startupMarkPathFn
 	healthyMarkPathFn = func() string { return filepath.Join(dir, "healthy") }
 	failedVersionPathFn = func() string { return filepath.Join(dir, "update-failed") }
-	t.Cleanup(func() { healthyMarkPathFn, failedVersionPathFn = prevHealthy, prevFailed })
+	startupMarkPathFn = func() string { return filepath.Join(dir, "update-starting") }
+	t.Cleanup(func() {
+		healthyMarkPathFn, failedVersionPathFn, startupMarkPathFn = prevHealthy, prevFailed, prevStarting
+	})
 }
 
 func TestHealthyMarkRoundTrip(t *testing.T) {

@@ -1142,7 +1142,11 @@ func (s *Server) watchdogLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			beat := time.Unix(0, s.statusBeat.Load())
+			beatNano := s.statusBeat.Load()
+			if beatNano == 0 {
+				continue // reportStatus 还没跑第一轮（启动初期）
+			}
+			beat := time.Unix(0, beatNano)
 			if !watchdogStuck(beat, time.Now(), statusWatchdogTimeout) {
 				continue
 			}

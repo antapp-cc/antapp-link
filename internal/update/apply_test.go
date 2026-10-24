@@ -500,47 +500,68 @@ func TestCleanupOldAfterHealthyRemovesWhenAlreadyMature(t *testing.T) {
 	}
 }
 
-// 上次更新留下了 .old、而当前版本从未确认健康：启动时应回滚到旧版并记录失败版本。
+// 更新后的第一次启动必须放行（给新版机会），第二次仍未健康才回滚。
 func TestRollbackIfUnhealthyUpdate(t *testing.T) {
 	stubLifecycle(t)
 	stubRolloutPaths(t)
 	self := filepath.Join(t.TempDir(), "app.exe")
 	writeFakeExePair(t, self)
 
+	// 第一次启动：不回滚，只记启动标记。
 	rolled, err := RollbackIfUnhealthyUpdate(self, "0.5.0")
-	if err != nil {
-		t.Fatalf("回滚失败: %v", err)
+	if err != nil || rolled {
+		t.Fatalf("第一次启动不该回滚: rolled=%v err=%v", rolled, err)
 	}
-	if !rolled {
-		t.Fatal("无健康标记 + 有 .old 时应回滚")
+	if got, _ := os.ReadFile(self); string(got) != "new" {
+		t.Fatalf("第一次启动不该动程序文件，实际 %q", got)
 	}
-	if got, rerr := os.ReadFile(self); rerr != nil || string(got) != "old" {
-		t.Errorf("程序路径应恢复成旧版，实际 %q (err=%v)", got, rerr)
+
+	// 第二次启动（窗口内、仍未健康）：回滚。
+	rolled, err = RollbackIfUnhealthyUpdate(self, "0.5.0")
+	if err != nil || !rolled {
+		t.Fatalf("第二次启动应回滚: rolled=%v err=%v", rolled, err)
 	}
-	if _, serr := os.Stat(self + ".old"); !os.IsNotExist(serr) {
-		t.Errorf("回滚后 .old 不该还在，实际 err=%v", serr)
+	if got, _ := os.ReadFile(self); string(got) != "old" {
+		t.Errorf("应恢复成旧版，实际 %q", got)
 	}
 	if got := FailedVersion(); got != "0.5.0" {
 		t.Errorf("应记录失败版本 0.5.0，实际 %q", got)
 	}
 
-	// 健康标记匹配当前版本：.old 只是没清理的备份，不该回滚。
+	// 确认健康会清掉启动标记：下次正常运行不会被回滚。
 	writeFakeExePair(t, self)
 	if err := MarkHealthy("0.5.0"); err != nil {
 		t.Fatal(err)
 	}
 	rolled, err = RollbackIfUnhealthyUpdate(self, "0.5.0")
 	if err != nil || rolled {
-		t.Fatalf("健康过不该回滚: rolled=%v err=%v", rolled, err)
+		t.Fatalf("确认健康后不该回滚: rolled=%v err=%v", rolled, err)
 	}
 
 	// 没有 .old：什么都不做。
 	if err := os.Remove(self + ".old"); err != nil {
 		t.Fatal(err)
 	}
-	ClearHealthyMark()
 	rolled, err = RollbackIfUnhealthyUpdate(self, "0.5.0")
 	if err != nil || rolled {
 		t.Fatalf("没有回滚副本时不该动文件: rolled=%v err=%v", rolled, err)
+	}
+}
+
+// 启动标记超出窗口不算连续崩溃：很久之前的一次异常退出不该回滚现在的新版。
+func TestRollbackIfUnhealthyUpdateIgnoresStaleStartupMark(t *testing.T) {
+	stubLifecycle(t)
+	stubRolloutPaths(t)
+	self := filepath.Join(t.TempDir(), "app.exe")
+	writeFakeExePair(t, self)
+
+	writeStartupMark(startupMark{
+		Version: "0.5.0",
+		Count:   1,
+		At:      time.Now().Add(-2 * startupCrashWindow).Format(time.RFC3339),
+	})
+	rolled, err := RollbackIfUnhealthyUpdate(self, "0.5.0")
+	if err != nil || rolled {
+		t.Fatalf("过期启动标记不该触发回滚: rolled=%v err=%v", rolled, err)
 	}
 }
