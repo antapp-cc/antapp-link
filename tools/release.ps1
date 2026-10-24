@@ -24,6 +24,12 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 
+# 版本号格式：和 internal/update 的 versionPattern 同一规则。格式错了签名发布
+# 照样能过，但所有节点会把它比较成「没有更新」——必须在构建前拦下来。
+if ($Version -notmatch '^\d+\.\d+\.\d+([-+].+)?$') {
+    throw "版本号格式不对：$Version（需要 主.次.修订，例如 0.4.12）"
+}
+
 Write-Host "== 构建 $Version ==" -ForegroundColor Cyan
 & (Join-Path $root 'build.ps1') -Version $Version
 if ($LASTEXITCODE -ne 0) { throw '构建失败' }

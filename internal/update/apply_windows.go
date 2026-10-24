@@ -54,9 +54,6 @@ func apply(self, newExePath string) error {
 		Detail: fmt.Sprintf("替换 %s", self),
 	})
 
-	// 旧版的健康标记对即将替换的新版无效：新版要重新证明自己健康。
-	ClearHealthyMark()
-
 	// 交接状态建不起来就中止更新：没有它，旧进程无法确认新版是否真的接手，
 	// 只能退回「Start() 成功即成功」—— 那正是这一轮要消灭的行为。临时目录不可写、
 	// 空间不足都会走到这里；宁可这次不更新，也不能让旧版在无法确认的情况下退出。
@@ -69,6 +66,11 @@ func apply(self, newExePath string) error {
 		})
 		return fmt.Errorf("无法建立更新交接状态，已中止更新（旧版继续运行）: %w", err)
 	}
+
+	// 交接状态建立成功、即将真正替换文件：旧版的健康标记对新版无效了。
+	// 放在 NewHandoff 之后：交接建不起来时更新根本没发生，不能顺手清掉健康标记，
+	// 否则当前版本会被后续启动误判成"未健康"而回滚。
+	ClearHealthyMark()
 
 	var launched *exec.Cmd
 	err = swapExe(self, newExePath, func(p string) error {
@@ -254,8 +256,18 @@ func rollbackToOld(self, old, currentVersion, reason string) (bool, error) {
 		_ = os.Rename(failed, self)
 		return false, err
 	}
-	MarkFailedVersion(currentVersion)
 	clearStartupMark()
+	if err := MarkFailedVersion(currentVersion); err != nil {
+		// 回滚本身完成了，但「这个版本别再装」的记录写不进去：旧版下次可能又把它
+		// 装回来。发出告警让用户/日志知道，而不是静默返回「回滚完成」。
+		recordLifecycle(LifecycleEvent{
+			Event:   EventUpdateFailed,
+			Version: currentVersion,
+			Detail:  "已恢复旧版，但失败版本记录写入失败（旧版可能再次尝试同一版本）",
+			Err:     err.Error(),
+		})
+		return true, fmt.Errorf("已恢复旧版，但失败版本记录写入失败（旧版可能再次尝试同一版本）: %w", err)
+	}
 	recordLifecycle(LifecycleEvent{
 		Event:   EventRollback,
 		Version: currentVersion,

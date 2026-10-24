@@ -304,3 +304,24 @@ func TestDownloadConcurrentSameTarget(t *testing.T) {
 		}
 	}
 }
+
+// 清单版本号必须符合 主.次.修订 规则：格式错了签名发布照样能过，但所有节点会
+// 把它比较成「没有更新」，所以 Validate 必须拦下。
+func TestManifestValidateVersionFormat(t *testing.T) {
+	base := func(version string) *Manifest {
+		return &Manifest{
+			Version: version,
+			Client:  Asset{URL: "https://example.com/a", SHA256: strings.Repeat("a", 64)},
+		}
+	}
+	for _, v := range []string{"0.4.12", "1.2.3", "v1.2.3", "1.2.3-rc.1", "1.2.3+build.5"} {
+		if err := base(v).Validate(); err != nil {
+			t.Errorf("版本 %q 应通过校验: %v", v, err)
+		}
+	}
+	for _, v := range []string{"", "oops", "1.2", "1.2.3.4"} {
+		if err := base(v).Validate(); err == nil {
+			t.Errorf("版本 %q 应被拒绝", v)
+		}
+	}
+}

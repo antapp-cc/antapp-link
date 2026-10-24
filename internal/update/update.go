@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -206,9 +207,14 @@ func (c *Checker) fetchSignature(ctx context.Context, src Source) ([]byte, error
 	return sig, nil
 }
 
+// versionPattern 是清单版本号格式：主.次.修订，可带 prerelease/build 后缀
+// （版本比较会忽略后缀）。签名清单来自发布脚本，格式错了只会在所有节点上静默
+// 判成「没有更新」，所以校验必须和发布脚本用同一套规则。
+var versionPattern = regexp.MustCompile(`^v?\d+\.\d+\.\d+([-+].*)?$`)
+
 func (m *Manifest) Validate() error {
-	if strings.TrimSpace(m.Version) == "" {
-		return errors.New("清单缺少 version")
+	if !versionPattern.MatchString(strings.TrimSpace(m.Version)) {
+		return fmt.Errorf("清单 version 格式不对：%q（需要 主.次.修订，例如 0.4.12）", m.Version)
 	}
 	if strings.TrimSpace(m.Client.URL) == "" {
 		return errors.New("清单缺少 client.url")

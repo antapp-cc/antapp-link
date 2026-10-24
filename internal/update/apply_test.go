@@ -617,3 +617,35 @@ func TestRollbackIfUnhealthyUpdateFailsClosedWhenStartupMarkUnwritable(t *testin
 		t.Errorf("应记录失败版本，实际 %q", got)
 	}
 }
+
+// 失败版本记录写不进去时，回滚必须完成并返回错误让上层告警，不能静默。
+func TestRollbackIfUnhealthyUpdateReportsFailedVersionWriteError(t *testing.T) {
+	stubLifecycle(t)
+	stubRolloutPaths(t)
+	self := filepath.Join(t.TempDir(), "app.exe")
+	writeFakeExePair(t, self)
+
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prev := failedVersionPathFn
+	failedVersionPathFn = func() string { return filepath.Join(blocker, "update-failed") }
+	t.Cleanup(func() { failedVersionPathFn = prev })
+
+	// 第一次启动放行。
+	if rolled, err := RollbackIfUnhealthyUpdate(self, "0.5.0"); err != nil || rolled {
+		t.Fatalf("第一次启动不该回滚: rolled=%v err=%v", rolled, err)
+	}
+	// 第二次启动回滚，但失败记录写不进去。
+	rolled, err := RollbackIfUnhealthyUpdate(self, "0.5.0")
+	if !rolled {
+		t.Fatal("第二次启动应回滚")
+	}
+	if err == nil {
+		t.Fatal("失败版本记录写不进去时必须报错")
+	}
+	if got, _ := os.ReadFile(self); string(got) != "old" {
+		t.Errorf("回滚本身应完成，实际 %q", got)
+	}
+}

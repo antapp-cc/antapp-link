@@ -115,12 +115,12 @@ func healthyMarkedVersion() string {
 //
 // CheckUpdate 会跳过它，避免旧版把同一个崩溃版本反复装回去。用户确认问题解决后
 // 可删掉记录重试。
-func MarkFailedVersion(version string) {
+func MarkFailedVersion(version string) error {
 	path := failedVersionPathFn()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(path, []byte(version+"\n"), 0o600)
+	return os.WriteFile(path, []byte(version+"\n"), 0o600)
 }
 
 // FailedVersion 返回已记录的失败版本，没有则空字符串。

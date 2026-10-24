@@ -1185,15 +1185,20 @@ func (u *UI) askUpdate() {
 			return
 		}
 
+		// Synchronize 是异步的（排队 + PostMessage），必须等回调真正结束才能放门禁，
+		// 否则用户还在确认框里时，自动更新就可能开始第二份下载/应用。
+		done := make(chan struct{})
 		u.mw.Synchronize(func() {
+			defer close(done)
 			if walk.MsgBox(u.mw, "下载完成",
-				"更新包已通过校验。\n\n点「是」马上重启到新版本；点「否」下次启动时再更新。",
+				"更新包已通过校验。\n\n点「是」马上重启到新版本；点「否」暂不更新（下次联网检查时重新下载）。",
 				walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
 				u.btnUpdate.SetEnabled(true)
 				return
 			}
 			u.applyUpdate(newExe)
 		})
+		<-done
 	}()
 }
 
