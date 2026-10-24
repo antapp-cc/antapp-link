@@ -190,7 +190,7 @@ func TestFlowStatsProtocols(t *testing.T) {
 	}
 }
 
-// 空闲清扫删掉一条流后留 30 秒墓碑：窗口内同 key 的包回来要恢复原槽，
+// 空闲清扫删掉一条流后留 60 秒墓碑：窗口内同 key 的包回来要恢复原槽，
 // 否则每清扫一次就可能让一条安静的长连接换槽、内层 TCP 乱序一次。
 func TestFlowTableRecentRestoresSlot(t *testing.T) {
 	base := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
@@ -209,7 +209,7 @@ func TestFlowTableRecentRestoresSlot(t *testing.T) {
 	}
 }
 
-// 墓碑只保留 30 秒：窗口外同 key 的包不再恢复原槽，墓碑本身也会被清掉。
+// 墓碑只保留 60 秒：窗口外同 key 的包不再恢复原槽，墓碑本身也会被清掉。
 func TestFlowTableRecentExpires(t *testing.T) {
 	base := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	ft := NewFlowTable()

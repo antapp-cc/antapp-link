@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/tls"
+	"errors"
 	"log/slog"
 	"net"
 	"sync"
@@ -37,6 +38,10 @@ type udpSession struct {
 	recv     *proto.Cipher // 解这个客户端发来的
 	sendSeal *proto.Cipher // 加密发给这个客户端
 
+	// owner 是登记这条通道的会话。同一个 IP 快速重连时，旧会话读协程的迟到登记
+	// 不能覆盖新会话的条目 —— 否则 map 被顶掉后新会话的上行全部找不到人。
+	owner *session
+
 	// sendMu 保护 sendSeal：Cipher.Seal 会改 sendSeq 和共享的 nonce。
 	// 下行数据（pumpTun）和保活回包（readLoop）是两个 goroutine 在并发调 send，
 	// 不串行化就会序号重复、nonce 复用 —— 后者是密码学错误，不只是丢包。
@@ -46,6 +51,37 @@ type udpSession struct {
 	// 下行不走槽位，没有 SlotStatus 可看，这两个数是判断「数据到底通没通」的依据。
 	rxBytes atomic.Uint64
 	txBytes atomic.Uint64
+}
+
+// sessionAlive 报告会话是否还活着（closed 只在收尾时关闭一次）。
+func sessionAlive(s *session) bool {
+	if s == nil {
+		return false
+	}
+	select {
+	case <-s.closed:
+		return false
+	default:
+		return true
+	}
+}
+
+// allowUDPReplace 报告同 IP 已有的条目能否被新会话顶掉。
+//
+// 只有「旧条目没有主人」或「旧主人已经收尾」才允许覆盖。同 IP 快速重连时新会话
+// 先登记、旧会话读协程的迟到登记后到：不拦的话旧条目会顶掉新条目，旧会话 detach
+// 再按守卫删掉它，map 就空了 —— 新会话下行照发、上行全被当来路不明丢弃。
+func allowUDPReplace(cur *udpSession, next *session) bool {
+	if cur == nil {
+		return true
+	}
+	if cur.owner == nil {
+		return true
+	}
+	if cur.owner == next {
+		return true
+	}
+	return !sessionAlive(cur.owner)
 }
 
 func newUDPMux(listen string, tun *TUN, log *slog.Logger) (*udpMux, error) {
@@ -73,7 +109,16 @@ func newUDPMux(listen string, tun *TUN, log *slog.Logger) (*udpMux, error) {
 // 端口参数只用于日志：家宽 NAT 会把客户端自报的源端口改掉，服务端真正能用的端口
 // 必须从收到的第一个包里学习（见 lookup）。按 IP 收敛没有歧义 —— 服务端同一时刻
 // 只服务一个客户端。
-func (m *udpMux) addSession(tlsState tls.ConnectionState, ip net.IP, port int) (*udpSession, error) {
+func (m *udpMux) addSession(owner *session, tlsState tls.ConnectionState, ip net.IP, port int) (*udpSession, error) {
+	// 登记前先自查：自己这个会话是不是已经在收尾了。
+	//
+	// 交错 A（泄漏）里 detach 早就跑过（那时 sess.udp 还是 nil，不会回收），迟到的
+	// 登记只会在 map 里留一条没人删的条目；交错 B 里新旧会话交替时旧会话已被
+	// old.close() 踢掉。两种情况下 owner 的 closed 都已关闭 —— 直接拒绝最省事，
+	// 也不依赖 map 里此刻有没有条目。
+	if !sessionAlive(owner) {
+		return nil, errors.New("会话已收尾，放弃登记 UDP 数据通道")
+	}
 	c2sKey, err := tlsState.ExportKeyingMaterial(proto.UDPLabelC2S, nil, 32)
 	if err != nil {
 		return nil, err
@@ -94,9 +139,14 @@ func (m *udpMux) addSession(tlsState tls.ConnectionState, ip net.IP, port int) (
 	sess := &udpSession{
 		recv:     recv,
 		sendSeal: send,
+		owner:    owner,
 	}
 	sess.peer.Store(&net.UDPAddr{IP: ip, Port: port})
 	m.mu.Lock()
+	if !allowUDPReplace(m.sessions[ip.String()], owner) {
+		m.mu.Unlock()
+		return nil, errors.New("该 IP 已有更新的 UDP 会话，拒绝覆盖")
+	}
 	m.sessions[ip.String()] = sess
 	m.mu.Unlock()
 	return sess, nil
@@ -117,6 +167,20 @@ func (m *udpMux) removeSession(sess *udpSession) {
 	key := p.IP.String()
 	m.mu.Lock()
 	if cur, ok := m.sessions[key]; ok && cur == sess {
+		delete(m.sessions, key)
+	}
+	m.mu.Unlock()
+}
+
+// dropOtherSessions 摘掉同 IP 下不属于 keep 的条目。
+//
+// 调用方（registerUDP）已经确认 keep 是当前会话：同 IP 的其他条目都属于已被取代的
+// 旧会话。不先摘掉的话，addSession 的 allowUDPReplace 会看到「旧 owner 还活着」
+// 而拒绝新会话的登记，随后旧会话 detach 删掉旧条目，map 就空了 —— 新会话上行全丢。
+func (m *udpMux) dropOtherSessions(ip net.IP, keep *session) {
+	key := ip.String()
+	m.mu.Lock()
+	if cur, ok := m.sessions[key]; ok && cur.owner != keep {
 		delete(m.sessions, key)
 	}
 	m.mu.Unlock()

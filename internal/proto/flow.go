@@ -77,9 +77,20 @@ type FlowTable struct {
 	recent map[flowKey]recentFlow
 	// recentOrder 按插入顺序记录墓碑 key，用于淘汰最旧的一条；可能含已删除的 key（惰性）。
 	recentOrder []flowKey
+	// fallback 是表满后回退哈希的流所落槽位的小容量旁路表。
+	//
+	// 表满时新流不插主映射，每个包本来独立走 hashToAlive；alive 集合一变，同一条流
+	// 的前后包就可能落到不同槽。这里记住第一次的选择，后续包复用前先校验「槽仍有效」
+	// （范围 + 存活）：有效就沿用、不换槽；已死则重选 —— 把包发回死槽等于持续丢包。
+	// 容量小、满了不记（退化为逐包哈希），淘汰任何旧条目都等于让那条流换槽。
+	fallback map[flowKey]int
 	// clock 是时间源，测试注入用；nil 表示 time.Now。
 	clock func() time.Time
 }
+
+// maxFallback 是旁路表的容量。表满本身是极端场景，这里只兜住几百条活跃的长尾流；
+// 超出的流不记（退化为逐包哈希，与没有旁路表时的行为一致）。
+const maxFallback = 1024
 
 // maxFlows 是流表容量上限。每条 entry 约 24 字节，三万条约 1MB 级（含 map 开销），
 // 对两端都不算负担。上限不是"永不淘汰"的借口：FIN/RST 和空闲期回收才是控制占用的
@@ -162,6 +173,7 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 		// 不回收的话，长会话里的表会被已经关闭的连接吃满，新流只能退回哈希。
 		if proto == 6 && flags&(tcpFlagFIN|tcpFlagRST) != 0 {
 			delete(t.m, key)
+			delete(t.fallback, key)
 			t.counts[e.slot]--
 			t.addCounts(e.proto, -1)
 			t.reclaimed++
@@ -218,16 +230,51 @@ func (t *FlowTable) Slot(payload []byte, n int, alive func(int) bool) int {
 		// 新流不插入（老流的映射绝不能动 —— 那会让内层 TCP 乱序），但仍必须
 		// 在**活槽**里选，直接纯哈希会把这批新流分到已经断开的成员槽上。
 		t.fallbacks++
-		return hashToAlive(payload, n, alive)
+		s, ok := t.fallback[key]
+		if ok && s > 0 && s < n && (alive == nil || alive(s)) {
+			// 记住的槽仍然有效：沿用，避免成员闪断期间换槽。
+			if proto == 6 && flags&(tcpFlagFIN|tcpFlagRST) != 0 {
+				delete(t.fallback, key)
+			}
+			return s
+		}
+		if ok {
+			// 记过的槽已经不可用（成员断开或槽数变少）：丢掉旧值重新选，
+			// 绝不能把包发回一个不存在/已断开的槽。
+			delete(t.fallback, key)
+		}
+		s = hashToAlive(payload, n, alive)
+		// 满了不记（退化为逐包哈希）：淘汰任何旧条目都等于让那条流换槽。
+		if len(t.fallback) < maxFallback {
+			if t.fallback == nil {
+				t.fallback = make(map[flowKey]int, 64)
+			}
+			t.fallback[key] = s
+		}
+		// FIN/RST 表示这条流结束：清掉旁路条目，否则短连接会把小容量吃满。
+		if proto == 6 && flags&(tcpFlagFIN|tcpFlagRST) != 0 {
+			delete(t.fallback, key)
+		}
+		return s
 	}
 
 	best := 0
-	for i := 1; i < n; i++ {
-		if alive != nil && !alive(i) {
-			continue
+	// 表刚满过又降下来的流：旁路表里已经记过它原来的槽，这里直接转正。
+	// 不查的话它会被当作新流重新选槽 —— 过渡期换槽一次 = 内层 TCP 乱序一次。
+	if s, ok := t.fallback[key]; ok {
+		if s > 0 && s < n && (alive == nil || alive(s)) {
+			best = s
 		}
-		if best == 0 || t.counts[i] < t.counts[best] {
-			best = i
+		delete(t.fallback, key)
+	}
+	if best == 0 {
+		for i := 1; i < n; i++ {
+			if alive != nil && !alive(i) {
+				continue
+			}
+			if best == 0 || t.counts[i] < t.counts[best] {
+				best = i
+			}
 		}
 	}
 	if best == 0 {

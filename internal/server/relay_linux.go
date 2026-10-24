@@ -126,11 +126,32 @@ func startPortRelay(ctx context.Context, cfg Config, log *slog.Logger, tunnelUp 
 		listeners = append(listeners, ln)
 		mu.Unlock()
 		go func() {
+			var backoff time.Duration
 			for {
 				conn, err := ln.Accept()
 				if err != nil {
+					// 只有「监听已关闭」该退出。fd / 内核缓冲耗尽（EMFILE/ENOBUFS）
+					// 是瞬时错误：直接 return 会让这个端口永久没人 accept，外部连接在
+					// backlog 里挂死，而 status 仍显示「转发器已启动」。主隧道 accept
+					// 循环是同一套退避处理。
+					if isResourceExhausted(err) && ctx.Err() == nil {
+						if backoff == 0 {
+							backoff = time.Second
+						} else if backoff < 30*time.Second {
+							backoff *= 2
+						}
+						log.Warn("转发端口 accept 失败：资源不足，稍后重试",
+							"port", port, "retry_in", backoff, "err", err)
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(backoff):
+						}
+						continue
+					}
 					return // 监听已关闭
 				}
+				backoff = 0
 				st.onAccept()
 				if tunnelUp != nil && !tunnelUp() {
 					// 隧道不可用就别拨号：外部立刻拿到连接关闭，不必挂到超时

@@ -3,6 +3,8 @@ package server
 import (
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/antapp-cc/antapp-link/internal/pki"
@@ -15,6 +17,45 @@ const ChainName = "ANTAPP_LINK"
 // daemonProcessName 是本守护进程的进程名：端口占用检查时用它区分
 // 「自家转发器的监听」与「外部程序的占用」。
 const daemonProcessName = "antapp-linkd"
+
+// forwardRangePath 记录上一次 Up 铺的转发端口段。
+//
+// 换端口段时（--force / 改配置）只靠 cfg 是不知道旧段规则的：Up 只会 ensureRule 新段，
+// Down 也只按新段删，旧段的 INPUT 放行会永久对公网开着。把上次的段记下来，Up 铺新段
+// 前先清旧段。放 /run（tmpfs）：机器重启后 iptables 规则本身也没了，记录与现场一致。
+var forwardRangePath = "/run/antapp-link/forward-range"
+
+func readForwardRange() string {
+	raw, err := os.ReadFile(forwardRangePath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+func writeForwardRange(r string) error {
+	if err := os.MkdirAll(filepath.Dir(forwardRangePath), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(forwardRangePath, []byte(r+"\n"), 0o644)
+}
+
+// stripOutIface 去掉参数里的 "-o <网卡>"。
+//
+// iptables -D 按给定字段匹配：不写 -o 时，带任意 -o 的同规则也能删掉。Up 时的网卡名
+// 与 Down 时可能不同（dhcp 改名、云厂商换网卡），用 down 时刻的名字拼 -D 会删不掉，
+// 于是 MASQUERADE 和 MSS clamp 残留。
+func stripOutIface(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-o" && i+1 < len(args) {
+			i++
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return out
+}
 
 // Rule 是一条 iptables 规则。Table 为空表示 filter 表。
 type Rule struct {

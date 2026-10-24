@@ -109,6 +109,9 @@ func applyUpdate(newBinary string, out io.Writer) error {
 
 // rollback 把旧二进制放回去并重启，然后同样做一次健康检查。它自己失败时要讲清旧版本
 // 在哪，别让现场既没有能跑的、也没有能回滚的。
+//
+// 所有失败分支都用 %w 包装 cause：cmdUpdate 靠 errors.As 从错误链里认出
+// forwardEnvError（端口被占用），回滚本身失败时也不能把这条线索丢掉。
 func rollback(self, backup string, cause error) error {
 	// 回滚后的检查也要有"相对起点"：坏版本刚写过状态文件，拿它当基准等于没判
 	before := ""
@@ -117,18 +120,18 @@ func rollback(self, backup string, cause error) error {
 	}
 
 	if err := copyBinary(backup, self); err != nil {
-		return fmt.Errorf("%v；回滚也失败（旧版本仍在 %s，可用 install -m755 手动放回）: %w", cause, backup, err)
+		return fmt.Errorf("%w；回滚也失败（旧版本仍在 %s，可用 install -m755 手动放回）: %v", cause, backup, err)
 	}
 	if err := runSystemctl("restart", "antapp-linkd"); err != nil {
-		return fmt.Errorf("%v；文件已回滚但重启失败: %w", cause, err)
+		return fmt.Errorf("%w；文件已回滚但重启失败: %v", cause, err)
 	}
 	// 同 applyUpdate：基线取回滚之后新实例自己的起点；读不到就按失败处理
 	baseline, berr := serviceRestarts()
 	if berr != nil {
-		return fmt.Errorf("%v；文件已回滚但无法确认新实例是否稳定: %w", cause, berr)
+		return fmt.Errorf("%w；文件已回滚但无法确认新实例是否稳定: %v", cause, berr)
 	}
 	if err := waitHealthy(30*time.Second, before, baseline); err != nil {
-		return fmt.Errorf("%v；文件已回滚但回滚后的服务也没就绪: %w", cause, err)
+		return fmt.Errorf("%w；文件已回滚但回滚后的服务也没就绪: %v", cause, err)
 	}
 	return fmt.Errorf("%w（已回滚到备份版本）", cause)
 }
@@ -145,7 +148,12 @@ func rollback(self, backup string, cause error) error {
 func waitHealthy(timeout time.Duration, before string, restartsBefore int) error {
 	deadline := time.Now().Add(timeout)
 	last := "（还没有一次检查完成）"
-	healthy := 0
+	var (
+		healthy        int
+		firstStamp     string
+		forwardFailed  bool
+		lastForwardErr string
+	)
 	for time.Now().Before(deadline) {
 		time.Sleep(3 * time.Second)
 
@@ -170,30 +178,22 @@ func waitHealthy(timeout time.Duration, before string, restartsBefore int) error
 			last, healthy = fmt.Sprintf("读状态文件失败: %v", err), 0
 			continue
 		}
-		if st.UpdatedAt == before {
-			last, healthy = "状态文件还是启动前那一份（新进程尚未写入）", 0
-			continue
-		}
-		if !st.Fresh() {
-			last, healthy = "状态文件没有刷新", 0
-			continue
-		}
-		// 转发器是节点机访问服务的入口。它启动失败时进程照样健康、状态文件照样刷新，
-		// 但节点机的端口转发全不通 —— 这种「活着但没用」不能算健康，否则坏版本会被
-		// 记成更新成功、跳过回滚。
-		//
-		// 只认「已确认失败」：状态文件来自旧版 daemon 时 ForwardKnown 是 false，
-		// 那种未知状态不能当成失败（否则老版本一升级就被误回滚）。
-		if st.ForwardKnown && !st.ForwardReady {
-			last, healthy = "端口转发器启动失败: "+st.ForwardError, 0
-			continue
-		}
-		// 连两次都健康才算：单次采样可能正好落在两次崩溃之间
-		healthy++
-		if healthy >= 2 {
+		var done bool
+		healthy, firstStamp, done, last = healthSample(st, before, healthy, firstStamp)
+		if done {
 			return nil
 		}
-		last = "第一次健康，等第二次确认"
+		forwardFailed = st.ForwardKnown && !st.ForwardReady
+		if forwardFailed {
+			lastForwardErr = st.ForwardError
+		}
+	}
+	// 只有「端口被别的进程占用」这种可识别的环境特征才豁免拉黑。转发器因新版本
+	// 自己的 bug 起不来时 ForwardReady 同样是 false —— 那种必须照常拉黑，否则
+	// 坏版本会每小时白重启一次、永远不收敛。
+	if forwardFailed && isForwardPortConflict(lastForwardErr) {
+		return &forwardEnvError{reason: fmt.Sprintf("新版本启动后 %s 内没就绪：转发端口被外部占用（%s）",
+			timeout, lastForwardErr)}
 	}
 	return fmt.Errorf("新版本启动后 %s 内没就绪：%s", timeout, last)
 }

@@ -66,6 +66,8 @@ func TestRegisterUDPIgnoresDuplicateReport(t *testing.T) {
 	sess := &session{name: "c", closed: make(chan struct{}), tlsConn: tc}
 	sess.slots = []*slotConn{newSlotConn(tc)}
 	t.Cleanup(sess.close)
+	// registerUDP 只处理当前会话（真实路径：控制连接读循环里调用）。
+	s.attach(sess)
 
 	s.registerUDP(sess, []byte{0x30, 0x39})
 	first := sess.udpSession()
@@ -99,5 +101,35 @@ func TestHandshakeFailureLogSampled(t *testing.T) {
 	}
 	if got := s.hsFails.Load(); got != 5 {
 		t.Fatalf("失败计数 = %d, want 5", got)
+	}
+}
+
+// 会话已经被新连接取代时（不再是 current），registerUDP 必须直接拒绝：
+// detach 已经跑过且当时 sess.udp 还是 nil，这条登记写进 mux 就再没人回收。
+func TestRegisterUDPRejectsStaleSession(t *testing.T) {
+	s, _ := newTestServer(t, newHandshakeLimiter(1))
+	m, err := newUDPMux("127.0.0.1:0", nil, discardLogger())
+	if err != nil {
+		t.Fatalf("newUDPMux: %v", err)
+	}
+	t.Cleanup(m.close)
+	s.udp = m
+
+	a, b := net.Pipe()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	stale := &session{name: "stale", closed: make(chan struct{})}
+	stale.slots = []*slotConn{newSlotConn(a)}
+	t.Cleanup(stale.close)
+
+	current := &session{name: "current", closed: make(chan struct{})}
+	t.Cleanup(current.close)
+	s.attach(current)
+
+	s.registerUDP(stale, []byte{0x30, 0x39})
+	if stale.udpSession() != nil {
+		t.Fatal("被取代的会话不该登记 UDP 通道")
+	}
+	if got := m.lookup(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}); got != nil {
+		t.Fatal("被取代的会话不该写进 mux 的 map")
 	}
 }

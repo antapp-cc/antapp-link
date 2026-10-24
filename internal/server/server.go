@@ -926,6 +926,18 @@ func (s *Server) registerUDP(sess *session, payload []byte) {
 		s.log.Warn("同一会话重复上报 UDP 端口，已忽略（防止 nonce 复用）", "client", sess.name)
 		return
 	}
+	// 会话可能已经被新连接取代、或正在收尾：先确认自己仍是当前会话再登记。
+	// 放在解析端口/远端之前 —— 便宜，且被取代时不需要 TLS 状态。
+	//
+	// 否则 detach 已经跑过（那时 sess.udp 还是 nil，不会回收），这里再写进 mux 的
+	// 条目就永远没人删 —— 客户端换 IP 重连时每次泄漏一个（含两把 AES Cipher）。
+	s.mu.Lock()
+	current := s.current
+	s.mu.Unlock()
+	if current != sess {
+		s.log.Warn("登记 UDP 会话失败：会话已不是当前会话", "client", sess.name)
+		return
+	}
 	port := int(binary.BigEndian.Uint16(payload))
 	remote, ok := sess.slot(0).conn.RemoteAddr().(*net.TCPAddr)
 	if !ok || sess.tlsConn == nil {
@@ -933,14 +945,29 @@ func (s *Server) registerUDP(sess *session, payload []byte) {
 		return
 	}
 	// IP 只认 TCP 连接的真实远端，端口由控制通道上报 —— 见 udprelay.go 的注释
-	u, err := s.udp.addSession(sess.tlsConn.ConnectionState(), remote.IP, port)
+	// 自己已是当前会话：同 IP 上的旧条目属于被取代的会话，先摘掉再登记，
+	// 否则旧条目会挡住新会话（allowUDPReplace 看到旧 owner 还活着）。
+	s.udp.dropOtherSessions(remote.IP, sess)
+	u, err := s.udp.addSession(sess, sess.tlsConn.ConnectionState(), remote.IP, port)
 	if err != nil {
-		s.log.Warn("登记 UDP 会话失败", "client", sess.name, "err", err)
+		// 会话收尾竞态下会走到这里（owner 已关闭），属正常，Debug 即可；
+		// 真正的异常（导出密钥失败）极罕见，开 Debug 也能看到。
+		s.log.Debug("登记 UDP 会话失败", "client", sess.name, "err", err)
 		return
 	}
 	sess.mu.Lock()
 	sess.udp = u
 	sess.mu.Unlock()
+	// 登记完才发现会话已经被 detach：把刚写进 mux 的条目回滚，宁可客户端收不到
+	// 回包自己重建，也不留一条没人回收的 UDP 会话。
+	s.mu.Lock()
+	stillCurrent := s.current == sess
+	s.mu.Unlock()
+	if !stillCurrent {
+		s.udp.removeSession(u)
+		s.log.Info("UDP 会话登记已回滚：会话被取代", "client", sess.name)
+		return
+	}
 	s.log.Info("客户端 UDP 数据通道已登记", "client", sess.name,
 		"udp_port", port, "remote_ip", remote.IP.String())
 }

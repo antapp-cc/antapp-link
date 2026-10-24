@@ -1,6 +1,7 @@
 package server
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -140,5 +141,41 @@ func TestRulesTCPModeHasNoUDPTunnelPort(t *testing.T) {
 		if strings.Contains(s, "-p udp --dport 62233") {
 			t.Errorf("tcp 模式下不该有 UDP 隧道端口规则：%s", s)
 		}
+	}
+}
+
+// 删除规则时要能去掉 -o：Up 和 Down 之间网卡可能改名，带旧网卡名的 -D 删不掉
+// MASQUERADE / MSS clamp，规则会永久残留。
+func TestStripOutIface(t *testing.T) {
+	got := stripOutIface([]string{"-s", "10.10.0.0/24", "-o", "eth0", "-j", "MASQUERADE"})
+	want := []string{"-s", "10.10.0.0/24", "-j", "MASQUERADE"}
+	if len(got) != len(want) {
+		t.Fatalf("参数数量不对: %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("第 %d 个参数应为 %q，实际 %q", i, want[i], got[i])
+		}
+	}
+	// 没有 -o 的参数原样返回
+	if got := stripOutIface([]string{"-p", "tcp", "-j", "ACCEPT"}); len(got) != 4 || got[3] != "ACCEPT" {
+		t.Fatalf("无 -o 时应原样返回，实际 %v", got)
+	}
+}
+
+// 换端口段时靠 /run 的记录清旧段：写进去能读回来，删掉后读到空。
+func TestForwardRangeRoundTrip(t *testing.T) {
+	old := forwardRangePath
+	forwardRangePath = filepath.Join(t.TempDir(), "forward-range")
+	defer func() { forwardRangePath = old }()
+
+	if got := readForwardRange(); got != "" {
+		t.Fatalf("文件不存在时应返回空，实际 %q", got)
+	}
+	if err := writeForwardRange("31400:31409"); err != nil {
+		t.Fatalf("写失败: %v", err)
+	}
+	if got := readForwardRange(); got != "31400:31409" {
+		t.Fatalf("应读回写进去的段，实际 %q", got)
 	}
 }

@@ -111,3 +111,52 @@ func TestUDPSessionCountsTxBytes(t *testing.T) {
 		t.Fatal("发送成功后 txBytes 应增长")
 	}
 }
+
+// 同 IP 快速重连时，旧会话读协程的迟到登记不能顶掉新会话的条目：
+// map 被顶掉后旧会话 detach 会按守卫把它删掉，新会话的上行就全丢了。
+func TestAllowUDPReplace(t *testing.T) {
+	oldSess := &session{closed: make(chan struct{})}
+	newSess := &session{closed: make(chan struct{})}
+
+	if allowUDPReplace(&udpSession{owner: newSess}, oldSess) {
+		t.Fatal("同 IP 已有活会话时不该允许旧会话覆盖")
+	}
+	close(oldSess.closed)
+	if !allowUDPReplace(&udpSession{owner: oldSess}, newSess) {
+		t.Fatal("旧会话已收尾时应允许新会话登记")
+	}
+	if !allowUDPReplace(nil, newSess) {
+		t.Fatal("空条目应允许登记")
+	}
+	if !allowUDPReplace(&udpSession{}, newSess) {
+		t.Fatal("没有 owner 的旧条目应允许登记")
+	}
+	if !allowUDPReplace(&udpSession{owner: newSess}, newSess) {
+		t.Fatal("同一会话重复登记（不应发生）不该被拦")
+	}
+}
+
+// 新会话登记前必须摘掉同 IP 的旧条目：旧 owner 还活着时 allowUDPReplace 会拒绝
+// 新会话，随后旧会话 detach 删掉旧条目，map 就空了 —— 新会话上行全丢。
+func TestDropOtherSessions(t *testing.T) {
+	m := newTestMux()
+	ip := net.IPv4(127, 0, 0, 1)
+	oldOwner := &session{closed: make(chan struct{})}
+	old := &udpSession{owner: oldOwner}
+	old.peer.Store(&net.UDPAddr{IP: ip, Port: 1})
+	m.sessions[ip.String()] = old
+
+	keep := &session{closed: make(chan struct{})}
+	m.dropOtherSessions(ip, keep)
+	if _, ok := m.sessions[ip.String()]; ok {
+		t.Fatal("不属于 keep 的旧条目应被摘掉")
+	}
+
+	own := &udpSession{owner: keep}
+	own.peer.Store(&net.UDPAddr{IP: ip, Port: 2})
+	m.sessions[ip.String()] = own
+	m.dropOtherSessions(ip, keep)
+	if m.sessions[ip.String()] != own {
+		t.Fatal("keep 自己的条目不该被删")
+	}
+}

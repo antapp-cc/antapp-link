@@ -41,6 +41,58 @@ var updatedToPath = "/run/antapp-link/updated-to"
 // 没有回滚动作，也不该把这一版记成「失败」永久跳过。
 var errNothingChanged = errors.New("未做任何改动")
 
+// forwardEnvError 表示健康检查失败的原因是「转发端口被本机别的进程占用」，
+// 与二进制版本无关。cmdUpdate 据此不把该版本写进黑名单：占用解除后下一轮自然能成功，
+// 而不是让一个好版本在两次重启之间永久停摆。
+type forwardEnvError struct{ reason string }
+
+func (e *forwardEnvError) Error() string { return e.reason }
+
+// isForwardPortConflict 判断转发器失败原因是不是「端口被别的进程占用」。
+//
+// 只有这种可识别的环境特征才豁免更新黑名单：转发器因新版本自己的 bug 挂掉时
+// ForwardReady 同样是 false，全部豁免会让坏版本每小时白重启一次、永不收敛。
+func isForwardPortConflict(msg string) bool {
+	return strings.Contains(msg, "address already in use") ||
+		strings.Contains(msg, "Only one usage") // Windows 文案；服务端用不到，防御一下
+}
+
+// healthSample 是 waitHealthy 里「这一份状态文件是否足以证明新版本健康」的纯判定。
+//
+// 返回下一次 healthy 计数、第一次健康时的 UpdatedAt、是否判定完成、以及未完成的原因。
+// 抽成纯函数是为了能测「两次读到同一份状态文件不能算健康」：进程启动后只写一次状态就
+// 僵死（死锁、卡在 iptables）时，Fresh() 和 is-active 都会被骗过去；但同一份文件也可能
+// 只是没赶上刷新周期，所以实现是「保持计数继续等」，僵死由超时兜底。
+func healthSample(st Status, before string, healthy int, firstStamp string) (int, string, bool, string) {
+	if st.UpdatedAt == before {
+		return 0, "", false, "状态文件还是启动前那一份（新进程尚未写入）"
+	}
+	if !st.Fresh() {
+		return 0, "", false, "状态文件没有刷新"
+	}
+	// 转发器是节点机访问服务的入口。它启动失败时进程照样健康、状态文件照样刷新，
+	// 但节点机的端口转发全不通 —— 这种「活着但没用」不能算健康，否则坏版本会被
+	// 记成更新成功、跳过回滚。
+	//
+	// 只认「已确认失败」：状态文件来自旧版 daemon 时 ForwardKnown 是 false，
+	// 那种未知状态不能当成失败（否则老版本一升级就被误回滚）。
+	if st.ForwardKnown && !st.ForwardReady {
+		return 0, "", false, "端口转发器启动失败: " + st.ForwardError
+	}
+	// 两次读到同一份文件：可能只是没赶上 5 秒刷新周期（采样间隔 3 秒）。不算新的
+	// 健康采样，保持计数继续等下一次，别重置重来 —— 否则 3s/5s 的相位会让它反复
+	// 从头开始。真僵死的话会一直等到 timeout 判失败，方向仍是 fail-closed。
+	if healthy >= 1 && st.UpdatedAt == firstStamp {
+		return healthy, firstStamp, false, "状态文件在两次采样间没有刷新（继续观察）"
+	}
+	// 连两次都健康才算：单次采样可能正好落在两次崩溃之间。
+	healthy++
+	if healthy == 1 {
+		return 1, st.UpdatedAt, false, "第一次健康，等第二次确认"
+	}
+	return healthy, firstStamp, true, ""
+}
+
 // cmdUpdate 实现 `antapp-linkd update`：查更新源，有新版本就换掉自己并重启。
 //
 // 不带 --check 时才会真的替换二进制并重启服务（没有单独的 --apply 开关）。
@@ -148,6 +200,13 @@ func cmdUpdate(stdout, stderr io.Writer, args []string) int {
 	fmt.Fprintf(stdout, "已下载并校验 sha256\n")
 
 	if err := applyUpdate(newBin, stdout); err != nil {
+		// 转发端口被别的进程占着是环境问题，不是版本问题：回滚是对的（这个版本在这台
+		// 机器上确实跑不起来），但不能拉黑 —— 占用方消失后下一轮应该还能试。
+		var fe *forwardEnvError
+		if errors.As(err, &fe) {
+			fmt.Fprintf(stderr, "更新已回滚：转发端口被外部占用，不是版本问题（%v）；未记失败版本，占用解除后下一轮会重试\n", fe)
+			return 1
+		}
 		// 只有「已经替换过、可能已经把服务搞坏」才值得锁掉这一版。备份失败、路径不对、
 		// 替换没落到目标文件上（update.ErrNotApplied）这些现场都没动，锁掉它只会白挡
 		// 一个版本，还让人以为自己在旧版本上。

@@ -48,10 +48,20 @@ func Up(cfg Config, logger *slog.Logger, force bool) error {
 		_ = iptables(args...)
 	}
 
+	// 换段时先把上一段留下的 INPUT 放行清掉：Up 只 ensureRule 新段，旧段会永久
+	// 对公网开着。记录由上一次 Up 写进 /run。
+	currentRange := fmt.Sprintf("%d:%d", cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
+	if prev := readForwardRange(); prev != "" && prev != currentRange {
+		removeInputRange(prev)
+		logger.Info("已清理旧转发端口段的放行规则", "range", prev)
+	}
 	for _, r := range Rules(cfg, wan) {
 		if err := ensureRule(r); err != nil {
 			return err
 		}
+	}
+	if err := writeForwardRange(currentRange); err != nil {
+		logger.Warn("记录转发端口段失败（换段时旧规则可能残留）", "err", err)
 	}
 	logger.Info("netfilter 规则就绪",
 		"forward_ports", fmt.Sprintf("%d-%d", cfg.ForwardPorts.Start, cfg.ForwardPorts.End),
@@ -69,18 +79,41 @@ func Down(cfg Config, logger *slog.Logger) error {
 	_ = iptables("-t", "nat", "-F", ChainName)
 	_ = iptables("-t", "nat", "-X", ChainName)
 
-	if wan, err := defaultInterface(); err == nil {
-		for _, r := range Rules(cfg, wan) {
-			if r.Chain == ChainName {
-				continue // 已随自定义链一起删掉
-			}
-			args := []string{"-t", TableOrDefault(r.Table), "-D", r.Chain}
-			args = append(args, r.Args...)
-			_ = iptables(args...)
-		}
+	// 端口段放行按形状删：当前段 + 上一次记录过的段（换段后旧段规则还留着）。
+	currentRange := fmt.Sprintf("%d:%d", cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
+	removeInputRange(currentRange)
+	if prev := readForwardRange(); prev != "" && prev != currentRange {
+		removeInputRange(prev)
 	}
+
+	wan, err := defaultInterface()
+	if err != nil {
+		// 拿不到出口网卡就拼不出 MASQUERADE / MSS clamp 的删除参数。如实报错，
+		// 不要静默跳过还宣称「已清理」—— 残留的 INPUT 放行/NAT 会无人察觉。
+		//
+		// 这里不能删 forward-range 记录：内置链规则还没清完，记录是下一次 Up/Down
+		// 定位旧端口段的唯一线索。
+		return fmt.Errorf("netfilter: 查不到默认出口网卡，内置链规则未清理（残留需手动处理）: %w", err)
+	}
+	for _, r := range Rules(cfg, wan) {
+		if r.Chain == ChainName {
+			continue // 已随自定义链一起删掉
+		}
+		args := []string{"-t", TableOrDefault(r.Table), "-D", r.Chain}
+		// 去掉 -o：iptables -D 未给出的字段不参与匹配，这样网卡改名后也能删掉
+		// MASQUERADE / MSS clamp（Up 时写的是旧网卡名）。
+		args = append(args, stripOutIface(r.Args)...)
+		_ = iptables(args...)
+	}
+	// 全部清理走完才删记录：中途失败时留着，下一次 Up/Down 还能按它定位旧段。
+	_ = os.Remove(forwardRangePath)
 	logger.Info("netfilter 规则已清理")
 	return nil
+}
+
+// removeInputRange 删除「转发端口段放行」的 INPUT 规则（-D 容忍不存在）。
+func removeInputRange(portRange string) {
+	_ = iptables("-D", "INPUT", "-p", "tcp", "--dport", portRange, "-j", "ACCEPT")
 }
 
 func ensureRule(r Rule) error {
