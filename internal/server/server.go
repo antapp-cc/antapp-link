@@ -531,7 +531,14 @@ func (s *Server) handshake(ctx context.Context, raw net.Conn) (*tls.Conn, string
 	_ = tlsConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	typ, payload, err := proto.ReadFrame(tlsConn)
 	if err != nil {
-		s.log.Warn("读首帧失败", connLogAttrs(err, tlsConn, "client", name)...)
+		attrs := connLogAttrs(err, tlsConn, "client", name)
+		if connBrokenReason(err) == reasonPeerClosed {
+			// 客户端启动收敛或收尾时会主动关掉多余连接，首帧前关闭是正常的，
+			// 不是服务端异常。记 Debug，别和超时/乱码/认证失败混在 Warn 里。
+			s.log.Debug("读首帧失败：对端正常关闭", attrs...)
+		} else {
+			s.log.Warn("读首帧失败", attrs...)
+		}
 		return nil, "", helloPayload{}, false
 	}
 	if typ != proto.TypeHello {
@@ -711,6 +718,10 @@ func (s *Server) noteJoinFailure(sess *session) {
 
 // connBrokenReason 把连接断开的 error 翻成一句人话；认不出返回空串。
 // 客户端侧有一份对应实现（Windows 的 syscall 文案也需要它）。
+// reasonPeerClosed 是「对端正常关闭」的归类文案。读首帧失败的日志级别靠它区分：
+// 对端主动关闭是正常收敛，其他原因（超时、重置、乱码）才是异常。
+const reasonPeerClosed = "对端正常关闭了连接"
+
 func connBrokenReason(err error) string {
 	if err == nil {
 		return ""
@@ -729,7 +740,7 @@ func connBrokenReason(err error) string {
 		strings.Contains(msg, "timed out"):
 		return "对端一段时间没有响应（线路中断，或对端进程卡住）"
 	case strings.Contains(msg, "eof"):
-		return "对端正常关闭了连接"
+		return reasonPeerClosed
 	case strings.Contains(msg, "unreachable"):
 		return "网络不可达"
 	case strings.Contains(msg, "refused"):
