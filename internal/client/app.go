@@ -1448,6 +1448,12 @@ func (a *App) CheckUpdate(ctx context.Context, quiet bool) (*update.Manifest, er
 		return nil, nil
 	}
 
+	// 上次更新后没能健康启动、已经回滚过的版本：跳过，别让旧版反复把它装回去。
+	if m.Version == update.FailedVersion() {
+		a.log.Warn("跳过已知有问题的版本（上次更新后未能健康启动）", "version", m.Version)
+		return nil, nil
+	}
+
 	a.log.Info("发现新版本", "current", Version, "latest", m.Version)
 	a.mu.Lock()
 	a.pending = m

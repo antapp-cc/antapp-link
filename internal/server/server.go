@@ -56,6 +56,12 @@ const (
 	// tunDropRefreshEvery 是重新执行 ip -s link 的间隔。每 5 秒 fork 一次没必要，
 	// 丢包是趋势指标，30 秒的粒度足够，也避免在 fd 紧张时雪上加霜。
 	tunDropRefreshEvery = 30 * time.Second
+
+	// statusWatchdogTimeout 是「状态上报心跳停了多久算僵死」。reportStatus 每 5 秒
+	// 写一次状态，中间要取会话锁；连续 60 秒没心跳说明主循环被死锁拖住了。
+	// systemd 的 Restart 只在进程退出时生效，僵死必须主动退出才能让 systemd 拉起
+	// 一个干净进程 —— 否则节点显示「已连接」却一点流量都不走。
+	statusWatchdogTimeout = 60 * time.Second
 )
 
 // handshakeLimiter 给外层 TLS 握手加一个有界闸门。
@@ -167,6 +173,9 @@ type Server struct {
 	hsFails    atomic.Uint64
 	instanceID string
 	startedAt  time.Time
+	// statusBeat 是 reportStatus 每轮上报的 UnixNano 心跳，watchdogLoop 据此判断
+	// 进程是否已经僵死（状态文件写不出来 / 主循环被死锁拖住）。
+	statusBeat atomic.Int64
 }
 
 // relayState 是端口转发器的启动结果：就绪，或一句能被 status 展示的失败原因。
@@ -252,6 +261,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		defer stopRelay()
 	}
 	go s.reportStatus(runCtx)
+	go s.watchdogLoop(runCtx)
 	go func() {
 		<-runCtx.Done()
 		_ = ln.Close()
@@ -1045,6 +1055,7 @@ func (s *Server) reportStatus(ctx context.Context) {
 		tunKnown     bool
 	)
 	for {
+		s.statusBeat.Store(time.Now().UnixNano())
 		st := Status{
 			Listen:     s.cfg.Listen,
 			Device:     s.cfg.Tunnel.Device,
@@ -1108,6 +1119,40 @@ func (s *Server) reportStatus(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+	}
+}
+
+// watchdogStuck 判断状态上报心跳是否已经停了超过 timeout。零值（还没写过）不算：
+// 启动初期 reportStatus 可能还没跑第一轮。
+func watchdogStuck(beat, now time.Time, timeout time.Duration) bool {
+	return !beat.IsZero() && now.Sub(beat) > timeout
+}
+
+// watchdogLoop 盯住 reportStatus 的心跳。
+//
+// 状态文件每 5 秒刷新一次，心跳停了说明进程卡在某个锁上（数据面死锁、会话锁被
+// 写超时拖死）—— 这类僵死 systemd 发现不了（进程还在）。主动退出让 Restart=always
+// 拉起干净进程，比「显示在线但流量全停」好。
+func (s *Server) watchdogLoop(ctx context.Context) {
+	t := time.NewTicker(10 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			beat := time.Unix(0, s.statusBeat.Load())
+			if !watchdogStuck(beat, time.Now(), statusWatchdogTimeout) {
+				continue
+			}
+			silent := time.Since(beat).Round(time.Second)
+			s.log.Error("状态上报心跳停止，判定进程僵死，主动退出让 systemd 重启", "silent_for", silent)
+			select {
+			case s.fatal <- fmt.Errorf("状态上报心跳停止 %v（疑似死锁），主动退出重启", silent):
+			default:
+			}
+			return
 		}
 	}
 }

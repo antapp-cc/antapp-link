@@ -34,6 +34,7 @@ func waitHealthyThenCleanup(app *client.App) {
 	deadline := time.Now().Add(cleanupHealthyWait)
 	for time.Now().Before(deadline) {
 		if app.Status().Online {
+			_ = update.MarkHealthy(client.Version)
 			update.CleanupOldAfterHealthy()
 			return
 		}
@@ -89,6 +90,22 @@ func run() int {
 	}
 
 	rootDir := *dataArg
+
+	// 上次更新留下的 .old 如果对应「从未健康运行过」的新版，先把磁盘恢复成旧版。
+	// 放在单实例检查之前：崩溃版可能连单实例初始化这一步都过不去，恢复要尽早。
+	if self, serr := os.Executable(); serr == nil {
+		rolled, rerr := update.RollbackIfUnhealthyUpdate(self, client.Version)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "回滚上次未健康启动的更新失败: %v\n", rerr)
+		} else if rolled {
+			// 磁盘已经恢复旧版。当前进程是被回滚掉的新版：继续运行会让用户误以为
+			// 更新成功，而且它会写健康标记、把失败版本记录清掉，导致旧版下次又
+			// 把同一个崩溃版本装回来。直接退出，让用户重新启动旧版。
+			client.ShowMessage("AntApp Link",
+				"上次更新后的新版本未能正常启动，已自动恢复旧版。\n\n请重新打开程序。")
+			return 1
+		}
+	}
 
 	// 单实例闸门。桌面快捷方式点几次就起几个进程的话，托盘上会堆一排图标；
 	// 更要紧的是几个实例会同时去抢同一块虚拟网卡和同一批路由，把网络搅乱。
@@ -240,12 +257,20 @@ func run() int {
 	// 根本用不了，而提前写下的 ready 已经让旧进程放手了。ready 由 RunUI 在界面
 	// 建好之后写，见 client/ui_windows.go 的 buildUIThenConfirm。
 	go waitHealthyThenCleanup(app)
+	// 进程稳定跑过观察窗口也算健康：用户可能一直挂着不连隧道，不能因此让
+	// 下次启动把新版回滚掉。
+	go func() {
+		time.Sleep(2 * time.Minute)
+		_ = update.MarkHealthy(client.Version)
+	}()
 	if err := client.RunUI(app, logs, dataDir); err != nil {
 		logger.Error("界面启动失败", "err", err)
 		failStartup(err)
 		client.ShowMessage("AntApp Link", "界面启动失败："+err.Error())
 		return 1
 	}
+	// 用户正常关闭：新版至少成功运行到主动退出，标记健康，下次启动不回滚。
+	_ = update.MarkHealthy(client.Version)
 	return 0
 }
 

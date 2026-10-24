@@ -54,6 +54,9 @@ func apply(self, newExePath string) error {
 		Detail: fmt.Sprintf("替换 %s", self),
 	})
 
+	// 旧版的健康标记对即将替换的新版无效：新版要重新证明自己健康。
+	ClearHealthyMark()
+
 	// 交接状态建不起来就中止更新：没有它，旧进程无法确认新版是否真的接手，
 	// 只能退回「Start() 成功即成功」—— 那正是这一轮要消灭的行为。临时目录不可写、
 	// 空间不足都会走到这里；宁可这次不更新，也不能让旧版在无法确认的情况下退出。
@@ -130,42 +133,49 @@ func awaitHandoff(dir string, h *Handoff, newProc *exec.Cmd, self string) error 
 
 	// ready 只覆盖「图标、窗口、托盘都建好了」这一刻。新版确认后马上崩掉的话，
 	// 旧进程如果已经走了，就没有任何人能恢复磁盘上的回滚副本。
-	if !newProcessExited(newProc, applyPostReadyGrace) {
+	exited, waitErr := waitProcessExit(newProc, applyPostReadyGrace)
+	if !exited {
+		return nil
+	}
+	// 退出码 0 是正常退出（用户自己关掉了窗口），不是"新版没站住"：磁盘上的新版
+	// 是好的，回滚反而会把用户刚确认可用的版本换回旧的。用户主动关掉的程序也不该
+	// 被一个隐藏的旧窗口顶回来。
+	if waitErr == nil {
+		recordLifecycle(LifecycleEvent{Event: EventUpdateReady, Detail: "新版正常退出（用户主动关闭），保留新版"})
 		return nil
 	}
 
 	reclaimed := reclaimInstance()
 	if reclaimed {
 		if rerr := restoreOldExe(self); rerr != nil {
-			recordLifecycle(LifecycleEvent{Event: EventRollback, Detail: "新版确认后退出，恢复旧版失败", Err: rerr.Error()})
-			return fmt.Errorf("新版在确认启动后 %v 内退出，且恢复旧版失败（旧版仍在 %s.old，可手动改回）: %w",
+			recordLifecycle(LifecycleEvent{Event: EventRollback, Detail: "新版确认后异常退出，恢复旧版失败", Err: rerr.Error()})
+			return fmt.Errorf("新版在确认启动后 %v 内异常退出，且恢复旧版失败（旧版仍在 %s.old，可手动改回）: %w",
 				applyPostReadyGrace, self, rerr)
 		}
-		recordLifecycle(LifecycleEvent{Event: EventRollback, Detail: "新版确认后退出，已恢复旧版"})
-		return fmt.Errorf("新版在确认启动后 %v 内退出，已恢复旧版并继续运行", applyPostReadyGrace)
+		recordLifecycle(LifecycleEvent{Event: EventRollback, Detail: "新版确认后异常退出，已恢复旧版"})
+		return fmt.Errorf("新版在确认启动后 %v 内异常退出，已恢复旧版并继续运行", applyPostReadyGrace)
 	}
-	recordLifecycle(LifecycleEvent{Event: EventHandoffTimeout, Detail: "新版确认后退出，但单实例互斥体已被别的实例持有"})
-	return fmt.Errorf("新版在确认启动后 %v 内退出，且单实例互斥体已被别的实例持有：本窗口停止接管网络，请关闭它（%w）",
+	recordLifecycle(LifecycleEvent{Event: EventHandoffTimeout, Detail: "新版确认后异常退出，但单实例互斥体已被别的实例持有"})
+	return fmt.Errorf("新版在确认启动后 %v 内异常退出，且单实例互斥体已被别的实例持有：本窗口停止接管网络，请关闭它（%w）",
 		applyPostReadyGrace, ErrHandoffBlocked)
 }
 
-// newProcessExited 在 grace 内观察新进程是否退出；返回 true 表示它已经死了。
+// waitProcessExit 在 grace 内观察新进程是否退出；返回 true 表示它已经死了。
 //
-// 用 goroutine 等 Wait：Windows 上没有可靠的「查一下就返回」的进程存活接口，
-// 而 Wait 正是回收进程句柄的那次调用。
-func newProcessExited(cmd *exec.Cmd, grace time.Duration) bool {
-	exited := make(chan struct{})
+// 第二个返回值是 cmd.Wait 的结果：nil = 正常退出（exit 0），*exec.ExitError =
+// 崩溃或非零退出。调用方据此区分「用户主动关闭」和「新版没站住」。
+func waitProcessExit(cmd *exec.Cmd, grace time.Duration) (bool, error) {
+	done := make(chan error, 1)
 	go func() {
-		_ = cmd.Wait()
-		close(exited)
+		done <- cmd.Wait()
 	}()
 	t := time.NewTimer(grace)
 	defer t.Stop()
 	select {
-	case <-exited:
-		return true
+	case err := <-done:
+		return true, err
 	case <-t.C:
-		return false
+		return false, nil
 	}
 }
 
@@ -191,6 +201,40 @@ func restoreOldExe(self string) error {
 	// 崩掉的那一版没有保留价值，下次更新会重新下载。
 	_ = os.Remove(failed)
 	return nil
+}
+
+// RollbackIfUnhealthyUpdate 在启动早期检查「上次更新是否留下了从未健康运行过的新版」。
+//
+// 判据：安装目录旁边有 .old（上次更新替换掉旧版的副本），而健康标记不是当前版本 ——
+// 说明新版启动后从未确认健康（旧进程 2 秒窗口没覆盖到的崩溃，或进程被强杀）。
+// 此时把磁盘恢复成 .old，并把这个版本记成失败版本，避免旧版下次又把它装回来。
+//
+// 返回 true 表示执行了回滚。当前进程是内存里的新版，回滚只影响下次启动。
+func RollbackIfUnhealthyUpdate(self, currentVersion string) (bool, error) {
+	old := self + ".old"
+	if _, err := os.Stat(old); err != nil {
+		return false, nil
+	}
+	if healthyMarkedVersion() == currentVersion {
+		return false, nil // 当前版本健康过，.old 只是还没清理的备份
+	}
+	failed := self + ".failed"
+	_ = os.Remove(failed)
+	if err := os.Rename(self, failed); err != nil {
+		return false, err
+	}
+	if err := os.Rename(old, self); err != nil {
+		// 退回去：正常路径上必须留着一个能启动的程序。
+		_ = os.Rename(failed, self)
+		return false, err
+	}
+	MarkFailedVersion(currentVersion)
+	recordLifecycle(LifecycleEvent{
+		Event:   EventRollback,
+		Version: currentVersion,
+		Detail:  "上次更新后新版从未健康运行，已恢复旧版",
+	})
+	return true, nil
 }
 
 // swapExe 是 Apply 里可测的那部分：改名 → 写入 → 拉起。

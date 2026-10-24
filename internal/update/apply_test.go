@@ -150,9 +150,20 @@ func startHandoffChild(t *testing.T, dir, invocation, envKey, testName string) *
 	return cmd
 }
 
-// 模拟「界面刚建好就崩」的新版：确认接手后立刻退出。
+// 模拟「界面刚建好就崩」的新版：确认接手后立刻以非零退出码退出。
 func TestHandoffHelperReadyThenExit(t *testing.T) {
 	if os.Getenv("GO_WANT_HANDOFF_READY_EXIT") != "1" {
+		return
+	}
+	if err := MarkStartupReady(); err != nil {
+		os.Exit(3)
+	}
+	os.Exit(4) // 崩溃（非零退出），不是用户主动关闭
+}
+
+// 模拟「确认接手后用户正常关闭」：退出码 0。
+func TestHandoffHelperReadyThenNormalExit(t *testing.T) {
+	if os.Getenv("GO_WANT_HANDOFF_NORMAL_EXIT") != "1" {
 		return
 	}
 	if err := MarkStartupReady(); err != nil {
@@ -215,6 +226,36 @@ func TestAwaitHandoffDetectsExitRightAfterReady(t *testing.T) {
 	}
 	if _, serr := os.Stat(self + ".old"); !os.IsNotExist(serr) {
 		t.Errorf("恢复成功后 .old 不该还在，实际 err=%v", serr)
+	}
+}
+
+// 新版确认后用户主动关闭（退出码 0）是正常退出：磁盘上的新版要保留，不回滚。
+func TestAwaitHandoffKeepsNewOnNormalExit(t *testing.T) {
+	stubLifecycle(t)
+	dir, h := newTestHandoff(t)
+	self := filepath.Join(t.TempDir(), "app.exe")
+	writeFakeExePair(t, self)
+
+	prevGrace := applyPostReadyGrace
+	applyPostReadyGrace = time.Second
+	t.Cleanup(func() { applyPostReadyGrace = prevGrace })
+
+	SetInstanceHandoffHooks(func() {}, func() bool {
+		t.Error("正常退出不该回收互斥体")
+		return true
+	})
+	t.Cleanup(func() { SetInstanceHandoffHooks(func() {}, func() bool { return true }) })
+
+	cmd := startHandoffChild(t, dir, h.InvocationID, "GO_WANT_HANDOFF_NORMAL_EXIT", "TestHandoffHelperReadyThenNormalExit")
+	if err := awaitHandoff(dir, h, cmd, self); err != nil {
+		t.Fatalf("正常退出不该报错: %v", err)
+	}
+	got, rerr := os.ReadFile(self)
+	if rerr != nil || string(got) != "new" {
+		t.Errorf("正常退出应保留新版，实际 %q (err=%v)", got, rerr)
+	}
+	if _, serr := os.Stat(self + ".old"); serr != nil {
+		t.Errorf("正常退出应保留回滚副本，实际 err=%v", serr)
 	}
 }
 
@@ -456,5 +497,50 @@ func TestCleanupOldAfterHealthyRemovesWhenAlreadyMature(t *testing.T) {
 
 	if _, err := os.Stat(backup); !os.IsNotExist(err) {
 		t.Errorf("跑够窗口后应清掉回滚副本，实际 err=%v", err)
+	}
+}
+
+// 上次更新留下了 .old、而当前版本从未确认健康：启动时应回滚到旧版并记录失败版本。
+func TestRollbackIfUnhealthyUpdate(t *testing.T) {
+	stubLifecycle(t)
+	stubRolloutPaths(t)
+	self := filepath.Join(t.TempDir(), "app.exe")
+	writeFakeExePair(t, self)
+
+	rolled, err := RollbackIfUnhealthyUpdate(self, "0.5.0")
+	if err != nil {
+		t.Fatalf("回滚失败: %v", err)
+	}
+	if !rolled {
+		t.Fatal("无健康标记 + 有 .old 时应回滚")
+	}
+	if got, rerr := os.ReadFile(self); rerr != nil || string(got) != "old" {
+		t.Errorf("程序路径应恢复成旧版，实际 %q (err=%v)", got, rerr)
+	}
+	if _, serr := os.Stat(self + ".old"); !os.IsNotExist(serr) {
+		t.Errorf("回滚后 .old 不该还在，实际 err=%v", serr)
+	}
+	if got := FailedVersion(); got != "0.5.0" {
+		t.Errorf("应记录失败版本 0.5.0，实际 %q", got)
+	}
+
+	// 健康标记匹配当前版本：.old 只是没清理的备份，不该回滚。
+	writeFakeExePair(t, self)
+	if err := MarkHealthy("0.5.0"); err != nil {
+		t.Fatal(err)
+	}
+	rolled, err = RollbackIfUnhealthyUpdate(self, "0.5.0")
+	if err != nil || rolled {
+		t.Fatalf("健康过不该回滚: rolled=%v err=%v", rolled, err)
+	}
+
+	// 没有 .old：什么都不做。
+	if err := os.Remove(self + ".old"); err != nil {
+		t.Fatal(err)
+	}
+	ClearHealthyMark()
+	rolled, err = RollbackIfUnhealthyUpdate(self, "0.5.0")
+	if err != nil || rolled {
+		t.Fatalf("没有回滚副本时不该动文件: rolled=%v err=%v", rolled, err)
 	}
 }
