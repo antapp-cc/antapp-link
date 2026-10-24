@@ -319,7 +319,7 @@ func TestManifestValidateVersionFormat(t *testing.T) {
 			t.Errorf("版本 %q 应通过校验: %v", v, err)
 		}
 	}
-	for _, v := range []string{"", "oops", "1.2", "1.2.3.4"} {
+	for _, v := range []string{"", "oops", "1.2", "1.2.3.4", `1.2.3-..\..\x`, "1.2.3-a/b", "1.2.3-a:b", "1.2.3-"} {
 		if err := base(v).Validate(); err == nil {
 			t.Errorf("版本 %q 应被拒绝", v)
 		}

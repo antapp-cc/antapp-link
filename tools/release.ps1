@@ -24,10 +24,12 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 
-# 版本号格式：和 internal/update 的 versionPattern 同一规则。格式错了签名发布
-# 照样能过，但所有节点会把它比较成「没有更新」——必须在构建前拦下来。
-if ($Version -notmatch '^\d+\.\d+\.\d+([-+].*)?$') {
-    throw "版本号格式不对：$Version（需要 主.次.修订，例如 0.4.12）"
+# 版本号格式：和 internal/update 的 versionPattern、build.ps1 同一套规则。
+# 后缀只允许 SemVer 安全字符（字母/数字/点/连字符）：路径分隔符、盘符和 .. 段
+# 一旦进来，下面的递归删除就可能越出仓库。格式错了签名发布照样能过，但所有节点
+# 会把它比较成「没有更新」——必须在构建前拦下来。
+if ($Version -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$') {
+    throw "版本号格式不对：$Version（只允许 主.次.修订 和 -/+ 安全后缀，例如 0.4.13）"
 }
 
 Write-Host "== 构建 $Version ==" -ForegroundColor Cyan
@@ -45,8 +47,15 @@ $linkdHash = (Get-FileHash $linkd -Algorithm SHA256).Hash.ToLower()
 $linkdSize = (Get-Item $linkd).Length
 
 $out = Join-Path $root "dist\release-$Version"
-if (Test-Path $out) { Remove-Item $out -Recurse -Force }
-New-Item -ItemType Directory -Force $out | Out-Null
+# 版本号后缀已限制为安全字符，这里再兜底一次：发布目录必须真的在 dist 下，
+# 否则拒绝删除 —— 递归删错目录的代价太大。
+$fullOut = [IO.Path]::GetFullPath($out)
+$fullDist = [IO.Path]::GetFullPath((Join-Path $root 'dist')).TrimEnd('\') + '\'
+if (-not $fullOut.StartsWith($fullDist, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "发布目录越界：$fullOut（必须在 $fullDist 下）"
+}
+if (Test-Path $fullOut) { Remove-Item $fullOut -Recurse -Force }
+New-Item -ItemType Directory -Force $fullOut | Out-Null
 
 Copy-Item $exe (Join-Path $out 'antapp-link.exe') -Force
 Copy-Item $linkd (Join-Path $out 'antapp-linkd') -Force

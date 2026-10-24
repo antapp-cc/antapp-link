@@ -208,9 +208,10 @@ func (c *Checker) fetchSignature(ctx context.Context, src Source) ([]byte, error
 }
 
 // versionPattern 是清单版本号格式：主.次.修订，可带 prerelease/build 后缀
-// （版本比较会忽略后缀）。签名清单来自发布脚本，格式错了只会在所有节点上静默
-// 判成「没有更新」，所以校验必须和发布脚本用同一套规则。
-var versionPattern = regexp.MustCompile(`^v?\d+\.\d+\.\d+([-+].*)?$`)
+// （版本比较会忽略后缀）。后缀只允许 SemVer 安全字符：这个值在发布脚本里会
+// 拼进文件名和目录名，路径分隔符/盘符/.. 段一律拒绝。和 tools/release.ps1、
+// build.ps1 用同一套规则。
+var versionPattern = regexp.MustCompile(`^v?\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$`)
 
 func (m *Manifest) Validate() error {
 	if !versionPattern.MatchString(strings.TrimSpace(m.Version)) {

@@ -16,6 +16,13 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 Set-Location $root
 
+# 版本号会拼进发布文件名（AntAppLink-安装-<版本>.exe）和 dist 目录名，只允许
+# SemVer 的安全字符：路径分隔符、盘符和 .. 段一旦进来，发布脚本的递归删除可能
+# 越出仓库。和 tools/release.ps1、internal/update 的 Manifest.Validate 同一套规则。
+if ($Version -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$') {
+    throw "版本号格式不对：$Version（只允许 主.次.修订 和 -/+ 安全后缀，例如 0.4.13）"
+}
+
 $distDir = Join-Path $root $Dist
 New-Item -ItemType Directory -Force $distDir | Out-Null
 
