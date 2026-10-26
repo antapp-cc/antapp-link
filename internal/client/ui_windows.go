@@ -271,6 +271,9 @@ func (u *UI) build() error {
 	// 没用（会被随后的 SetForegroundWindow 重置）。索性让它根本不参与轮转。
 	disableTabStop(u.txtLog.Handle())
 
+	// 窗口宽度变化时按新宽度重排日志（旧行也跟着变）。
+	u.txtLog.BoundsChanged().Attach(u.relayoutLog)
+
 	if err := u.buildTray(); err != nil {
 		return err
 	}
@@ -806,7 +809,12 @@ func (u *UI) refresh() {
 	// 改成只追加新行：控件从空开始，选择状态就永远停在初始值，不给它变全选的机会。
 	if newLines, seq := u.logs.Since(u.logSeq); len(newLines) > 0 {
 		u.logSeq = seq
-		u.txtLog.AppendText(strings.Join(newLines, "\r\n") + "\r\n")
+		max := u.logMaxUnits()
+		fitted := make([]string, len(newLines))
+		for i, l := range newLines {
+			fitted[i] = fitLogLineTo(l, max)
+		}
+		u.txtLog.AppendText(strings.Join(fitted, "\r\n") + "\r\n")
 		u.trimLog()
 
 		const (
@@ -841,6 +849,43 @@ func (u *UI) trimLog() {
 	}
 	u.txtLog.SetTextSelection(0, n-logTrimKeep)
 	u.txtLog.ReplaceSelectedText("", false)
+}
+
+// logMaxUnits 按日志区当前宽度算能放多少显示单位（ASCII=1，中文=2）。
+//
+// 时间列在行首、截断从行尾做，所以时间永远保留；窗口拉宽后重排（relayoutLog）
+// 也用它。
+func (u *UI) logMaxUnits() int {
+	w := u.txtLog.BoundsPixels().Width
+	if w <= 0 {
+		w = 500
+	}
+	units := (w - 17) / 7 // 滚动条约 17px，Consolas 9pt 约 7px/单位
+	if units < 20 {
+		units = 20
+	}
+	return units
+}
+
+// relayoutLog 按当前窗口宽度重排已显示的日志：窗口拉宽/收窄时旧行也跟着变。
+func (u *UI) relayoutLog() {
+	if u.mw == nil || u.txtLog == nil {
+		return
+	}
+	max := u.logMaxUnits()
+	var b strings.Builder
+	for _, l := range u.logs.Tail(0) {
+		b.WriteString(fitLogLineTo(l, max))
+		b.WriteString("\r\n")
+	}
+	// resize 时整框重绘可以接受：选择/滚动位置会重置，但窗口大小变化本来就是用户主动操作。
+	u.txtLog.SetText(b.String())
+	u.logSeq = u.logs.Seq()
+	const (
+		wmVScroll = 0x0115
+		sbBottom  = 7
+	)
+	u.txtLog.SendMessage(wmVScroll, sbBottom, 0)
 }
 
 // Connect/Disconnect 会做网络操作（探测、改路由、跑 PowerShell），不能卡住界面线程。

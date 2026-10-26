@@ -173,6 +173,13 @@ func (b *LogBuffer) Clear() {
 	b.lines = nil
 }
 
+// Seq 返回累计写入过的行数；窗口重排后界面用它把增量游标推到最新。
+func (b *LogBuffer) Seq() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.seq
+}
+
 // Tail 返回最后 n 行。n<=0 表示全部。
 func (b *LogBuffer) Tail(n int) []string {
 	b.mu.Lock()
@@ -230,7 +237,9 @@ func (h *teeHandler) Handle(_ context.Context, r slog.Record) error {
 		return err
 	}
 	if r.Level >= slog.LevelInfo {
-		h.buf.addLine(fitLogLine(uiLine))
+		// 存完整行：界面在展示时按当前窗口宽度截断（窗口拉宽后旧行也能重排），
+		// 文件本来就是完整的。
+		h.buf.addLine(uiLine)
 	}
 	return nil
 }
@@ -253,6 +262,11 @@ const ellipsisUnits = 2
 // 所以从数据层保证：界面只展示放得下的部分。完整内容在日志文件里
 // （file handler 不经过这里），需要时去看文件。
 func fitLogLine(s string) string {
+	return fitLogLineTo(s, logLineMaxUnits)
+}
+
+// fitLogLineTo 按给定显示宽度截断；界面会按当前窗口宽度传入 max。
+func fitLogLineTo(s string, max int) string {
 	width := 0
 	for i, r := range s {
 		w := 1
@@ -260,7 +274,7 @@ func fitLogLine(s string) string {
 			w = 2
 		}
 		// 截断用的 … 自己占 2 格（中文宽度），必须提前预留，否则截出来还是超
-		if width+w+ellipsisUnits > logLineMaxUnits {
+		if width+w+ellipsisUnits > max {
 			return s[:i] + "…"
 		}
 		width += w
