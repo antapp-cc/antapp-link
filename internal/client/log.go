@@ -237,9 +237,9 @@ func (h *teeHandler) Handle(_ context.Context, r slog.Record) error {
 
 // logLineMaxUnits 是界面日志区一行能容纳的显示宽度（ASCII=1，中文=2）。
 //
-// 实测客户区 529px、9pt Consolas 约 7px/字符、前缀 19 字符占 133px，扣掉滚动条后
-// 约 54 单位，加上前缀 11 就是 65 —— 但实测还有余量，取 82。
-const logLineMaxUnits = 75
+// 取 60：60×7px≈420px，安全小于日志区客户区（约 500px），截断后不会再折行；
+// 之前 75（约 525px）截断后仍超宽，EDIT 控件就会把行折成两行。
+const logLineMaxUnits = 60
 
 // ellipsisUnits 是截断标记 … 的显示宽度。
 const ellipsisUnits = 2
