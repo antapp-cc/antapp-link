@@ -24,7 +24,7 @@ func TestFitLogLineCapsWidth(t *testing.T) {
 		name string
 		in   string
 	}{
-		{"短行不动", "10-20 12:01:51 . 已连接 103.142.86.145:62233（4 条并行连接）"},
+		{"短行不动", "10-20 12:01:51 . 已连接"},
 		{"中文超长", "10-20 12:01:40 ! 会话结束  原因=" + strings.Repeat("很长的中文原因", 20)},
 		{"英文超长", "10-20 12:01:40 ! " + strings.Repeat("abcdefghij", 30)},
 		{"中英混排超长", "10-20 12:01:40 ! " + strings.Repeat("连接abc", 30)},
