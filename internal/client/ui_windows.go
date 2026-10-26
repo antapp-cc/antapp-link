@@ -47,8 +47,9 @@ const emSetTargetDevice = 0x0448
 // 界面日志区只保留最近约 56K 字符（约 400 行）：多行 EDIT 默认 65535 字上限，
 // 不裁剪的话拉满后 AppendText 会静默失效，界面就不动了。完整历史在日志文件里。
 const (
-	logTrimThreshold = 60000 // 超过这么多字符就裁剪
-	logTrimKeep      = 56000 // 裁剪后保留最近字符数
+	logMaxLength     = 0x7FFFFFFE // EM_SETLIMITTEXT：把默认 64KB 上限放宽
+	logTrimThreshold = 60000      // 超过这么多字符就裁剪
+	logTrimKeep      = 56000      // 裁剪后保留最近字符数
 )
 
 // 换成独立的托盘库就得处理两个消息循环抢主线程的问题。
@@ -229,6 +230,9 @@ func (u *UI) build() error {
 		u.txtLog.SetBackground(bg)
 	}
 	u.txtLog.SetTextColor(walk.RGB(0x00, 0x00, 0x00))
+	// 放宽 EDIT 默认 64KB 上限。顺带也是「不折行」生效的一环：没有这一步，
+	// 同一个 EDIT 控件在长行上仍会按窗口宽度折（0.4.12/0.4.13 的界面就折了）。
+	u.txtLog.SetMaxLength(logMaxLength)
 
 	// 日志区强行单行显示，跟 OpenVPN 一样。
 	//
