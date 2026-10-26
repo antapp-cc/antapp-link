@@ -207,13 +207,13 @@ func (h *teeHandler) Handle(_ context.Context, r slog.Record) error {
 	b.WriteString(" ")
 	b.WriteString(r.Message)
 	for _, a := range h.attrs {
-		b.WriteString("  ")
+		b.WriteString(" ")
 		b.WriteString(attrKeyLabel(a.Key))
 		b.WriteString("=")
 		b.WriteString(a.Value.String())
 	}
 	r.Attrs(func(a slog.Attr) bool {
-		b.WriteString("  ")
+		b.WriteString(" ")
 		b.WriteString(attrKeyLabel(a.Key))
 		b.WriteString("=")
 		b.WriteString(a.Value.String())
