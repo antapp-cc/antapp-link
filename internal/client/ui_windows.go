@@ -1530,9 +1530,12 @@ func (u *UI) onOpenLog() {
 		u.alert("查看日志文件", "日志文件不存在："+path)
 		return
 	}
-	if err := openInExplorer(path); err != nil {
-		u.alert("查看日志文件", err.Error())
-	}
+	// ShellExecute 会等系统关联程序起来，放后台跑，别卡 UI 线程。
+	go func() {
+		if err := openInExplorer(path); err != nil {
+			u.alert("查看日志文件", err.Error())
+		}
+	}()
 }
 
 // trimLog 把界面日志控制在可控长度内。
@@ -1581,7 +1584,7 @@ func (u *UI) alert(title, msg string) {
 	})
 }
 
-// openInExplorer 用 ShellExecute 打开目录。
+// openInExplorer 用 ShellExecute 打开文件或目录。
 //
 // 不走 explorer.exe：它把目录打开之后经常返回非 0 退出码（实测在 C:\Program Files
 // 下必定返回 1），拿退出码当判据就会把「其实已经打开了」报成失败。
