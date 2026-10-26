@@ -11,22 +11,20 @@ import (
 	"sync/atomic"
 )
 
-// rotatingLog 是够用的按大小轮转日志。只留一份备份：排查现场通常只看最近那次，
-// 多留几份只是白占磁盘。
+// rotatingLog 是日志文件写入器（不轮转）：一次运行内的日志完整保留，重启/重连
+// 时清空，避免新旧混在一起。
 type rotatingLog struct {
-	path    string
-	maxSize int64
+	path string
 
 	mu   sync.Mutex
 	file *os.File
-	size int64
 }
 
-func OpenLog(path string, maxSize int64) (*rotatingLog, error) {
+func OpenLog(path string) (*rotatingLog, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	l := &rotatingLog{path: path, maxSize: maxSize}
+	l := &rotatingLog{path: path}
 	if err := l.open(); err != nil {
 		return nil, err
 	}
@@ -34,19 +32,12 @@ func OpenLog(path string, maxSize int64) (*rotatingLog, error) {
 }
 
 func (l *rotatingLog) open() error {
-	// 初始打开（NewFileLogger）清空旧文件：重启后日志从零开始，不跟上次的混在一起。
-	// rotate 之后重开的是刚清空的空文件，截断没有影响。
+	// 打开即清空：重启/重连后日志从零开始，不跟旧的混在一起。
 	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
-	info, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return err
-	}
 	l.file = f
-	l.size = info.Size()
 	return nil
 }
 
@@ -56,26 +47,7 @@ func (l *rotatingLog) Write(p []byte) (int, error) {
 	if l.file == nil {
 		return 0, os.ErrClosed
 	}
-	if l.maxSize > 0 && l.size+int64(len(p)) > l.maxSize {
-		if err := l.rotate(); err != nil {
-			return 0, err
-		}
-	}
-	n, err := l.file.Write(p)
-	l.size += int64(n)
-	return n, err
-}
-
-func (l *rotatingLog) rotate() error {
-	if err := l.file.Close(); err != nil {
-		return err
-	}
-	l.file = nil
-	if err := os.Rename(l.path, l.path+".1"); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	l.size = 0
-	return l.open()
+	return l.file.Write(p)
 }
 
 // SwitchFile 把日志切到新文件。文件是追加写的（保留全部历史）；
@@ -94,7 +66,6 @@ func (l *rotatingLog) SwitchFile(path string) error {
 		return err
 	}
 	l.file = f
-	l.size = 0
 	return nil
 }
 
@@ -417,8 +388,7 @@ func CurrentLogFile() string {
 // NewFileLogger 建一个同时写文件与界面缓冲的 logger。
 func NewFileLogger(root string) (*slog.Logger, *LogBuffer, func(), error) {
 	rootDirForLogs = root
-	// maxSize=0：不轮转，日志文件保留全部历史。
-	rot, err := OpenLog(filepath.Join(LogsDir(root), "client.log"), 0)
+	rot, err := OpenLog(filepath.Join(LogsDir(root), "client.log"))
 	if err != nil {
 		return nil, nil, nil, err
 	}

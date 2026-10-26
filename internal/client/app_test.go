@@ -97,9 +97,10 @@ func TestDirLayout(t *testing.T) {
 	}
 }
 
-func TestOpenLogWritesAndRotates(t *testing.T) {
+// 不轮转：一次运行的日志完整落在一个文件里，不产生 .1 备份。
+func TestOpenLogWritesWithoutRotate(t *testing.T) {
 	dir := t.TempDir()
-	l, err := OpenLog(StatePath(dir), 64)
+	l, err := OpenLog(StatePath(dir))
 	if err != nil {
 		t.Fatalf("OpenLog: %v", err)
 	}
@@ -111,9 +112,15 @@ func TestOpenLogWritesAndRotates(t *testing.T) {
 			t.Fatalf("Write: %v", err)
 		}
 	}
-	// 超过大小上限后应当已轮转出 .1 备份
-	if _, err := os.Stat(l.Path() + ".1"); err != nil {
-		t.Errorf("超过大小上限后应该轮转出备份文件: %v", err)
+	raw, err := os.ReadFile(StatePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := strings.Repeat(string(line), 10); string(raw) != want {
+		t.Fatalf("内容不完整：%q", raw)
+	}
+	if _, err := os.Stat(StatePath(dir) + ".1"); !os.IsNotExist(err) {
+		t.Errorf("不该有 .1 轮转备份")
 	}
 }
 
