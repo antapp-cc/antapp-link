@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/lxn/walk"
@@ -90,9 +89,7 @@ type UI struct {
 	hideAt        time.Time
 	logSeq        uint64
 	lastLogReset  uint64
-	// logLayoutTimer 合并连续的 resize：停手 100ms 后再重排一次。
-	logLayoutTimer *time.Timer
-	done           chan struct{}
+	done          chan struct{}
 	// wantConnected 记录用户是否期望连接。点「断开连接」后置 false，自动重连守护据此
 	// 收手 —— 否则修好「连上又掉没人管」之后会变成「用户点了断开它又自己连回来」。
 	wantConnected atomic.Bool
@@ -275,7 +272,7 @@ func (u *UI) build() error {
 	disableTabStop(u.txtLog.Handle())
 
 	// 窗口宽度变化时按新宽度重排日志（旧行也跟着变）。
-	u.txtLog.BoundsChanged().Attach(u.scheduleLogRelayout)
+	u.txtLog.BoundsChanged().Attach(u.relayoutLog)
 
 	if err := u.buildTray(); err != nil {
 		return err
@@ -857,46 +854,17 @@ func (u *UI) trimLog() {
 // logMaxUnits 按日志区当前宽度算能放多少显示单位（ASCII=1，中文=2）。
 //
 // 时间列在行首、截断从行尾做，所以时间永远保留；窗口拉宽后重排（relayoutLog）
-// 也用它。字宽用控件当前字体实测，高 DPI 下不会按 7px 硬编码算偏。
+// 也用它。
 func (u *UI) logMaxUnits() int {
 	w := u.txtLog.BoundsPixels().Width
 	if w <= 0 {
 		w = 500
 	}
-	units := (w - 17) / u.charWidthPx() // 滚动条约 17px
+	units := (w - 17) / 7 // 滚动条约 17px，Consolas 9pt 约 7px/单位
 	if units < 20 {
 		units = 20
 	}
 	return units
-}
-
-// charWidthPx 用控件当前字体/DPI 实测一个 ASCII 字符的像素宽。
-func (u *UI) charWidthPx() int {
-	hdc := win.GetDC(u.txtLog.Handle())
-	if hdc == 0 {
-		return 7
-	}
-	defer win.ReleaseDC(u.txtLog.Handle(), hdc)
-	s, err := syscall.UTF16PtrFromString("0")
-	if err != nil {
-		return 7
-	}
-	var sz win.SIZE
-	if !win.GetTextExtentPoint32(hdc, s, 1, &sz) || sz.CX <= 0 {
-		return 7
-	}
-	return int(sz.CX)
-}
-
-// scheduleLogRelayout 合并连续的 resize 事件：按约一帧（16ms）合并重排，
-// 拖动过程中也会持续跟着重排，不会出现「拖到一半行先折了、松手才恢复」。
-func (u *UI) scheduleLogRelayout() {
-	if u.logLayoutTimer != nil {
-		u.logLayoutTimer.Stop()
-	}
-	u.logLayoutTimer = time.AfterFunc(16*time.Millisecond, func() {
-		u.mw.Synchronize(u.relayoutLog)
-	})
 }
 
 // relayoutLog 按当前窗口宽度重排已显示的日志：窗口拉宽/收窄时旧行也跟着变。
@@ -910,12 +878,8 @@ func (u *UI) relayoutLog() {
 		b.WriteString(fitLogLineTo(l, max))
 		b.WriteString("\r\n")
 	}
-	// 不用 SetText：WM_SETTEXT 会把整个只读框变成全选，有焦点就整片蓝底。
-	// 全选后替换内容，选择状态停在插入点末尾，最后再收一次光标。
-	n := u.txtLog.TextLength()
-	u.txtLog.SetTextSelection(0, n)
-	u.txtLog.ReplaceSelectedText(b.String(), false)
-	u.txtLog.SetTextSelection(0, 0)
+	// resize 时整框重绘可以接受：选择/滚动位置会重置，但窗口大小变化本来就是用户主动操作。
+	u.txtLog.SetText(b.String())
 	u.logSeq = u.logs.Seq()
 	const (
 		wmVScroll = 0x0115
