@@ -13,7 +13,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
@@ -70,12 +72,15 @@ type UI struct {
 	mImport    *walk.Action
 	cfgActions []*walk.Action
 
-	lblState    *walk.Label
-	lblCfg      *walk.Label
-	lblIP       *walk.Label
-	lblTraffic  *walk.Label
-	lblVersion  *walk.Label
-	txtLog      *walk.TextEdit
+	lblState   *walk.Label
+	lblCfg     *walk.Label
+	lblIP      *walk.Label
+	lblTraffic *walk.Label
+	lblVersion *walk.Label
+	txtLog     *walk.TextEdit
+	// richLog 是覆盖在 txtLog 上的 RichEdit 日志控件（普通 EDIT 不支持
+	// EM_SETTARGETDEVICE，长行必然折；RichEdit 才能不折行 + 横向滚动）。
+	richLog     win.HWND
 	btnPrimary  *walk.PushButton
 	btnReconn   *walk.PushButton
 	btnPortTest *walk.PushButton
@@ -248,7 +253,12 @@ func (u *UI) build() error {
 		win.GetWindowLong(logHwnd, win.GWL_STYLE)|win.WS_HSCROLL|esAutoHScroll)
 	win.SetWindowPos(logHwnd, 0, 0, 0, 0, 0,
 		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER)
-	u.txtLog.SendMessage(emSetTargetDevice, 0, 1)
+	// EM_SETTARGETDEVICE 的 wParam 必须是 HDC、lParam=-1 才是「不折行」；之前
+	// 传 wParam=0、lParam=1，控件实际仍按窗口宽度折（发送/接收数字变长就折）。
+	if hdc := win.GetDC(0); hdc != 0 {
+		u.txtLog.SendMessage(emSetTargetDevice, uintptr(hdc), uintptr(0xFFFFFFFF))
+		win.ReleaseDC(0, hdc)
+	}
 
 	// 关窗口只是收进托盘，不是退出 —— 否则隧道会跟着一起断
 	u.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
@@ -270,6 +280,9 @@ func (u *UI) build() error {
 	// 拿到焦点就把整片内容画成蓝底。在 VisibleChanged 里 SetFocus 给按钮试过，
 	// 没用（会被随后的 SetForegroundWindow 重置）。索性让它根本不参与轮转。
 	disableTabStop(u.txtLog.Handle())
+
+	// 日志区换成 RichEdit（覆盖在占位 Edit 上）；建不起来就退回普通 Edit。
+	u.initRichLog()
 
 	if err := u.buildTray(); err != nil {
 		return err
@@ -790,7 +803,9 @@ func (u *UI) refresh() {
 	// 日志会话切换（启动/重连/切配置）时清空界面日志，避免新旧混在一起。
 	if epoch := LogResetEpoch(); epoch != u.lastLogReset {
 		u.lastLogReset = epoch
-		if n := u.txtLog.TextLength(); n > 0 {
+		if u.richLog != 0 {
+			win.SendMessage(u.richLog, win.WM_SETTEXT, 0, 0)
+		} else if n := u.txtLog.TextLength(); n > 0 {
 			u.txtLog.SetTextSelection(0, n)
 			u.txtLog.ReplaceSelectedText("", false)
 		}
@@ -806,14 +821,13 @@ func (u *UI) refresh() {
 	// 改成只追加新行：控件从空开始，选择状态就永远停在初始值，不给它变全选的机会。
 	if newLines, seq := u.logs.Since(u.logSeq); len(newLines) > 0 {
 		u.logSeq = seq
-		u.txtLog.AppendText(strings.Join(newLines, "\r\n") + "\r\n")
+		text := strings.Join(newLines, "\r\n") + "\r\n"
+		if u.richLog != 0 {
+			u.richAppend(text)
+		} else {
+			u.txtLog.AppendText(text)
+		}
 		u.trimLog()
-
-		const (
-			wmVScroll = 0x0115
-			sbBottom  = 7
-		)
-		u.txtLog.SendMessage(wmVScroll, sbBottom, 0)
 	}
 
 	// 连上 5 秒后再收进托盘，留出时间让人看清状态；期间又断线就取消，重连重新
@@ -835,6 +849,15 @@ func (u *UI) refresh() {
 // trimLog 把界面日志控制在可控长度内：只留最近约 56K 字符（约 400 行）。
 // 多行 EDIT 默认 65535 字上限，超过后 AppendText 会静默失效；完整历史在日志文件。
 func (u *UI) trimLog() {
+	if u.richLog != 0 {
+		n := int(win.SendMessage(u.richLog, win.WM_GETTEXTLENGTH, 0, 0))
+		if n <= logTrimThreshold {
+			return
+		}
+		win.SendMessage(u.richLog, win.EM_SETSEL, 0, uintptr(n-logTrimKeep))
+		win.SendMessage(u.richLog, win.EM_REPLACESEL, 0, 0)
+		return
+	}
 	n := u.txtLog.TextLength()
 	if n <= logTrimThreshold {
 		return
@@ -1552,6 +1575,64 @@ func disableTabStop(w win.HWND) {
 	const wsTabStop = 0x00010000
 	style := win.GetWindowLong(w, win.GWL_STYLE)
 	win.SetWindowLong(w, win.GWL_STYLE, style&^wsTabStop)
+}
+
+// initRichLog 用 RichEdit 建日志区，覆盖在占位 TextEdit 上。
+//
+// 普通 EDIT 不支持 EM_SETTARGETDEVICE（那是 RichEdit 专用消息），多行长行必然按
+// 窗口宽度折；RichEdit 才能做到「不折行 + 横向滚动」—— OpenVPN 的日志窗口也是
+// RichEdit。建不起来就保留普通 Edit 兜底（长行会折，但日志功能不受影响）。
+func (u *UI) initRichLog() {
+	if _, err := windows.LoadLibrary("riched20.dll"); err != nil {
+		u.app.Log().Warn("RichEdit 日志区不可用，退回普通 Edit", "err", err)
+		return
+	}
+	cls, err := syscall.UTF16PtrFromString("RichEdit20W")
+	if err != nil {
+		return
+	}
+	b := u.txtLog.BoundsPixels()
+	style := uint32(win.WS_CHILD | win.WS_VISIBLE | win.WS_HSCROLL | win.WS_VSCROLL |
+		win.ES_MULTILINE | win.ES_READONLY | win.ES_AUTOHSCROLL | win.ES_AUTOVSCROLL | 0x0100 /* ES_NOHIDESEL */)
+	hwnd := win.CreateWindowEx(0, cls, nil, style,
+		int32(b.X), int32(b.Y), int32(b.Width), int32(b.Height),
+		u.mw.Handle(), 0, 0, nil)
+	if hwnd == 0 {
+		u.app.Log().Warn("RichEdit 日志区创建失败，退回普通 Edit")
+		return
+	}
+	u.richLog = hwnd
+	// 白底，和界面一致
+	win.SendMessage(hwnd, win.EM_SETBKGNDCOLOR, 0, 0x00FFFFFF)
+	// 不折行：RichEdit 的 EM_SETTARGETDEVICE（HDC + -1）。DC 必须保持有效，
+	// 释放后控件再格式化会失败、又变回折行，所以这里不 ReleaseDC（一个进程一个，
+	// 进程退出自动回收）。
+	if hdc := win.GetDC(0); hdc != 0 {
+		win.SendMessage(hwnd, win.EM_SETTARGETDEVICE, uintptr(hdc), ^uintptr(0))
+	}
+	// 跟随占位控件的位置/大小（窗口 resize、布局变化）
+	sync := func() {
+		nb := u.txtLog.BoundsPixels()
+		win.SetWindowPos(hwnd, 0, int32(nb.X), int32(nb.Y), int32(nb.Width), int32(nb.Height),
+			win.SWP_NOZORDER|win.SWP_NOACTIVATE)
+	}
+	u.txtLog.BoundsChanged().Attach(sync)
+	sync()
+}
+
+// richAppend 把新日志行追加到 RichEdit（照 OpenVPN：先取消选择、插入、滚到光标）。
+func (u *UI) richAppend(s string) {
+	h := u.richLog
+	if h == 0 {
+		return
+	}
+	win.SendMessage(h, win.EM_SETSEL, ^uintptr(0), ^uintptr(0))
+	p, err := syscall.UTF16PtrFromString(s)
+	if err != nil {
+		return
+	}
+	win.SendMessage(h, win.EM_REPLACESEL, 0, uintptr(unsafe.Pointer(p)))
+	win.SendMessage(h, win.EM_SCROLLCARET, 0, 0)
 }
 
 // alert 把错误挂在主窗口上弹出来，而不是变成一个找不到归属的孤立对话框。
