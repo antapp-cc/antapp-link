@@ -860,7 +860,9 @@ func (u *UI) logMaxUnits() int {
 	if w <= 0 {
 		w = 500
 	}
-	units := (w - 17) / 7 // 滚动条约 17px，Consolas 9pt 约 7px/单位
+	// 按 7px/单位估算是偏乐观的（实际字体或高 DPI 下更宽），留 3 个单位余量，
+	// 否则截断后的行仍会超宽，控件把结尾的 … 折到下一行。
+	units := (w-17)/7 - 3 // 滚动条约 17px
 	if units < 20 {
 		units = 20
 	}
