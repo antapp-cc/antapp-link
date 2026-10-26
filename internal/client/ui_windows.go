@@ -17,7 +17,6 @@ import (
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
-	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
 
 	"github.com/antapp-cc/antapp-link/internal/setup"
@@ -37,24 +36,6 @@ var appIconGray []byte
 var appIconGreen []byte
 
 // UI 是主窗口加托盘。托盘用 walk 自带的 NotifyIcon，跟主窗口共用同一个消息循环 ——
-// emSetTargetDevice 让多行 Edit 控件不要按窗口宽度折行。
-//
-// wParam=0 表示「用屏幕 DC」，lParam 非 0 表示「目标宽度只有这么多个字符」——
-// 于是控件不再自己折行，超出部分往右延伸，由横向滚动条承担。这正是日志区要的：
-// 折行出来的续行会顶格压在时间戳列上。
-const emSetTargetDevice = 0x0448
-
-// 界面日志区的容量控制。
-//
-// Windows 多行 EDIT 控件默认最多 65535 个字符，超过之后 walk 的 AppendText 会
-// 静默失效——日志文件还在写，界面却停在触顶那一刻（0.4.11 上实测界面停在
-// 10-26 10:16，文件已经写到 11:17）。这里把上限放宽作兜底，同时主动只保留最近
-// 一段：界面看最近的，完整历史点「查看日志文件」。
-const (
-	logMaxLength     = 0x7FFFFFFE // EM_SETLIMITTEXT：把默认 64KB 上限放宽
-	logTrimThreshold = 60000      // 超过这么多字符就裁剪
-	logTrimKeep      = 56000      // 裁剪后保留最近字符数（约 400 行）
-)
 
 // 换成独立的托盘库就得处理两个消息循环抢主线程的问题。
 //
@@ -79,12 +60,12 @@ type UI struct {
 	lblIP       *walk.Label
 	lblTraffic  *walk.Label
 	lblVersion  *walk.Label
-	txtLog      *walk.TextEdit
 	btnPrimary  *walk.PushButton
 	btnReconn   *walk.PushButton
 	btnPortTest *walk.PushButton
 	btnUpdate   *walk.PushButton
 	btnHide     *walk.PushButton
+	btnLog      *walk.PushButton
 
 	quitting      bool
 	trayHinted    bool
@@ -95,7 +76,6 @@ type UI struct {
 	// updateBusy 是自动更新与手动更新的 single-flight 门禁：两条路径都会下载并应用
 	// 同一个待更新文件，并发进入会互相截断/覆盖，门禁覆盖下载到退出整段流程。
 	updateBusy atomic.Bool
-	logSeq     uint64
 	done       chan struct{}
 	// wantConnected 记录用户是否期望连接。点「断开连接」后置 false，自动重连守护据此
 	// 收手 —— 否则修好「连上又掉没人管」之后会变成「用户点了断开它又自己连回来」。
@@ -174,10 +154,9 @@ func (u *UI) build() error {
 		AssignTo: &u.mw,
 		Title:    "AntApp Link",
 		Icon:     u.icon,
-		// 默认 540x353，跟用户原来那个 OpenVPN 客户端窗口差不多大。
-		// MinSize 必须比它小，否则 Windows 会把默认尺寸顶上去。
-		MinSize: Size{Width: 480, Height: 300},
-		Size:    Size{Width: 540, Height: 353},
+		// 去掉日志区后窗口矮了一截：状态行 + IP/流量 + 按钮就够。
+		MinSize: Size{Width: 480, Height: 170},
+		Size:    Size{Width: 540, Height: 200},
 		Layout:  VBox{Margins: Margins{Left: 10, Top: 10, Right: 10, Bottom: 10}, Spacing: 8},
 		Children: []Widget{
 			Composite{
@@ -196,12 +175,6 @@ func (u *UI) build() error {
 					},
 				},
 			},
-			TextEdit{
-				AssignTo: &u.txtLog,
-				ReadOnly: true,
-				VScroll:  true,
-				Font:     Font{Family: "Consolas", PointSize: 9},
-			},
 			Composite{
 				Layout: HBox{MarginsZero: true},
 				Children: []Widget{
@@ -217,56 +190,17 @@ func (u *UI) build() error {
 				Children: []Widget{
 					PushButton{AssignTo: &u.btnPrimary, Text: "连接", MinSize: Size{Width: 100}, OnClicked: u.onPrimary},
 					PushButton{AssignTo: &u.btnReconn, Text: "重新连接", MinSize: Size{Width: 100}, OnClicked: u.onReconnect},
-					PushButton{AssignTo: &u.btnPortTest, Text: "Node端口测试", MinSize: Size{Width: 110}, OnClicked: u.onPortTest},
+					PushButton{AssignTo: &u.btnPortTest, Text: "Node端口测试", MinSize: Size{Width: 100}, OnClicked: u.onPortTest},
+					PushButton{AssignTo: &u.btnLog, Text: "查看日志", MinSize: Size{Width: 70}, OnClicked: u.onOpenLog},
 					PushButton{AssignTo: &u.btnUpdate, Text: "立即更新", MinSize: Size{Width: 100}, OnClicked: u.onUpdate},
 					HSpacer{},
-					PushButton{AssignTo: &u.btnHide, Text: "隐藏", MinSize: Size{Width: 100}, OnClicked: u.onHide},
+					PushButton{AssignTo: &u.btnHide, Text: "隐藏", MinSize: Size{Width: 80}, OnClicked: u.onHide},
 				},
 			},
 		},
 	}).Create(); err != nil {
 		return fmt.Errorf("创建主窗口: %w", err)
 	}
-
-	// 日志区显式涂成纯白底 + 纯黑字。
-	//
-	// 不写的话用的是系统 COLOR_WINDOW：浅色主题下本来就是白，但深色主题 / 高对比度
-	// 方案下会变成深灰或别的颜色，日志区肤色就跟着系统跑。这里钉死 #FFFFFF，
-	// 和浅色界面保持一致。
-	if bg, berr := walk.NewSolidColorBrush(walk.RGB(0xFF, 0xFF, 0xFF)); berr == nil {
-		u.txtLog.SetBackground(bg)
-	}
-	u.txtLog.SetTextColor(walk.RGB(0x00, 0x00, 0x00))
-	// 放宽 EDIT 控件的默认 64KB 上限（真正的保护是 trimLog 的主动裁剪）。
-	u.txtLog.SetMaxLength(logMaxLength)
-	// 失焦时清掉选择，避免焦点移走后日志区底部还留着一条蓝色高亮。
-	u.txtLog.FocusedChanged().Attach(func() {
-		if u.txtLog.Focused() {
-			return
-		}
-		if s, e := u.txtLog.TextSelection(); s != e {
-			u.txtLog.SetTextSelection(s, s)
-		}
-	})
-
-	// 日志区强行单行显示，跟 OpenVPN 一样。
-	//
-	// 普通 Edit 控件默认按窗口宽度折行，折出来的续行是顶格的 —— 正好压在时间戳那一列
-	// 上，一屏文字看着发花。OpenVPN 的做法是压根不折：每条日志一行，超出的往右延伸，
-	// 底部一条横向滚动条让需要的人自己拖。
-	//
-	// 三样缺一不可：WS_HSCROLL（滚动条）、ES_AUTOHSCROLL（滚动而不是折行）、
-	// EM_SETTARGETDEVICE(lParam 非 0，明确告诉控件不要按窗口宽度折行)。
-	const esAutoHScroll = 0x0080
-	logHwnd := u.txtLog.Handle()
-	win.SetWindowLong(logHwnd, win.GWL_STYLE,
-		win.GetWindowLong(logHwnd, win.GWL_STYLE)|win.WS_HSCROLL|esAutoHScroll)
-	win.SetWindowPos(logHwnd, 0, 0, 0, 0, 0,
-		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER)
-	u.txtLog.SendMessage(emSetTargetDevice, 0, 1)
-	// 水平滚动条必须在 emSetTargetDevice 之后隐藏：设置 target device 时控件会
-	// 重新算一遍滚动条，先隐藏的会在这一步被重新放出来。
-	hideHScrollBar(u.txtLog.Handle())
 
 	// 关窗口只是收进托盘，不是退出 —— 否则隧道会跟着一起断
 	u.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
@@ -282,13 +216,6 @@ func (u *UI) build() error {
 	// 多开几次就跑偏到屏幕角落了。
 	setup.CenterOnScreen(u.mw.Handle())
 
-	// 日志框退出焦点轮转。
-	//
-	// 窗口被激活时，Windows 把焦点给第一个带 WS_TABSTOP 的控件 —— 只读日志框
-	// 拿到焦点就把整片内容画成蓝底。在 VisibleChanged 里 SetFocus 给按钮试过，
-	// 没用（会被随后的 SetForegroundWindow 重置）。索性让它根本不参与轮转。
-	disableTabStop(u.txtLog.Handle())
-
 	if err := u.buildTray(); err != nil {
 		return err
 	}
@@ -302,11 +229,6 @@ func (u *UI) build() error {
 		if !u.mw.Visible() {
 			return
 		}
-		const (
-			wmVScroll = 0x0115
-			sbBottom  = 7
-		)
-		u.txtLog.SendMessage(wmVScroll, sbBottom, 0)
 		_ = u.btnPrimary.SetFocus()
 	})
 
@@ -803,32 +725,6 @@ func (u *UI) refresh() {
 		default:
 			u.ni.SetToolTip("AntApp Link · 连接中…")
 		}
-	}
-
-	// 日志只做增量追加，绝不整体 SetText。
-	//
-	// SetText 走的是 WM_SETTEXT，之后这个只读框的选择会变成「全选」，一有焦点就
-	// 整片画成蓝底。之后无论用 EM_SETSEL 去清、还是只用滚动消息绕开，都压不住 ——
-	// 三种写法都试过，见 git 历史（dc4e6dc / 2fdfafc / f27a79a）。
-	//
-	// 改成只追加新行：控件从空开始，选择状态就永远停在初始值，不给它变全选的机会。
-	if newLines, seq := u.logs.Since(u.logSeq); len(newLines) > 0 {
-		u.logSeq = seq
-		u.txtLog.AppendText(strings.Join(newLines, "\r\n") + "\r\n")
-		u.trimLog()
-		// 失焦时把选择收成光标：日志框失去焦点后不该再留一条蓝色高亮。
-		// 聚焦时不碰 —— 用户要能拖动选择、复制日志。
-		if !u.txtLog.Focused() {
-			if s, e := u.txtLog.TextSelection(); s != e {
-				u.txtLog.SetTextSelection(s, s)
-			}
-		}
-
-		const (
-			wmVScroll = 0x0115
-			sbBottom  = 7
-		)
-		u.txtLog.SendMessage(wmVScroll, sbBottom, 0)
 	}
 
 	// 连上 5 秒后再收进托盘，留出时间让人看清状态；期间又断线就取消，重连重新
@@ -1537,8 +1433,7 @@ func (u *UI) onOpenConfigDir() {
 
 // onOpenLog 用系统默认程序打开当前会话的日志文件。
 //
-// 界面日志只保留最近一段（见 trimLog），完整历史靠这个入口 —— 和 OpenVPN 的
-// 「View Log」一个思路：文件才是权威，编辑器不受 EDIT 控件长度限制。
+// 和 OpenVPN 的「View Log」一个思路：文件才是权威，编辑器不受控件长度限制。
 func (u *UI) onOpenLog() {
 	path := CurrentLogFile()
 	if path == "" {
@@ -1555,19 +1450,6 @@ func (u *UI) onOpenLog() {
 			u.alert("查看日志文件", err.Error())
 		}
 	}()
-}
-
-// trimLog 把界面日志控制在可控长度内。
-//
-// 多行 EDIT 控件默认 65535 字符上限，超过后 walk 的 AppendText 会静默失效；
-// 这里删掉开头、只留最近一段，滚动位置由调用方重新贴到底部。
-func (u *UI) trimLog() {
-	n := u.txtLog.TextLength()
-	if n <= logTrimThreshold {
-		return
-	}
-	u.txtLog.SetTextSelection(0, n-logTrimKeep)
-	u.txtLog.ReplaceSelectedText("", false)
 }
 
 func (u *UI) quit() {
@@ -1587,24 +1469,6 @@ func (u *UI) quit() {
 		}
 		u.mw.Synchronize(func() { u.mw.Close() })
 	}()
-}
-
-// disableTabStop 摘掉控件的 WS_TABSTOP，让它不再被 Windows 选作默认焦点。
-func disableTabStop(w win.HWND) {
-	const wsTabStop = 0x00010000
-	style := win.GetWindowLong(w, win.GWL_STYLE)
-	win.SetWindowLong(w, win.GWL_STYLE, style&^wsTabStop)
-}
-
-// hideHScrollBar 隐藏控件自带的水平滚动条。日志区只做展示（长行截断，完整
-// 内容看日志文件），留一条用不上的横条只是白占高度。
-var (
-	user32            = windows.NewLazySystemDLL("user32.dll")
-	procShowScrollBar = user32.NewProc("ShowScrollBar")
-)
-
-func hideHScrollBar(hwnd win.HWND) {
-	_, _, _ = procShowScrollBar.Call(uintptr(hwnd), 0 /* SB_HORZ */, 0 /* 隐藏 */)
 }
 
 // alert 把错误挂在主窗口上弹出来，而不是变成一个找不到归属的孤立对话框。
