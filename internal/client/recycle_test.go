@@ -145,7 +145,7 @@ func contains(s, sub string) bool {
 	})()
 }
 
-// 验证期靠环境变量关掉定期重建；解析写错时必须退回「关闭」而不是悄悄恢复 12 小时。
+// 非法值退回默认（24h 开启）：这个开关现在是默认开、环境变量可调。
 func TestEnvRecycleEvery(t *testing.T) {
 	cases := []struct {
 		v    string
@@ -171,10 +171,10 @@ func TestEnvRecycleEvery(t *testing.T) {
 	}
 }
 
-// 默认必须关闭：验证新检测够不够用的前提是兜底不参与。
-func TestRecycleDisabledByDefault(t *testing.T) {
-	if defaultRecycleEvery != 0 {
-		t.Fatalf("默认周期应为 0（关闭），实际 %v", defaultRecycleEvery)
+// 默认 24 小时开启：ECMP 路径劣化自检看不出来，只能靠定时换源端口。
+func TestRecycleEnabledByDefault(t *testing.T) {
+	if defaultRecycleEvery != 24*time.Hour {
+		t.Fatalf("默认周期应为 24h，实际 %v", defaultRecycleEvery)
 	}
 }
 

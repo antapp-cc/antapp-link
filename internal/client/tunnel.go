@@ -1503,18 +1503,17 @@ var errScheduledRecycle = errors.New("定期重建连接")
 
 // 自动重建会话的阈值。用 var 而不是 const：测试要把周期压到毫秒级。
 var (
-	// recycleEvery 是自动重建会话的周期。默认 0 = 关闭，需要时用环境变量
-	// ANTAPP_RECYCLE=12h 打开（见 envRecycleEvery）。
+	// recycleEvery 是自动重建会话的周期。默认 24 小时开启；验证期可以用
+	// ANTAPP_RECYCLE=0 关闭、或用别的时间覆盖（见 envRecycleEvery）。
 	//
 	// 历史：链路做了 ECMP，同一条 TCP 流的包固定哈希到某条物理路径上。一旦那条路径
 	// 乱序严重（实测 rcv_ooopack 到过 20 万、乱序率 20%+），这条连接在整个生命周期
 	// 里都换不出去 —— 表现为「连上了但什么都打不开，重启云服或点重连立刻恢复」。
 	// 重连会换一个源端口，等于重新抽签选路径，这是客户端唯一能做的缓解。
 	//
-	// 为什么先关掉：成员连接现在有下行判活（memberDeadAfter），App 层有每 10 分钟的
-	// 端到端自检 —— 「数据面已经失效」这类问题能自己发现并重建，不必靠定时断线兜。
-	// 验证期就让它关着跑：真出问题时日志里会有 slot_silence 或自检失败记录，能分清
-	// 是新检测不够用，还是问题根本不在数据面（比如控制面正常、只是链路劣化）。
+	// 验证期先关过：成员连接有下行判活（memberDeadAfter），App 层有每 10 分钟的
+	// 端到端自检 —— 「数据面已经失效」能自己发现并重建。但 ECMP 路径劣化不属于
+	// 「失效」，自检看不出来，只能靠定时换端口，所以验证期结束后重新开回来。
 	recycleEvery = envRecycleEvery()
 
 	// recycleBusyBytes 是「正在传大量数据」的门槛：采样一分钟超过这个数就推迟。
@@ -1540,14 +1539,14 @@ var (
 	recycleDelay = 3 * time.Second
 )
 
-// defaultRecycleEvery 是定期重建的默认周期，0 = 关闭。
-const defaultRecycleEvery = 0
+// defaultRecycleEvery 是定期重建的默认周期：24 小时开启；ANTAPP_RECYCLE=0/off 关闭。
+const defaultRecycleEvery = 24 * time.Hour
 
 // envRecycleEvery 从 ANTAPP_RECYCLE 读取定期重建周期：0 / off 关闭，
 // 其余按 Go duration 解析（8h、12h、30m）。
 //
-// 非法值退回默认（关闭）而不是退回 12 小时：验证期设错了就该是「没开」，
-// 而且启动日志会把实际生效的值打出来，一眼能看出环境变量有没有生效。
+// 非法值退回默认（24 小时）而不是关闭：这个开关现在是「默认开、环境变量可调」，
+// 设错了退回默认比意外关掉兜底更安全；启动日志会把实际生效的值打出来。
 func envRecycleEvery() time.Duration {
 	v := strings.TrimSpace(os.Getenv("ANTAPP_RECYCLE"))
 	if v == "" {

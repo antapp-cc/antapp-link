@@ -460,12 +460,12 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 			a.log.Warn("隧道循环退出", connLogAttrs(err, nil)...)
 		}
 	}()
-	// 定期重建的当前取值必须进日志：验证期正是靠它关掉兜底的，事后翻日志要能
-	// 确认这次跑的是「关了兜底」的版本，而不是环境变量没设上。
+	// 定期重建的当前取值必须进日志：现场排查时要能确认这次跑的是「开着兜底」的版本，
+	// 还是环境变量把周期改了。
 	if recycleEvery > 0 {
 		a.log.Info("定期重建连接已启用", "every", recycleEvery.String())
 	} else {
-		a.log.Info("定期重建连接已关闭（ANTAPP_RECYCLE 可开启）")
+		a.log.Info("定期重建连接已关闭（ANTAPP_RECYCLE=0 关闭）")
 	}
 	// 定期把运行状态写进日志，给「用着用着没网」留现场。
 	//
