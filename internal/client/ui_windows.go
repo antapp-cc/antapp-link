@@ -44,6 +44,13 @@ var appIconGreen []byte
 // 折行出来的续行会顶格压在时间戳列上。
 const emSetTargetDevice = 0x0448
 
+// 界面日志区只保留最近约 56K 字符（约 400 行）：多行 EDIT 默认 65535 字上限，
+// 不裁剪的话拉满后 AppendText 会静默失效，界面就不动了。完整历史在日志文件里。
+const (
+	logTrimThreshold = 60000 // 超过这么多字符就裁剪
+	logTrimKeep      = 56000 // 裁剪后保留最近字符数
+)
+
 // 换成独立的托盘库就得处理两个消息循环抢主线程的问题。
 //
 // 窗口布局照用户已经在 Pi 节点机上用惯的那个 OpenVPN 客户端来：
@@ -784,6 +791,7 @@ func (u *UI) refresh() {
 	if newLines, seq := u.logs.Since(u.logSeq); len(newLines) > 0 {
 		u.logSeq = seq
 		u.txtLog.AppendText(strings.Join(newLines, "\r\n") + "\r\n")
+		u.trimLog()
 
 		const (
 			wmVScroll = 0x0115
@@ -806,6 +814,17 @@ func (u *UI) refresh() {
 		u.hintTray()
 	}
 	u.wasOnline = st.Online
+}
+
+// trimLog 把界面日志控制在可控长度内：只留最近约 56K 字符（约 400 行）。
+// 多行 EDIT 默认 65535 字上限，超过后 AppendText 会静默失效；完整历史在日志文件。
+func (u *UI) trimLog() {
+	n := u.txtLog.TextLength()
+	if n <= logTrimThreshold {
+		return
+	}
+	u.txtLog.SetTextSelection(0, n-logTrimKeep)
+	u.txtLog.ReplaceSelectedText("", false)
 }
 
 // Connect/Disconnect 会做网络操作（探测、改路由、跑 PowerShell），不能卡住界面线程。

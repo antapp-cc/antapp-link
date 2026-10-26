@@ -52,7 +52,7 @@ func (l *rotatingLog) Write(p []byte) (int, error) {
 	if l.file == nil {
 		return 0, os.ErrClosed
 	}
-	if l.size+int64(len(p)) > l.maxSize {
+	if l.maxSize > 0 && l.size+int64(len(p)) > l.maxSize {
 		if err := l.rotate(); err != nil {
 			return 0, err
 		}
@@ -74,8 +74,8 @@ func (l *rotatingLog) rotate() error {
 	return l.open()
 }
 
-// SwitchFile 把日志切到新文件并清空：每次连接会话的日志从零开始，
-// 打开文件看到的就是本次连接的最新内容（旧会话不保留）。
+// SwitchFile 把日志切到新文件。文件是追加写的（保留全部历史）；
+// 界面缓冲由调用方清空，界面只显示最近一段。
 func (l *rotatingLog) SwitchFile(path string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -84,8 +84,8 @@ func (l *rotatingLog) SwitchFile(path string) error {
 		l.file = nil
 	}
 	l.path = path
-	// 新会话覆盖写
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// 追加写，不截断旧会话的日志
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
@@ -354,8 +354,8 @@ var activeSession *sessionLogger
 
 var rootDirForLogs string
 
-// SwitchLogSession 把日志切到与配置文件同名的会话文件（pinode.antapp → pinode.log），
-// 文件与界面缓冲同时清空——新连接会话的日志从零开始，看到的永远是最新的。
+// SwitchLogSession 把日志切到与配置文件同名的会话文件（pinode.antapp → pinode.log）。
+// 文件追加写（保留全部历史），界面缓冲清空（界面只显示最近一段）。
 // 失败安静忽略：日志切换失败不该挡住连接。
 func SwitchLogSession(source string) {
 	if activeSession == nil {
@@ -384,7 +384,8 @@ func CurrentLogFile() string {
 // NewFileLogger 建一个同时写文件与界面缓冲的 logger。
 func NewFileLogger(root string) (*slog.Logger, *LogBuffer, func(), error) {
 	rootDirForLogs = root
-	rot, err := OpenLog(filepath.Join(LogsDir(root), "client.log"), 2<<20)
+	// maxSize=0：不轮转，日志文件保留全部历史。
+	rot, err := OpenLog(filepath.Join(LogsDir(root), "client.log"), 0)
 	if err != nil {
 		return nil, nil, nil, err
 	}
