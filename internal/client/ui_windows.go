@@ -37,12 +37,6 @@ var appIconGray []byte
 var appIconGreen []byte
 
 // UI 是主窗口加托盘。托盘用 walk 自带的 NotifyIcon，跟主窗口共用同一个消息循环 ——
-// emSetTargetDevice 让多行 Edit 控件不要按窗口宽度折行。
-//
-// wParam=0 表示「用屏幕 DC」，lParam 非 0 表示「目标宽度只有这么多个字符」——
-// 于是控件不再自己折行，超出部分往右延伸，由横向滚动条承担。这正是日志区要的：
-// 折行出来的续行会顶格压在时间戳列上。
-const emSetTargetDevice = 0x0448
 
 // 界面日志区的容量控制。
 //
@@ -249,26 +243,16 @@ func (u *UI) build() error {
 		}
 	})
 
-	// 日志区强行单行显示，跟 OpenVPN 一样。
-	//
-	// 普通 Edit 控件默认按窗口宽度折行，折出来的续行是顶格的 —— 正好压在时间戳那一列
-	// 上，一屏文字看着发花。OpenVPN 的做法是压根不折：每条日志一行，超出的往右延伸，
-	// 底部一条横向滚动条让需要的人自己拖。
-	//
-	// 三样缺一不可：WS_HSCROLL（滚动条）、ES_AUTOHSCROLL（滚动而不是折行）、
-	// EM_SETTARGETDEVICE(lParam 非 0，明确告诉控件不要按窗口宽度折行)。
+	// 日志区强行单行显示，跟 OpenVPN 一样：WS_HSCROLL + ES_AUTOHSCROLL，长行往右
+	// 延伸、由底部横向滚动条拖看，不折行。OpenVPN 的日志窗口（openvpn.c）就是这么
+	// 建 RichEdit 的，没有用 EM_SETTARGETDEVICE；之前那套 target device 参数在
+	// walk 的 EDIT 上不生效，反而让长行折开。
 	const esAutoHScroll = 0x0080
 	logHwnd := u.txtLog.Handle()
 	win.SetWindowLong(logHwnd, win.GWL_STYLE,
 		win.GetWindowLong(logHwnd, win.GWL_STYLE)|win.WS_HSCROLL|esAutoHScroll)
 	win.SetWindowPos(logHwnd, 0, 0, 0, 0, 0,
 		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER)
-	// lParam = -1 才是「不折行」（MSDN：0 = 按窗口宽度折行，-1 = 不折行）；
-	// 之前写的 1 会被当成列宽，长行仍可能折行。
-	u.txtLog.SendMessage(emSetTargetDevice, 0, ^uintptr(0))
-	// 水平滚动条必须在 emSetTargetDevice 之后隐藏：设置 target device 时控件会
-	// 重新算一遍滚动条，先隐藏的会在这一步被重新放出来。
-	hideHScrollBar(u.txtLog.Handle())
 
 	// 关窗口只是收进托盘，不是退出 —— 否则隧道会跟着一起断
 	u.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
@@ -1588,17 +1572,6 @@ func disableTabStop(w win.HWND) {
 	const wsTabStop = 0x00010000
 	style := win.GetWindowLong(w, win.GWL_STYLE)
 	win.SetWindowLong(w, win.GWL_STYLE, style&^wsTabStop)
-}
-
-// hideHScrollBar 隐藏控件自带的水平滚动条。日志区只做展示（长行截断，完整
-// 内容看日志文件），留一条用不上的横条只是白占高度。
-var (
-	user32            = windows.NewLazySystemDLL("user32.dll")
-	procShowScrollBar = user32.NewProc("ShowScrollBar")
-)
-
-func hideHScrollBar(hwnd win.HWND) {
-	_, _, _ = procShowScrollBar.Call(uintptr(hwnd), 0 /* SB_HORZ */, 0 /* 隐藏 */)
 }
 
 // alert 把错误挂在主窗口上弹出来，而不是变成一个找不到归属的孤立对话框。
