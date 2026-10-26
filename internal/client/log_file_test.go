@@ -68,3 +68,21 @@ func TestTeeHandlerFileLine(t *testing.T) {
 		t.Fatalf("文件日志 = %q，want %q", got, want)
 	}
 }
+
+// 文件要写 Debug（补拨失败、丢包、UDP 失败等关键现场都在 Debug 里），
+// 界面只显示 Info 及以上，保持简洁。
+func TestTeeHandlerDebug(t *testing.T) {
+	var buf strings.Builder
+	h := &teeHandler{w: &buf, buf: NewLogBuffer(10)}
+	rec := slog.NewRecord(time.Date(2026, 10, 26, 15, 36, 0, 0, time.Local), slog.LevelDebug, "成员连接补拨失败", 0)
+	if err := h.Handle(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); !strings.Contains(got, "成员连接补拨失败") {
+		t.Fatalf("文件应写 Debug 日志，实际 %q", got)
+	}
+	lines, _ := h.buf.Since(0)
+	if len(lines) != 0 {
+		t.Fatalf("界面不该显示 Debug 日志，实际 %q", lines)
+	}
+}

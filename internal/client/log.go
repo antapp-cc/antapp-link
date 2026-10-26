@@ -196,9 +196,9 @@ type teeHandler struct {
 	attrs []slog.Attr
 }
 
-func (h *teeHandler) Enabled(_ context.Context, level slog.Level) bool {
-	return level >= slog.LevelInfo
-}
+// Enabled 放行所有级别：Debug 也要进 Handle 写进文件（补拨失败、丢包、UDP 失败等
+// 关键现场都在 Debug 里），界面显示与否由 Handle 决定。
+func (h *teeHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h *teeHandler) Handle(_ context.Context, r slog.Record) error {
 	var b strings.Builder
@@ -227,10 +227,14 @@ func (h *teeHandler) Handle(_ context.Context, r slog.Record) error {
 	// 一条日志就是一行：底层错误里偶尔带 \n，换成空格。日志区已经关掉自动折行
 	// （见 ui_windows.go），超长内容由横向滚动条承担 —— 和 OpenVPN 一样。
 	line := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(b.String())
-	h.buf.addLine(fitLogLine(line))
-	// 文件里写同一行（不截断）：用户要求文件跟界面一样简单，不要 time=/level=/msg=。
-	_, err := io.WriteString(h.w, line+"\n")
-	return err
+	// 文件写全部级别（含 Debug，排查现场靠它），不截断；界面只显示 Info 及以上。
+	if _, err := io.WriteString(h.w, line+"\n"); err != nil {
+		return err
+	}
+	if r.Level >= slog.LevelInfo {
+		h.buf.addLine(fitLogLine(line))
+	}
+	return nil
 }
 
 // logLineMaxUnits 是界面日志区一行能容纳的显示宽度（ASCII=1，中文=2）。
