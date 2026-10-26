@@ -239,8 +239,6 @@ func (u *UI) build() error {
 	u.txtLog.SetTextColor(walk.RGB(0x00, 0x00, 0x00))
 	// 放宽 EDIT 控件的默认 64KB 上限（真正的保护是 trimLog 的主动裁剪）。
 	u.txtLog.SetMaxLength(logMaxLength)
-	// 日志区只做展示，水平滚动条用不上（长行截断，完整内容看日志文件）。
-	hideHScrollBar(u.txtLog.Handle())
 
 	// 日志区强行单行显示，跟 OpenVPN 一样。
 	//
@@ -257,6 +255,9 @@ func (u *UI) build() error {
 	win.SetWindowPos(logHwnd, 0, 0, 0, 0, 0,
 		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER)
 	u.txtLog.SendMessage(emSetTargetDevice, 0, 1)
+	// 水平滚动条必须在 emSetTargetDevice 之后隐藏：设置 target device 时控件会
+	// 重新算一遍滚动条，先隐藏的会在这一步被重新放出来。
+	hideHScrollBar(u.txtLog.Handle())
 
 	// 关窗口只是收进托盘，不是退出 —— 否则隧道会跟着一起断
 	u.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
