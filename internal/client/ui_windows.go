@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/lxn/walk"
@@ -258,6 +259,8 @@ func (u *UI) build() error {
 	// 水平滚动条必须在 emSetTargetDevice 之后隐藏：设置 target device 时控件会
 	// 重新算一遍滚动条，先隐藏的会在这一步被重新放出来。
 	hideHScrollBar(u.txtLog.Handle())
+	// 点击日志框不产生焦点/光标/选择（底部蓝条的来源）。
+	subclassLogMouse(u)
 
 	// 关窗口只是收进托盘，不是退出 —— 否则隧道会跟着一起断
 	u.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
@@ -1594,6 +1597,26 @@ var (
 
 func hideHScrollBar(hwnd win.HWND) {
 	_, _, _ = procShowScrollBar.Call(uintptr(hwnd), 0 /* SB_HORZ */, 0 /* 隐藏 */)
+}
+
+// 日志框的鼠标消息拦截：点击只读 Edit 会把它设成焦点并放下光标/选择，
+// 视觉上就是底部一条蓝条。日志区只做展示，把点击直接吞掉；要看/复制完整日志
+// 走「查看日志文件」。这两个变量必须放在包级，回调地址和原 WndProc 都不能被 GC。
+var (
+	logMouseProc uintptr
+	logProcPrev  uintptr
+)
+
+func subclassLogMouse(u *UI) {
+	hwnd := u.txtLog.Handle()
+	logMouseProc = syscall.NewCallback(func(h uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+		switch msg {
+		case win.WM_LBUTTONDOWN, win.WM_LBUTTONUP, win.WM_LBUTTONDBLCLK:
+			return 0
+		}
+		return win.CallWindowProc(logProcPrev, win.HWND(h), msg, wParam, lParam)
+	})
+	logProcPrev = win.SetWindowLongPtr(hwnd, win.GWLP_WNDPROC, logMouseProc)
 }
 
 // alert 把错误挂在主窗口上弹出来，而不是变成一个找不到归属的孤立对话框。
