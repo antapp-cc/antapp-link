@@ -816,21 +816,13 @@ func (u *UI) refresh() {
 	// 改成只追加新行：控件从空开始，选择状态就永远停在初始值，不给它变全选的机会。
 	if newLines, seq := u.logs.Since(u.logSeq); len(newLines) > 0 {
 		u.logSeq = seq
-		u.txtLog.AppendText(strings.Join(newLines, "\r\n") + "\r\n")
+		// 照 OpenVPN 的做法（openvpn-gui openvpn.c）：追加前先把光标/选择挪到末尾，
+		// 再插入新行，最后滚到光标。不保存、不恢复旧选择 —— walk 的 AppendText 会
+		// 恢复旧选择，点击留下的选择就会在日志框聚焦时显示成一条蓝色高亮。
+		u.txtLog.SetTextSelection(u.txtLog.TextLength(), u.txtLog.TextLength())
+		u.txtLog.ReplaceSelectedText(strings.Join(newLines, "\r\n")+"\r\n", false)
 		u.trimLog()
-		// 失焦时把选择收成光标：日志框失去焦点后不该再留一条蓝色高亮。
-		// 聚焦时不碰 —— 用户要能拖动选择、复制日志。
-		if !u.txtLog.Focused() {
-			if s, e := u.txtLog.TextSelection(); s != e {
-				u.txtLog.SetTextSelection(s, s)
-			}
-		}
-
-		const (
-			wmVScroll = 0x0115
-			sbBottom  = 7
-		)
-		u.txtLog.SendMessage(wmVScroll, sbBottom, 0)
+		u.txtLog.ScrollToCaret()
 	}
 
 	// 连上 5 秒后再收进托盘，留出时间让人看清状态；期间又断线就取消，重连重新
