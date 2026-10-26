@@ -263,7 +263,9 @@ func (u *UI) build() error {
 		win.GetWindowLong(logHwnd, win.GWL_STYLE)|win.WS_HSCROLL|esAutoHScroll)
 	win.SetWindowPos(logHwnd, 0, 0, 0, 0, 0,
 		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER)
-	u.txtLog.SendMessage(emSetTargetDevice, 0, 1)
+	// lParam = -1 才是「不折行」（MSDN：0 = 按窗口宽度折行，-1 = 不折行）；
+	// 之前写的 1 会被当成列宽，长行仍可能折行。
+	u.txtLog.SendMessage(emSetTargetDevice, 0, ^uintptr(0))
 	// 水平滚动条必须在 emSetTargetDevice 之后隐藏：设置 target device 时控件会
 	// 重新算一遍滚动条，先隐藏的会在这一步被重新放出来。
 	hideHScrollBar(u.txtLog.Handle())
