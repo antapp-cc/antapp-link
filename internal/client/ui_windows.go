@@ -888,13 +888,13 @@ func (u *UI) charWidthPx() int {
 	return int(sz.CX)
 }
 
-// scheduleLogRelayout 合并连续的 resize 事件：停手 100ms 后再重排一次，
-// 避免拖动窗口时每像素都重绘整框。
+// scheduleLogRelayout 合并连续的 resize 事件：按约一帧（16ms）合并重排，
+// 拖动过程中也会持续跟着重排，不会出现「拖到一半行先折了、松手才恢复」。
 func (u *UI) scheduleLogRelayout() {
 	if u.logLayoutTimer != nil {
 		u.logLayoutTimer.Stop()
 	}
-	u.logLayoutTimer = time.AfterFunc(100*time.Millisecond, func() {
+	u.logLayoutTimer = time.AfterFunc(16*time.Millisecond, func() {
 		u.mw.Synchronize(u.relayoutLog)
 	})
 }
