@@ -63,7 +63,7 @@ func TestTeeHandlerFileLine(t *testing.T) {
 	if err := h.Handle(context.Background(), rec); err != nil {
 		t.Fatal(err)
 	}
-	want := "10-26 15:35:14 . 出网自检通过\n"
+	want := "2026-10-26 15:35:14 . 出网自检通过\n"
 	if got := buf.String(); got != want {
 		t.Fatalf("文件日志 = %q，want %q", got, want)
 	}

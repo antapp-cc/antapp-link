@@ -202,12 +202,7 @@ func (h *teeHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h *teeHandler) Handle(_ context.Context, r slog.Record) error {
 	var b strings.Builder
-	// 前缀 17 个宽度单位：日期时间 14 + 空格 + 级别符号 + 空格。
-	//
-	// 日期每行都带：跨天看日志时没有它会完全分不清是哪一天。级别符号用 ASCII
-	// （. / ! / x）而不是 ·▲×，后者在等宽字体里占两格 —— 这两格省下来抵掉一部分开销。
-	b.WriteString(r.Time.Format("01-02 15:04:05"))
-	b.WriteString(" ")
+	// 级别符号用 ASCII（. / ! / x）而不是 ·▲×，后者在等宽字体里占两格。
 	b.WriteString(levelTag(r.Level))
 	b.WriteString(" ")
 	b.WriteString(r.Message)
@@ -226,13 +221,16 @@ func (h *teeHandler) Handle(_ context.Context, r slog.Record) error {
 	})
 	// 一条日志就是一行：底层错误里偶尔带 \n，换成空格。日志区已经关掉自动折行
 	// （见 ui_windows.go），超长内容由横向滚动条承担 —— 和 OpenVPN 一样。
-	line := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(b.String())
+	body := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(b.String())
+	// 界面只显示到月日（省宽度）；文件带年份（跨年/长期回看时必要）。
+	uiLine := r.Time.Format("01-02 15:04:05") + " " + body
+	fileLine := r.Time.Format("2006-01-02 15:04:05") + " " + body
 	// 文件写全部级别（含 Debug，排查现场靠它），不截断；界面只显示 Info 及以上。
-	if _, err := io.WriteString(h.w, line+"\n"); err != nil {
+	if _, err := io.WriteString(h.w, fileLine+"\n"); err != nil {
 		return err
 	}
 	if r.Level >= slog.LevelInfo {
-		h.buf.addLine(fitLogLine(line))
+		h.buf.addLine(fitLogLine(uiLine))
 	}
 	return nil
 }
