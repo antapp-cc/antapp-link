@@ -200,7 +200,7 @@ func (u *UI) build() error {
 				Children: []Widget{
 					Label{AssignTo: &u.lblIP, Text: "分配 IP: —"},
 					HSpacer{},
-					Label{AssignTo: &u.lblTraffic, Text: "发送 — / 接收 —"},
+					Label{AssignTo: &u.lblTraffic, Text: "接收 — / 发送 —"},
 					HSpacer{},
 					Label{AssignTo: &u.lblVersion, Text: fmt.Sprintf("AntApp Link %s", Version)},
 				},
@@ -703,10 +703,10 @@ func (u *UI) refresh() {
 
 	// 流量按本次连接累计；断开重连会新开一个隧道实例，计数从零开始
 	if st.Running {
-		u.lblTraffic.SetText(fmt.Sprintf("发送 %s / 接收 %s",
-			formatBytes(st.TxBytes), formatBytes(st.RxBytes)))
+		u.lblTraffic.SetText(fmt.Sprintf("接收 %s / 发送 %s",
+			formatBytes(st.RxBytes), formatBytes(st.TxBytes)))
 	} else {
-		u.lblTraffic.SetText("发送 — / 接收 —")
+		u.lblTraffic.SetText("接收 — / 发送 —")
 	}
 
 	// 后台自动重连也要显示成「连接中…」，否则日志在刷、按钮却停在「连接」，用户会
