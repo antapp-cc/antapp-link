@@ -239,6 +239,8 @@ func (u *UI) build() error {
 	u.txtLog.SetTextColor(walk.RGB(0x00, 0x00, 0x00))
 	// 放宽 EDIT 控件的默认 64KB 上限（真正的保护是 trimLog 的主动裁剪）。
 	u.txtLog.SetMaxLength(logMaxLength)
+	// 日志区只做展示，水平滚动条用不上（长行截断，完整内容看日志文件）。
+	hideHScrollBar(u.txtLog.Handle())
 
 	// 日志区强行单行显示，跟 OpenVPN 一样。
 	//
@@ -804,6 +806,11 @@ func (u *UI) refresh() {
 		u.logSeq = seq
 		u.txtLog.AppendText(strings.Join(newLines, "\r\n") + "\r\n")
 		u.trimLog()
+		// 点击只读日志框会留下选择高亮（底部一条蓝条）；把选择收成光标，
+		// 位置不变但不留高亮。完整日志复制走「查看日志文件」。
+		if s, e := u.txtLog.TextSelection(); s != e {
+			u.txtLog.SetTextSelection(s, s)
+		}
 
 		const (
 			wmVScroll = 0x0115
@@ -1575,6 +1582,17 @@ func disableTabStop(w win.HWND) {
 	const wsTabStop = 0x00010000
 	style := win.GetWindowLong(w, win.GWL_STYLE)
 	win.SetWindowLong(w, win.GWL_STYLE, style&^wsTabStop)
+}
+
+// hideHScrollBar 隐藏控件自带的水平滚动条。日志区只做展示（长行截断，完整
+// 内容看日志文件），留一条用不上的横条只是白占高度。
+var (
+	user32            = windows.NewLazySystemDLL("user32.dll")
+	procShowScrollBar = user32.NewProc("ShowScrollBar")
+)
+
+func hideHScrollBar(hwnd win.HWND) {
+	_, _, _ = procShowScrollBar.Call(uintptr(hwnd), 0 /* SB_HORZ */, 0 /* 隐藏 */)
 }
 
 // alert 把错误挂在主窗口上弹出来，而不是变成一个找不到归属的孤立对话框。
