@@ -846,9 +846,8 @@ func (s *clientSession) enqueue(k int, batch []byte) {
 	// 刚判完又满），所以下面仍保留非阻塞 select 兜底。
 	if len(s.slotTx[k]) >= cap(s.slotTx[k]) {
 		s.tunnel.recordSlotDepth(k, len(s.slotTx[k]))
-		n := s.tunnel.Drops.SlotQueueFull.Add(1)
+		s.tunnel.Drops.SlotQueueFull.Add(1)
 		s.tunnel.Drops.UplinkBytes.Add(int64(len(batch)))
-		s.log.Debug("槽位写队列满，丢弃一批", "slot", k, "drops", n)
 		return
 	}
 	// 批缓冲由 pumpFromDevice 复用，投递后马上会被覆盖，所以必须在这里拷一份。
@@ -861,11 +860,9 @@ func (s *clientSession) enqueue(k int, batch []byte) {
 	default:
 		s.tunnel.recordSlotDepth(k, len(s.slotTx[k]))
 		s.tunnel.Drops.UplinkBytes.Add(int64(len(batch)))
-		// 只进 Debug，不报 Warn。这条在 Pi 节点上会持续触发（几十个 peer 的上行
-		// 把管道吃满，每分钟都在丢），刷屏之后反而看不出真正的问题。计数仍然保留，
-		// 排障时开 Debug 就能看到；「丢包统计」那行也按原因汇总了同样的数字。
-		n := s.tunnel.Drops.SlotQueueFull.Add(1)
-		s.log.Debug("槽位写队列满，丢弃一批", "slot", k, "drops", n)
+		// 只计数，不逐条记录：拥塞时每批都会触发，写日志会刷屏；「丢包统计」
+		// 那行按原因汇总了同样的数字。
+		s.tunnel.Drops.SlotQueueFull.Add(1)
 	}
 }
 
