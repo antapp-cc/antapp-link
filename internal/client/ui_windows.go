@@ -53,7 +53,7 @@ const emSetTargetDevice = 0x0448
 const (
 	logMaxLength     = 0x7FFFFFFE // EM_SETLIMITTEXT：把默认 64KB 上限放宽
 	logTrimThreshold = 60000      // 超过这么多字符就裁剪
-	logTrimKeep      = 40000      // 裁剪后保留最近字符数（约 300 行）
+	logTrimKeep      = 56000      // 裁剪后保留最近字符数（约 400 行）
 )
 
 // 换成独立的托盘库就得处理两个消息循环抢主线程的问题。
