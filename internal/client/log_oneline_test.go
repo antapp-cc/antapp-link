@@ -27,7 +27,7 @@ func TestHandleEmitsSingleLine(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			buf := NewLogBuffer(10)
-			h := &teeHandler{file: slog.NewTextHandler(io.Discard, nil), buf: buf}
+			h := &teeHandler{w: io.Discard, buf: buf}
 
 			r := slog.NewRecord(time.Now(), slog.LevelWarn, c.msg, 0)
 			r.AddAttrs(c.attr)

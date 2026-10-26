@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -190,19 +191,16 @@ func (b *LogBuffer) Tail(n int) []string {
 // 直接在界面里显示 slog 的原文也行，但那样满屏都是 time=/level=/msg=，
 // 跟用户已经习惯的 OpenVPN 客户端日志观感差得远。
 type teeHandler struct {
-	file slog.Handler
-	buf  *LogBuffer
+	w     io.Writer
+	buf   *LogBuffer
+	attrs []slog.Attr
 }
 
-func (h *teeHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return h.file.Enabled(ctx, level)
+func (h *teeHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= slog.LevelInfo
 }
 
-func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
-	if err := h.file.Handle(ctx, r); err != nil {
-		return err
-	}
-
+func (h *teeHandler) Handle(_ context.Context, r slog.Record) error {
 	var b strings.Builder
 	// 前缀 17 个宽度单位：日期时间 14 + 空格 + 级别符号 + 空格。
 	//
@@ -213,6 +211,12 @@ func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
 	b.WriteString(levelTag(r.Level))
 	b.WriteString(" ")
 	b.WriteString(r.Message)
+	for _, a := range h.attrs {
+		b.WriteString("  ")
+		b.WriteString(attrKeyLabel(a.Key))
+		b.WriteString("=")
+		b.WriteString(a.Value.String())
+	}
 	r.Attrs(func(a slog.Attr) bool {
 		b.WriteString("  ")
 		b.WriteString(attrKeyLabel(a.Key))
@@ -224,7 +228,9 @@ func (h *teeHandler) Handle(ctx context.Context, r slog.Record) error {
 	// （见 ui_windows.go），超长内容由横向滚动条承担 —— 和 OpenVPN 一样。
 	line := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(b.String())
 	h.buf.addLine(fitLogLine(line))
-	return nil
+	// 文件里写同一行（不截断）：用户要求文件跟界面一样简单，不要 time=/level=/msg=。
+	_, err := io.WriteString(h.w, line+"\n")
+	return err
 }
 
 // logLineMaxUnits 是界面日志区一行能容纳的显示宽度（ASCII=1，中文=2）。
@@ -325,12 +331,12 @@ var attrKeyLabels = map[string]string{
 // WithAttrs / WithGroup 在本项目里用不到（都是直接 slog.Info/Warn/Error），
 // 但 slog.Handler 要求实现，这里保持语义正确即可。
 func (h *teeHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &teeHandler{file: h.file.WithAttrs(attrs), buf: h.buf}
+	cp := *h
+	cp.attrs = append(append([]slog.Attr{}, h.attrs...), attrs...)
+	return &cp
 }
 
-func (h *teeHandler) WithGroup(name string) slog.Handler {
-	return &teeHandler{file: h.file.WithGroup(name), buf: h.buf}
-}
+func (h *teeHandler) WithGroup(string) slog.Handler { return h }
 
 // levelTag 用符号而不是「信息/警告/错误」四个字：每条都印一遍的话，
 // 那两个字占了时间戳之后最醒目的位置，而绝大多数行都是「信息」，纯属噪声。
@@ -402,7 +408,6 @@ func NewFileLogger(root string) (*slog.Logger, *LogBuffer, func(), error) {
 	}
 	buf := NewLogBuffer(500)
 	activeSession = &sessionLogger{rot: rot, buf: buf}
-	fileHandler := slog.NewTextHandler(rot, &slog.HandlerOptions{Level: slog.LevelInfo})
-	return slog.New(&teeHandler{file: fileHandler, buf: buf}), buf,
+	return slog.New(&teeHandler{w: rot, buf: buf}), buf,
 		func() { _ = rot.Close() }, nil
 }

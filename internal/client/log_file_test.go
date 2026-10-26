@@ -1,9 +1,13 @@
 package client
 
 import (
+	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // CurrentLogFile 返回当前会话日志文件；NewFileLogger 之后应指向 client.log，
@@ -48,5 +52,19 @@ func TestLogResetEpoch(t *testing.T) {
 	SwitchLogSession("other.antapp")
 	if got := LogResetEpoch(); got != before+2 {
 		t.Fatalf("再次切换后 epoch = %d, want %d", got, before+2)
+	}
+}
+
+// 文件日志跟界面行一样简单：10-26 15:35:14 . 出网自检通过（不带 time=/level=/msg=）。
+func TestTeeHandlerFileLine(t *testing.T) {
+	var buf strings.Builder
+	h := &teeHandler{w: &buf, buf: NewLogBuffer(10)}
+	rec := slog.NewRecord(time.Date(2026, 10, 26, 15, 35, 14, 0, time.Local), slog.LevelInfo, "出网自检通过", 0)
+	if err := h.Handle(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	want := "10-26 15:35:14 . 出网自检通过\n"
+	if got := buf.String(); got != want {
+		t.Fatalf("文件日志 = %q，want %q", got, want)
 	}
 }
