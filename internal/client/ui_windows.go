@@ -37,6 +37,10 @@ var appIconGray []byte
 var appIconGreen []byte
 
 // UI 是主窗口加托盘。托盘用 walk 自带的 NotifyIcon，跟主窗口共用同一个消息循环 ——
+//
+// emSetTargetDevice 让多行 Edit 控件不要按窗口宽度折行（早上那版用的就是
+// wParam=0、lParam=1；换成 -1 或删掉后长行都会折，见 0.4.12 的几次反复）。
+const emSetTargetDevice = 0x0448
 
 // 界面日志区的容量控制。
 //
@@ -243,16 +247,18 @@ func (u *UI) build() error {
 		}
 	})
 
-	// 日志区强行单行显示，跟 OpenVPN 一样：WS_HSCROLL + ES_AUTOHSCROLL，长行往右
-	// 延伸、由底部横向滚动条拖看，不折行。OpenVPN 的日志窗口（openvpn.c）就是这么
-	// 建 RichEdit 的，没有用 EM_SETTARGETDEVICE；之前那套 target device 参数在
-	// walk 的 EDIT 上不生效，反而让长行折开。
+	// 日志区强行单行显示：WS_HSCROLL + ES_AUTOHSCROLL + EM_SETTARGETDEVICE。
+	// 早上那版（wParam=0、lParam=1）长行不折；后面换成 -1 或删掉都会折，说明
+	// 这个控件认的是 (0,1) 这组参数，不是 MSDN 上的 -1 语义。
 	const esAutoHScroll = 0x0080
 	logHwnd := u.txtLog.Handle()
 	win.SetWindowLong(logHwnd, win.GWL_STYLE,
 		win.GetWindowLong(logHwnd, win.GWL_STYLE)|win.WS_HSCROLL|esAutoHScroll)
 	win.SetWindowPos(logHwnd, 0, 0, 0, 0, 0,
 		win.SWP_FRAMECHANGED|win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER)
+	u.txtLog.SendMessage(emSetTargetDevice, 0, 1)
+	// 水平滚动条在 target device 设置之后再隐藏，否则会被重新放出来。
+	hideHScrollBar(u.txtLog.Handle())
 
 	// 关窗口只是收进托盘，不是退出 —— 否则隧道会跟着一起断
 	u.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
@@ -1572,6 +1578,17 @@ func disableTabStop(w win.HWND) {
 	const wsTabStop = 0x00010000
 	style := win.GetWindowLong(w, win.GWL_STYLE)
 	win.SetWindowLong(w, win.GWL_STYLE, style&^wsTabStop)
+}
+
+// hideHScrollBar 隐藏控件自带的水平滚动条。日志区只做展示（长行截断，完整
+// 内容看日志文件），留一条用不上的横条只是白占高度。
+var (
+	user32            = windows.NewLazySystemDLL("user32.dll")
+	procShowScrollBar = user32.NewProc("ShowScrollBar")
+)
+
+func hideHScrollBar(hwnd win.HWND) {
+	_, _, _ = procShowScrollBar.Call(uintptr(hwnd), 0 /* SB_HORZ */, 0 /* 隐藏 */)
 }
 
 // alert 把错误挂在主窗口上弹出来，而不是变成一个找不到归属的孤立对话框。
