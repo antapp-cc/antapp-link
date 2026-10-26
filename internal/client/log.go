@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // rotatingLog 是够用的按大小轮转日志。只留一份备份：排查现场通常只看最近那次，
@@ -32,7 +33,9 @@ func OpenLog(path string, maxSize int64) (*rotatingLog, error) {
 }
 
 func (l *rotatingLog) open() error {
-	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	// 初始打开（NewFileLogger）清空旧文件：重启后日志从零开始，不跟上次的混在一起。
+	// rotate 之后重开的是刚清空的空文件，截断没有影响。
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -84,8 +87,8 @@ func (l *rotatingLog) SwitchFile(path string) error {
 		l.file = nil
 	}
 	l.path = path
-	// 追加写，不截断旧会话的日志
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	// 新会话从零开始：清空旧会话的日志（软件重启/重新连接时不跟旧的混在一起）。
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -354,8 +357,15 @@ var activeSession *sessionLogger
 
 var rootDirForLogs string
 
+// logResetEpoch 每次日志会话切换（启动/连接/切配置）时自增；界面靠它判断
+// 要不要把日志控件清空，避免旧会话的日志和新会话的混在一起。
+var logResetEpoch atomic.Uint64
+
+// LogResetEpoch 返回当前日志会话代数；界面检测到变化就清空日志控件。
+func LogResetEpoch() uint64 { return logResetEpoch.Load() }
+
 // SwitchLogSession 把日志切到与配置文件同名的会话文件（pinode.antapp → pinode.log）。
-// 文件追加写（保留全部历史），界面缓冲清空（界面只显示最近一段）。
+// 文件清空（新会话从零开始），界面缓冲清空并通知界面清空日志控件。
 // 失败安静忽略：日志切换失败不该挡住连接。
 func SwitchLogSession(source string) {
 	if activeSession == nil {
@@ -370,6 +380,7 @@ func SwitchLogSession(source string) {
 	// 会话已切走，它没有保留价值——删掉，别在 logs 目录里留残渣
 	_ = os.Remove(filepath.Join(LogsDir(rootDirForLogs), "client.log"))
 	activeSession.buf.Clear()
+	logResetEpoch.Add(1)
 }
 
 // CurrentLogFile 返回当前会话日志文件的路径，供界面的「查看日志文件」使用。

@@ -87,6 +87,7 @@ type UI struct {
 	wasOnline     bool
 	hideAt        time.Time
 	logSeq        uint64
+	lastLogReset  uint64
 	done          chan struct{}
 	// wantConnected 记录用户是否期望连接。点「断开连接」后置 false，自动重连守护据此
 	// 收手 —— 否则修好「连上又掉没人管」之后会变成「用户点了断开它又自己连回来」。
@@ -779,6 +780,16 @@ func (u *UI) refresh() {
 		default:
 			u.ni.SetToolTip("AntApp Link · 连接中…")
 		}
+	}
+
+	// 日志会话切换（启动/重连/切配置）时清空界面日志，避免新旧混在一起。
+	if epoch := LogResetEpoch(); epoch != u.lastLogReset {
+		u.lastLogReset = epoch
+		if n := u.txtLog.TextLength(); n > 0 {
+			u.txtLog.SetTextSelection(0, n)
+			u.txtLog.ReplaceSelectedText("", false)
+		}
+		u.logSeq = 0
 	}
 
 	// 日志只做增量追加，绝不整体 SetText。
