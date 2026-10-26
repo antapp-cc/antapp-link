@@ -85,7 +85,6 @@ type UI struct {
 	btnPortTest *walk.PushButton
 	btnUpdate   *walk.PushButton
 	btnHide     *walk.PushButton
-	btnLog      *walk.PushButton
 
 	quitting      bool
 	trayHinted    bool
@@ -219,7 +218,6 @@ func (u *UI) build() error {
 					PushButton{AssignTo: &u.btnPrimary, Text: "连接", MinSize: Size{Width: 100}, OnClicked: u.onPrimary},
 					PushButton{AssignTo: &u.btnReconn, Text: "重新连接", MinSize: Size{Width: 100}, OnClicked: u.onReconnect},
 					PushButton{AssignTo: &u.btnPortTest, Text: "Node端口测试", MinSize: Size{Width: 100}, OnClicked: u.onPortTest},
-					PushButton{AssignTo: &u.btnLog, Text: "查看日志", MinSize: Size{Width: 70}, OnClicked: u.onOpenLog},
 					PushButton{AssignTo: &u.btnUpdate, Text: "立即更新", MinSize: Size{Width: 100}, OnClicked: u.onUpdate},
 					HSpacer{},
 					PushButton{AssignTo: &u.btnHide, Text: "隐藏", MinSize: Size{Width: 80}, OnClicked: u.onHide},
