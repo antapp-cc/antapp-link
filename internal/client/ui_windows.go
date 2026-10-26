@@ -44,6 +44,18 @@ var appIconGreen []byte
 // 折行出来的续行会顶格压在时间戳列上。
 const emSetTargetDevice = 0x0448
 
+// 界面日志区的容量控制。
+//
+// Windows 多行 EDIT 控件默认最多 65535 个字符，超过之后 walk 的 AppendText 会
+// 静默失效——日志文件还在写，界面却停在触顶那一刻（0.4.11 上实测界面停在
+// 10-26 10:16，文件已经写到 11:17）。这里把上限放宽作兜底，同时主动只保留最近
+// 一段：界面看最近的，完整历史点「查看日志文件」。
+const (
+	logMaxLength     = 0x7FFFFFFE // EM_SETLIMITTEXT：把默认 64KB 上限放宽
+	logTrimThreshold = 60000      // 超过这么多字符就裁剪
+	logTrimKeep      = 40000      // 裁剪后保留最近字符数（约 300 行）
+)
+
 // 换成独立的托盘库就得处理两个消息循环抢主线程的问题。
 //
 // 窗口布局照用户已经在 Pi 节点机上用惯的那个 OpenVPN 客户端来：
@@ -225,6 +237,8 @@ func (u *UI) build() error {
 		u.txtLog.SetBackground(bg)
 	}
 	u.txtLog.SetTextColor(walk.RGB(0x00, 0x00, 0x00))
+	// 放宽 EDIT 控件的默认 64KB 上限（真正的保护是 trimLog 的主动裁剪）。
+	u.txtLog.SetMaxLength(logMaxLength)
 
 	// 日志区强行单行显示，跟 OpenVPN 一样。
 	//
@@ -474,6 +488,7 @@ func (u *UI) rebuildTrayMenu() {
 	menu.Actions().Add(walk.NewSeparatorAction())
 	add("导入连接码", u.onImport)
 	add("打开配置目录", u.onOpenConfigDir)
+	add("查看日志文件", u.onOpenLog)
 	add("检查更新", u.onCheckUpdate)
 	menu.Actions().Add(walk.NewSeparatorAction())
 
@@ -788,6 +803,7 @@ func (u *UI) refresh() {
 	if newLines, seq := u.logs.Since(u.logSeq); len(newLines) > 0 {
 		u.logSeq = seq
 		u.txtLog.AppendText(strings.Join(newLines, "\r\n") + "\r\n")
+		u.trimLog()
 
 		const (
 			wmVScroll = 0x0115
@@ -1498,6 +1514,38 @@ func (u *UI) onOpenConfigDir() {
 			u.alert("打开配置目录失败", err.Error())
 		}
 	}()
+}
+
+// onOpenLog 用系统默认程序打开当前会话的日志文件。
+//
+// 界面日志只保留最近一段（见 trimLog），完整历史靠这个入口 —— 和 OpenVPN 的
+// 「View Log」一个思路：文件才是权威，编辑器不受 EDIT 控件长度限制。
+func (u *UI) onOpenLog() {
+	path := CurrentLogFile()
+	if path == "" {
+		u.alert("查看日志文件", "还没有日志文件（程序刚启动）。")
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		u.alert("查看日志文件", "日志文件不存在："+path)
+		return
+	}
+	if err := openInExplorer(path); err != nil {
+		u.alert("查看日志文件", err.Error())
+	}
+}
+
+// trimLog 把界面日志控制在可控长度内。
+//
+// 多行 EDIT 控件默认 65535 字符上限，超过后 walk 的 AppendText 会静默失效；
+// 这里删掉开头、只留最近一段，滚动位置由调用方重新贴到底部。
+func (u *UI) trimLog() {
+	n := u.txtLog.TextLength()
+	if n <= logTrimThreshold {
+		return
+	}
+	u.txtLog.SetTextSelection(0, n-logTrimKeep)
+	u.txtLog.ReplaceSelectedText("", false)
 }
 
 func (u *UI) quit() {

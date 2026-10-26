@@ -105,7 +105,11 @@ func (l *rotatingLog) Close() error {
 	return err
 }
 
-func (l *rotatingLog) Path() string { return l.path }
+func (l *rotatingLog) Path() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.path
+}
 
 // LogBuffer 保留最近若干行日志供界面显示。
 //
@@ -366,6 +370,15 @@ func SwitchLogSession(source string) {
 	// 会话已切走，它没有保留价值——删掉，别在 logs 目录里留残渣
 	_ = os.Remove(filepath.Join(LogsDir(rootDirForLogs), "client.log"))
 	activeSession.buf.Clear()
+}
+
+// CurrentLogFile 返回当前会话日志文件的路径，供界面的「查看日志文件」使用。
+// 还没有日志（启动早期）时返回空串。
+func CurrentLogFile() string {
+	if activeSession == nil || activeSession.rot == nil {
+		return ""
+	}
+	return activeSession.rot.Path()
 }
 
 // NewFileLogger 建一个同时写文件与界面缓冲的 logger。
