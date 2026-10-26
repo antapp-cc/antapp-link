@@ -463,7 +463,7 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 	// 定期重建的当前取值必须进日志：现场排查时要能确认这次跑的是「开着兜底」的版本，
 	// 还是环境变量把周期改了。
 	if recycleEvery > 0 {
-		a.log.Info("定期重建连接已启用", "every", recycleEvery.String())
+		a.log.Info(fmt.Sprintf("定期重建连接已启用（每 %s）", cnDuration(recycleEvery)))
 	} else {
 		a.log.Info("定期重建连接已关闭（ANTAPP_RECYCLE=0 关闭）")
 	}

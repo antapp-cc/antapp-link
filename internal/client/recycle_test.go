@@ -178,6 +178,25 @@ func TestRecycleEnabledByDefault(t *testing.T) {
 	}
 }
 
+// 日志里的周期显示成中文，不能是 "24h0m0s"。
+func TestCNDuration(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{24 * time.Hour, "24 小时"},
+		{30 * time.Minute, "30 分钟"},
+		{8*time.Hour + 30*time.Minute, "8 小时 30 分钟"},
+		{30 * time.Second, "30 秒"},
+		{0, "0"},
+	}
+	for _, c := range cases {
+		if got := cnDuration(c.d); got != c.want {
+			t.Errorf("cnDuration(%v) = %q，want %q", c.d, got, c.want)
+		}
+	}
+}
+
 // 定期重建的等待必须比常规退避短：常规 Backoff 的 10 秒起步是为
 // 「对端刚崩、内核还在收尾」设计的，主动断开不会撞上那种情况，
 // 干等 10 秒只是白白拉低 uptime（对外部节点来说端口是关的）。

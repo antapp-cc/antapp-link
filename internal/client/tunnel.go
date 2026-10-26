@@ -1562,6 +1562,28 @@ func envRecycleEvery() time.Duration {
 	return d
 }
 
+// cnDuration 把周期转成中文（小时/分钟/秒），给日志里给用户看；
+// time.Duration 自带的 "24h0m0s" 对用户不友好。
+func cnDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0"
+	}
+	hours := int(d / time.Hour)
+	minutes := int((d % time.Hour) / time.Minute)
+	secs := int((d % time.Minute) / time.Second)
+	parts := make([]string, 0, 3)
+	if hours > 0 {
+		parts = append(parts, fmt.Sprintf("%d 小时", hours))
+	}
+	if minutes > 0 {
+		parts = append(parts, fmt.Sprintf("%d 分钟", minutes))
+	}
+	if hours == 0 && minutes == 0 && secs > 0 {
+		parts = append(parts, fmt.Sprintf("%d 秒", secs))
+	}
+	return strings.Join(parts, " ")
+}
+
 // recycleAt 到点返回 errScheduledRecycle，让上层把会话重建一次。
 //
 // 只在真正空闲时动手：先采样一分钟，这期间收发合计超过 recycleBusyBytes 就推迟
