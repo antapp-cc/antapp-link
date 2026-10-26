@@ -174,10 +174,10 @@ func (u *UI) build() error {
 		AssignTo: &u.mw,
 		Title:    "AntApp Link",
 		Icon:     u.icon,
-		// 默认 540x353，跟用户原来那个 OpenVPN 客户端窗口差不多大。
+		// 默认 570x350，跟用户原来那个 OpenVPN 客户端窗口差不多大。
 		// MinSize 必须比它小，否则 Windows 会把默认尺寸顶上去。
 		MinSize: Size{Width: 480, Height: 300},
-		Size:    Size{Width: 540, Height: 353},
+		Size:    Size{Width: 570, Height: 350},
 		Layout:  VBox{Margins: Margins{Left: 10, Top: 10, Right: 10, Bottom: 10}, Spacing: 8},
 		Children: []Widget{
 			Composite{
