@@ -109,6 +109,9 @@ type UI struct {
 
 // RunUI 阻塞运行图形界面，直到用户从托盘菜单退出。
 func RunUI(app *App, logs *LogBuffer, rootDir string) error {
+	// NlaSvc 停掉时任务栏网络图标会误报「无 Internet」，客户端顺手把它拉起来。
+	go keepNlaSvcAlive(app.Log())
+
 	iconPath, err := ensureIconFile(rootDir, "antapp-fill.ico", appIcon)
 	if err != nil {
 		return err
