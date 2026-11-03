@@ -260,6 +260,14 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		s.relayStat.Store(relayStat)
 		defer stopRelay()
 	}
+	// UDP 转发：TCP 那套之外单独一组监听，补齐 Pi Node 官方要求的 31400-31409/udp。
+	stopUDPForward, udpErr := startUDPForward(runCtx, cfg, logger, func() bool { return s.currentSession() != nil })
+	if udpErr != nil {
+		logger.Warn("UDP 端口转发启动失败", "err", udpErr,
+			"forward_ports", fmt.Sprintf("%d-%d", cfg.ForwardPorts.Start, cfg.ForwardPorts.End))
+	} else {
+		defer stopUDPForward()
+	}
 	go s.reportStatus(runCtx)
 	go s.watchdogLoop(runCtx)
 	go func() {
