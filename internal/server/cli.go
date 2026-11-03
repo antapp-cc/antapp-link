@@ -477,6 +477,10 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 	// 「端口在监听」不等于「转发能用」：节点机没接入时转发器会立刻关掉外部连接，
 	// 而不是让它挂到拨号超时。不写这一句，运维看到端口开着会以为转发是好的。
 	fmt.Fprintln(stdout, "  注意：节点机未接入时，外部连接会被立即关闭（不挂超时）")
+	if st.UDPForwardPackets > 0 || st.UDPForwardBytes > 0 {
+		fmt.Fprintf(stdout, "  UDP 转发    : 累计 %d 包 / %d 字节（31400-31409/udp）\n",
+			st.UDPForwardPackets, st.UDPForwardBytes)
+	}
 	return 0
 }
 

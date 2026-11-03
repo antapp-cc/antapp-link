@@ -1106,6 +1106,10 @@ func (s *Server) reportStatus(ctx context.Context) {
 			st.ForwardRejected = rejected
 			st.ForwardSwept = idle
 		}
+		if pkts, bytes, ok := udpForwardSnapshot(); ok {
+			st.UDPForwardPackets = pkts
+			st.UDPForwardBytes = bytes
+		}
 		if sess := s.currentSession(); sess != nil {
 			st.Client = sess.name
 			st.ConnectedAt = sess.connectedAt.Format(time.RFC3339)

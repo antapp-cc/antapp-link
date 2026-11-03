@@ -52,6 +52,9 @@ type Status struct {
 	ForwardTotal    int `json:"forward_total,omitempty"`
 	ForwardRejected int `json:"forward_rejected,omitempty"`
 	ForwardSwept    int `json:"forward_swept,omitempty"`
+	// UDP 转发累计计数（TCP 转发之外的 31400-31409/udp）。
+	UDPForwardPackets uint64 `json:"udp_forward_packets,omitempty"`
+	UDPForwardBytes   uint64 `json:"udp_forward_bytes,omitempty"`
 	// Goroutines 是写状态那一刻的 goroutine 数。长期盯它有没有单调上涨，
 	// 比事后查 pprof 更容易发现「每次重连泄漏一点」这类问题。
 	Goroutines int `json:"goroutines,omitempty"`

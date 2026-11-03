@@ -29,6 +29,20 @@ var (
 	udpForwardMaxSessions = 256
 )
 
+// udpForwardCounters 是 UDP 转发的累计计数（多端口共用），写进状态文件供 status 展示。
+var udpForwardCounters struct {
+	rxPackets, rxBytes, txPackets, txBytes atomic.Uint64
+}
+
+// udpForwardSnapshot 返回 UDP 转发累计收发包数与字节数；一次都没转发过时 ok=false。
+func udpForwardSnapshot() (packets, bytes uint64, ok bool) {
+	rxP, txP := udpForwardCounters.rxPackets.Load(), udpForwardCounters.txPackets.Load()
+	if rxP+txP == 0 {
+		return 0, 0, false
+	}
+	return rxP + txP, udpForwardCounters.rxBytes.Load() + udpForwardCounters.txBytes.Load(), true
+}
+
 type udpForward struct {
 	listen   *net.UDPConn
 	target   *net.UDPAddr
@@ -163,6 +177,9 @@ func (f *udpForward) dispatch(from *net.UDPAddr, pkt []byte) {
 	sess.touch()
 	if _, err := sess.conn.Write(pkt); err != nil {
 		f.log.Debug("UDP 转发写节点机失败", "port", f.port, "err", err)
+	} else {
+		udpForwardCounters.rxPackets.Add(1)
+		udpForwardCounters.rxBytes.Add(uint64(len(pkt)))
 	}
 }
 
@@ -170,6 +187,7 @@ func (f *udpForward) dispatch(from *net.UDPAddr, pkt []byte) {
 func (f *udpForward) sessionReadLoop(key string, sess *udpForwardSession) {
 	buf := make([]byte, proto.MaxUDPPacket)
 	for {
+		_ = sess.conn.SetReadDeadline(time.Now().Add(udpForwardIdleTimeout))
 		n, err := sess.conn.Read(buf)
 		if err != nil {
 			f.removeSession(key, sess)
@@ -183,6 +201,8 @@ func (f *udpForward) sessionReadLoop(key string, sess *udpForwardSession) {
 			f.removeSession(key, sess)
 			return
 		}
+		udpForwardCounters.txPackets.Add(1)
+		udpForwardCounters.txBytes.Add(uint64(n))
 	}
 }
 
