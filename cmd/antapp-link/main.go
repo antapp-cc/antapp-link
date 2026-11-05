@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -49,6 +50,15 @@ func main() {
 }
 
 func run() int {
+	// panic 兜底：GUI 程序没有控制台，panic 只会让进程静默消失（事件日志/WER
+	// 都不留痕）。把堆栈落到 logs\panic-<时间>.log 再继续崩，行为不变。
+	defer func() {
+		if r := recover(); r != nil {
+			_ = client.WritePanicLog(defaultRootDir(), r, debug.Stack())
+			panic(r)
+		}
+	}()
+
 	// 更新拉起的新版一旦没走到「界面真的起来了」就退出，旧进程必须收到 failed 才能
 	// 恢复运行。兜底放在最前面：单实例检查本身就可能失败，而那条路径以前会让
 	// 旧进程一直等到超时。
