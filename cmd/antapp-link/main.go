@@ -50,8 +50,6 @@ func main() {
 }
 
 func run() int {
-	// 生命周期：启动/退出写独立 lifecycle.log，不受 client.log 重连清空影响。
-	update.LogLifecycle(update.EventProcessStart, "启动（exe="+os.Args[0]+"）", nil)
 	exited := false
 	defer func() {
 		if !exited {
@@ -203,6 +201,9 @@ func run() int {
 		client.ShowMessage("AntApp Link", "创建工作目录失败："+err.Error())
 		return 1
 	}
+	// 生命周期日志放在安装目录 logs\ 下，和 client.log 放一起，排查时不用翻两个目录。
+	update.SetLifecyclePath(filepath.Join(client.LogsDir(dataDir), "lifecycle.log"))
+	update.LogLifecycle(update.EventProcessStart, "启动（exe="+os.Args[0]+"）", nil)
 
 	logger, logs, closeLog, err := client.NewFileLogger(dataDir)
 	if err != nil {

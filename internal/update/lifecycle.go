@@ -94,6 +94,19 @@ var processInvocation = newInvocationID()
 
 var lifecyclePathFn = defaultLifecyclePath
 
+// SetLifecyclePath 改生命周期日志的位置。
+//
+// 客户端会把路径挪到安装目录的 logs\ 下，和 client.log / pinode.log 放一起，
+// 排查时不用在两个目录之间来回找。非管理员运行时安装目录不可写：Record 会
+// 失败并被忽略，不会影响客户端本身。
+func SetLifecyclePath(path string) {
+	if path == "" {
+		return
+	}
+	p := path
+	lifecyclePathFn = func() string { return p }
+}
+
 // defaultLifecyclePath 放在用户配置目录，而不是安装目录：客户端装在 Program Files
 // 时普通用户对安装目录没有写权限，写不进去等于启动事件全丢。
 func defaultLifecyclePath() string {
