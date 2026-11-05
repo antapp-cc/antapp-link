@@ -285,8 +285,12 @@ func run() int {
 	// 根本用不了，而提前写下的 ready 已经让旧进程放手了。ready 由 RunUI 在界面
 	// 建好之后写，见 client/ui_windows.go 的 buildUIThenConfirm。
 	// 老版本计划任务带着 72 小时运行时限（到点被调度器强杀），升级后第一次启动
-	// 顺手修正：只改已有任务，不创建，尊重用户关闭自启的选择。
-	go func() { _ = client.MigrateAutostartTask() }()
+	// 顺手修正：只改已有任务，不创建，尊重用户关闭自启的选择。失败只记日志。
+	go func() {
+		if err := client.MigrateAutostartTask(); err != nil {
+			logger.Warn("修正自启任务运行策略失败", "err", err)
+		}
+	}()
 	go waitHealthyThenCleanup(app)
 	// 进程稳定跑过观察窗口也算健康：用户可能一直挂着不连隧道，不能因此让
 	// 下次启动把新版回滚掉。
