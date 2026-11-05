@@ -50,20 +50,23 @@ func main() {
 }
 
 func run() int {
+	// 生命周期：启动/退出写独立 lifecycle.log，不受 client.log 重连清空影响。
+	update.LogLifecycle(update.EventProcessStart, "启动（exe="+os.Args[0]+"）", nil)
+	exited := false
+	defer func() {
+		if !exited {
+			update.LogLifecycle(update.EventProcessExit, "正常返回", nil)
+		}
+	}()
 	// panic 兜底：GUI 程序没有控制台，panic 只会让进程静默消失（事件日志/WER
 	// 都不留痕）。把堆栈落到 logs\panic-<时间>.log 再继续崩，行为不变。
 	defer func() {
 		if r := recover(); r != nil {
+			exited = true
 			update.LogLifecycle(update.EventProcessExit, "panic", fmt.Errorf("%v", r))
 			_ = client.WritePanicLog(defaultRootDir(), r, debug.Stack())
 			panic(r)
 		}
-	}()
-
-	// 生命周期：启动/退出写独立 lifecycle.log，不受 client.log 重连清空影响。
-	update.LogLifecycle(update.EventProcessStart, "启动（exe="+os.Args[0]+"）", nil)
-	defer func() {
-		update.LogLifecycle(update.EventProcessExit, "正常返回", nil)
 	}()
 
 	// 更新拉起的新版一旦没走到「界面真的起来了」就退出，旧进程必须收到 failed 才能
