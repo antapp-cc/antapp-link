@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/antapp-cc/antapp-link/internal/schtask"
 	"github.com/antapp-cc/antapp-link/internal/version"
 	"golang.org/x/sys/windows/registry"
 )
@@ -68,8 +69,18 @@ func enableAutostart(exe string) error {
 	if strings.ContainsAny(exe, " \t") {
 		target = `"` + exe + `"`
 	}
-	return runHidden("schtasks", "/create", "/tn", AutostartTask, "/tr", target,
-		"/sc", "onlogon", "/delay", "0000:30", "/rl", "highest", "/f")
+	if err := runHidden("schtasks", "/create", "/tn", AutostartTask, "/tr", target,
+		"/sc", "onlogon", "/delay", "0000:30", "/rl", "highest", "/f"); err != nil {
+		return err
+	}
+	// schtasks 不设运行时限：Windows 默认 72 小时且允许强杀，到点进程直接被结束。
+	// 必须紧接着改成无限运行；失败就删掉刚建的任务，不留「有任务但还会被掐掉」
+	// 的半配置状态。
+	if err := schtask.ApplySettings(); err != nil {
+		_ = runHidden("schtasks", "/delete", "/tn", AutostartTask, "/f")
+		return fmt.Errorf("设置自启任务运行策略失败: %w", err)
+	}
+	return nil
 }
 
 func runHiddenOutput(name string, args ...string) (string, error) {

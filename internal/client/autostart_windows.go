@@ -3,10 +3,13 @@
 package client
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/antapp-cc/antapp-link/internal/schtask"
 )
 
 const autostartTask = "AntAppLink"
@@ -27,10 +30,33 @@ func EnableAutostart() error {
 	}
 	// /delay 登录后延迟 30 秒再拉起：给网络栈留出就绪时间（DHCP/默认路由），
 	// 配合客户端自身的开机重试，双保险
-	return runCommand(Command{"schtasks", []string{
+	if err := runCommand(Command{"schtasks", []string{
 		"/create", "/tn", autostartTask, "/tr", target,
 		"/sc", "onlogon", "/delay", "0000:30", "/rl", "highest", "/f",
-	}})
+	}}); err != nil {
+		return err
+	}
+	// schtasks 不设运行时限：Windows 默认 72 小时且允许强杀，到点进程直接被结束。
+	// 必须紧接着改成无限运行；失败就删任务，不留「有任务但还会被掐掉」的状态。
+	if err := schtask.ApplySettings(); err != nil {
+		_ = exec.Command("schtasks", "/delete", "/tn", autostartTask, "/f").Run()
+		return fmt.Errorf("设置自启任务运行策略失败: %w", err)
+	}
+	return nil
+}
+
+// MigrateAutostartTask 启动时修正已部署电脑上的旧任务配置：只改已有任务，不创建。
+//
+// 老版本创建的任务带着 72 小时运行时限，到点会被任务调度器强杀。升级后第一次
+// 启动顺手修正；用户主动关掉的自启（任务不存在）保持不动。
+func MigrateAutostartTask() error {
+	if err := schtask.ApplySettings(); err != nil {
+		if errors.Is(err, schtask.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // DisableAutostart 删除计划任务。任务本来就不存在时不算失败。

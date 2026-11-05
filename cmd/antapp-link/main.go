@@ -54,9 +54,16 @@ func run() int {
 	// 都不留痕）。把堆栈落到 logs\panic-<时间>.log 再继续崩，行为不变。
 	defer func() {
 		if r := recover(); r != nil {
+			update.LogLifecycle(update.EventProcessExit, "panic", fmt.Errorf("%v", r))
 			_ = client.WritePanicLog(defaultRootDir(), r, debug.Stack())
 			panic(r)
 		}
+	}()
+
+	// 生命周期：启动/退出写独立 lifecycle.log，不受 client.log 重连清空影响。
+	update.LogLifecycle(update.EventProcessStart, "启动（exe="+os.Args[0]+"）", nil)
+	defer func() {
+		update.LogLifecycle(update.EventProcessExit, "正常返回", nil)
 	}()
 
 	// 更新拉起的新版一旦没走到「界面真的起来了」就退出，旧进程必须收到 failed 才能
@@ -274,6 +281,9 @@ func run() int {
 	// 交接确认不在这里：RunUI 还要加载图标、创建窗口、创建托盘，这些失败的话新版
 	// 根本用不了，而提前写下的 ready 已经让旧进程放手了。ready 由 RunUI 在界面
 	// 建好之后写，见 client/ui_windows.go 的 buildUIThenConfirm。
+	// 老版本计划任务带着 72 小时运行时限（到点被调度器强杀），升级后第一次启动
+	// 顺手修正：只改已有任务，不创建，尊重用户关闭自启的选择。
+	go func() { _ = client.MigrateAutostartTask() }()
 	go waitHealthyThenCleanup(app)
 	// 进程稳定跑过观察窗口也算健康：用户可能一直挂着不连隧道，不能因此让
 	// 下次启动把新版回滚掉。

@@ -16,8 +16,9 @@ func WritePanicLog(rootDir string, v any, stack []byte) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	name := fmt.Sprintf("panic-%s.log", time.Now().Format("20060102-150405"))
+	now := time.Now()
+	name := fmt.Sprintf("panic-%s.log", now.Format("20060102-150405"))
 	body := fmt.Sprintf("time: %s\nversion: %s\npanic: %v\n\n%s\n",
-		time.Now().Format(time.RFC3339), Version, v, stack)
+		now.Format(time.RFC3339), Version, v, stack)
 	return os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600)
 }
