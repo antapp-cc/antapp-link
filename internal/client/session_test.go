@@ -224,10 +224,6 @@ func TestFlushBatchStillReportsErrorWhileRunning(t *testing.T) {
 // 读方向已经是这个语义（断开只摘槽 + 补拨），写方向也要对齐 ——
 // 一条成员连接出问题不该重启整条隧道。
 func TestMemberSlotWriteFailureDropsSlotOnly(t *testing.T) {
-	old := slotWriteTimeout
-	slotWriteTimeout = 150 * time.Millisecond
-	defer func() { slotWriteTimeout = old }()
-
 	tun := testTunnel(t)
 	ctrl, ctrlPeer := net.Pipe()
 	defer ctrl.Close()
@@ -236,7 +232,7 @@ func TestMemberSlotWriteFailureDropsSlotOnly(t *testing.T) {
 
 	dead, deadPeer := net.Pipe() // 对端从不读：这条槽写不动
 	defer deadPeer.Close()
-	sess.slots[1] = dead
+	sess.slots[1] = shortDeadlineConn{dead}
 
 	done := make(chan error, 1)
 	go func() { done <- flushBatch(sess, 1, batchOf([]byte{1, 2, 3})) }()
@@ -256,14 +252,10 @@ func TestMemberSlotWriteFailureDropsSlotOnly(t *testing.T) {
 
 // 反例：控制连接（槽 0）写失败意味着会话本身断了，必须结束会话让上层重连。
 func TestControlSlotWriteFailureEndsSession(t *testing.T) {
-	old := slotWriteTimeout
-	slotWriteTimeout = 150 * time.Millisecond
-	defer func() { slotWriteTimeout = old }()
-
 	tun := testTunnel(t)
 	dead, deadPeer := net.Pipe() // 控制连接写不动
 	defer deadPeer.Close()
-	sess := newClientSession(tun, dead, "sid", nil, Ack{Members: 1})
+	sess := newClientSession(tun, shortDeadlineConn{dead}, "sid", nil, Ack{Members: 1})
 
 	done := make(chan error, 1)
 	go func() { done <- flushBatch(sess, 0, batchOf([]byte{1, 2, 3})) }()
@@ -286,4 +278,10 @@ func batchOf(pkts ...[]byte) []byte {
 		batch = append(batch, p...)
 	}
 	return batch
+}
+
+type shortDeadlineConn struct{ net.Conn }
+
+func (c shortDeadlineConn) SetWriteDeadline(t time.Time) error {
+	return c.Conn.SetWriteDeadline(time.Now().Add(150 * time.Millisecond))
 }

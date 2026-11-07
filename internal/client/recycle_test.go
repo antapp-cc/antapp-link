@@ -1,10 +1,12 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +20,21 @@ func withFastRecycle(t *testing.T, every, probe, retry time.Duration, busy uint6
 	t.Cleanup(func() {
 		recycleEvery, recycleBusyProbe, recycleRetry, recycleBusyBytes = oldEvery, oldProbe, oldRetry, oldBusy
 	})
+}
+
+func TestRecycleDeferralLogsElapsedTime(t *testing.T) {
+	withFastRecycle(t, 5*time.Millisecond, time.Millisecond, 5*time.Millisecond, 0)
+	var logs bytes.Buffer
+	s := newRecycleSession()
+	s.log = slog.New(slog.NewTextHandler(&logs, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(30*time.Millisecond, cancel)
+	if err := s.recycleAt(ctx); err != nil {
+		t.Fatalf("canceled recycleAt returned %v", err)
+	}
+	if !strings.Contains(logs.String(), "deferred_for=") {
+		t.Fatalf("deferral log missing elapsed duration: %s", logs.String())
+	}
 }
 
 func newRecycleSession() *clientSession {

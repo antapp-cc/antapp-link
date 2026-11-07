@@ -82,7 +82,7 @@ func TestEnqueueCopiesBatch(t *testing.T) {
 
 	select {
 	case queued := <-sess.slotTx[1]:
-		if len(queued) != 4 || queued[0] != 1 || queued[3] != 4 {
+		if len(queued.data) != 4 || queued.data[0] != 1 || queued.data[3] != 4 {
 			t.Fatalf("队列里的批被调用方覆盖了：%v", queued)
 		}
 	case <-time.After(time.Second):
@@ -111,6 +111,9 @@ func TestEnqueueDropsWhenFullWithoutBlocking(t *testing.T) {
 	dropped := sess.tunnel.Drops.SlotQueueFull.Load()
 	if dropped == 0 {
 		t.Fatal("队列满了却没有记录丢弃次数")
+	}
+	if got := sess.slotQueueDrops[1].Load(); got != dropped {
+		t.Fatalf("槽级丢弃计数 = %d，公共计数 = %d", got, dropped)
 	}
 	if sess.tunnel.Drops.UplinkBytes.Load() == 0 {
 		t.Fatal("丢弃了批次却没记字节数")

@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"net"
 	"sync"
@@ -22,8 +23,6 @@ func TestUDPSendConcurrentNoDuplicateSeq(t *testing.T) {
 		t.Fatalf("监听: %v", err)
 	}
 	defer srv.Close()
-	// 缓冲开到能装下全部包，避免本机回环上因队列溢出丢包干扰结论
-	_ = srv.SetReadBuffer(1 << 20)
 
 	conn, err := net.DialUDP("udp", nil, srv.LocalAddr().(*net.UDPAddr))
 	if err != nil {
@@ -40,17 +39,30 @@ func TestUDPSendConcurrentNoDuplicateSeq(t *testing.T) {
 
 	const workers, perWorker = 8, 200
 	total := workers * perWorker
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// 接收与发送并行，每个发送协程至多一个未确认包，不依赖系统实际接收缓冲上限。
+	received := make(chan struct{})
+	sendErrs := make(chan error, workers)
 	var wg sync.WaitGroup
+	defer func() { cancel(); wg.Wait() }()
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			for j := 0; j < perWorker; j++ {
-				_, _ = ch.send([]byte{byte(i), byte(j)})
+				if _, err := ch.send(ctx, []byte{byte(i), byte(j)}); err != nil {
+					sendErrs <- err
+					return
+				}
+				select {
+				case <-received:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}(i)
 	}
-	wg.Wait()
 
 	recvCipher, err := proto.NewCipher(key, 1)
 	if err != nil {
@@ -58,7 +70,7 @@ func TestUDPSendConcurrentNoDuplicateSeq(t *testing.T) {
 	}
 	buf := make([]byte, proto.MaxUDPPacket)
 	seen := make(map[uint64]bool, total)
-	_ = srv.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = srv.SetReadDeadline(time.Now().Add(5 * time.Second))
 	for len(seen) < total {
 		n, _, err := srv.ReadFromUDP(buf)
 		if err != nil {
@@ -75,6 +87,16 @@ func TestUDPSendConcurrentNoDuplicateSeq(t *testing.T) {
 		if _, err := recvCipher.Open(buf[:n]); err != nil {
 			t.Fatalf("序号 %d 的包解不开（nonce 或密钥被并发破坏）: %v", seq, err)
 		}
+		select {
+		case received <- struct{}{}:
+		case <-ctx.Done():
+			t.Fatal("并发发送确认超时")
+		}
+	}
+	select {
+	case err := <-sendErrs:
+		t.Fatalf("并发发送失败: %v", err)
+	default:
 	}
 	if len(seen) != total {
 		t.Fatalf("收到 %d 个包，期望 %d（余额被回环队列吞掉的话也会这样，但重复/解不开会先报）",
@@ -104,7 +126,7 @@ func TestUDPSendReturnsWrittenBytes(t *testing.T) {
 	ch := &udpChannel{conn: conn, sendSeal: seal}
 
 	payload := []byte{1, 2, 3, 4}
-	n, err := ch.send(payload)
+	n, err := ch.send(context.Background(), payload)
 	if err != nil {
 		t.Fatalf("发送失败: %v", err)
 	}
@@ -131,7 +153,7 @@ func TestUDPSendTracksErrorStreak(t *testing.T) {
 	ch := &udpChannel{conn: conn, sendSeal: seal}
 
 	for i := 0; i < 3; i++ {
-		if _, err := ch.send([]byte{1}); err == nil {
+		if _, err := ch.send(context.Background(), []byte{1}); err == nil {
 			t.Fatal("连接已关闭，发送不该成功")
 		}
 	}

@@ -150,7 +150,7 @@ func (c *udpChannel) probe(ctx context.Context, timeout time.Duration) error {
 	start := time.Now()
 	deadline := start.Add(timeout)
 
-	if _, err := c.send(nil); err != nil {
+	if _, err := c.send(ctx, nil); err != nil {
 		return err
 	}
 	next := 0
@@ -170,7 +170,7 @@ func (c *udpChannel) probe(ctx context.Context, timeout time.Duration) error {
 		}
 		if next < len(udpProbeRetryAt) && time.Since(start) >= udpProbeRetryAt[next] {
 			next++
-			if _, err := c.send(nil); err != nil {
+			if _, err := c.send(ctx, nil); err != nil {
 				return err
 			}
 		}
@@ -181,8 +181,16 @@ func (c *udpChannel) probe(ctx context.Context, timeout time.Duration) error {
 //
 // 返回字节数而不只是错误：数据面的「真正写出」统计要它。TxBytes 记的是明文长度，
 // 这里记的是密文长度，两者口径不同 —— 别拿它们相减当「丢了多少」。
-func (c *udpChannel) send(pkt []byte) (int, error) {
+func (c *udpChannel) send(ctx context.Context, pkt []byte) (int, error) {
 	c.sendMu.Lock()
+	if err := ctx.Err(); err != nil {
+		c.sendMu.Unlock()
+		return 0, err
+	}
+	if c.isClosed() {
+		c.sendMu.Unlock()
+		return 0, net.ErrClosed
+	}
 	n, err := c.conn.Write(c.sendSeal.Seal(pkt))
 	var streak int64
 	if err != nil {
@@ -268,7 +276,7 @@ func (c *udpChannel) keepalive(ctx context.Context) {
 					idle.Round(time.Second)))
 				return
 			}
-			_, _ = c.send(nil)
+			_, _ = c.send(ctx, nil)
 		}
 	}
 }

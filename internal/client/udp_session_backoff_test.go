@@ -31,6 +31,8 @@ func TestSessionUDPFailureDoesNotCountAsConnected(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 
+	helloMode := make(chan string, 1)
+
 	// 假服务端：回 HELLO_ACK，之后只读不回。同端口没有 UDP 监听，探测必然失败。
 	go func() {
 		c, err := ln.Accept()
@@ -38,9 +40,14 @@ func TestSessionUDPFailureDoesNotCountAsConnected(t *testing.T) {
 			return
 		}
 		defer c.Close()
-		if _, _, err := proto.ReadFrame(c); err != nil {
+		_, payload, err := proto.ReadFrame(c)
+		if err != nil {
 			return
 		}
+		var hello map[string]any
+		_ = json.Unmarshal(payload, &hello)
+		mode, _ := hello["mode"].(string)
+		helloMode <- mode
 		ack, _ := json.Marshal(Ack{TunnelIP: "10.10.0.2", Gateway: "10.10.0.1", Prefix: 24, MTU: 1400, Members: 1})
 		if err := proto.WriteFrame(c, proto.TypeHelloAck, ack); err != nil {
 			return
@@ -59,8 +66,11 @@ func TestSessionUDPFailureDoesNotCountAsConnected(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	connected, err := tun.session(ctx)
-	if err == nil || !strings.Contains(err.Error(), "UDP") {
+	if err == nil || !strings.Contains(err.Error(), "UDP") || !strings.Contains(err.Error(), "不回退 TCP") {
 		t.Fatalf("期望 UDP 通道失败的错误，实际 %v", err)
+	}
+	if mode := <-helloMode; pki.TunnelMode(mode) != pki.ModeUDP {
+		t.Fatalf("HELLO 未声明 UDP 模式: %q", mode)
 	}
 	if connected {
 		t.Fatal("UDP 通道没建起来却报告 connected=true，Run 会因此清零退避")

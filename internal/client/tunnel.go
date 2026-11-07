@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -143,6 +144,8 @@ type DropStats struct {
 	SlotQueueFull atomic.Int64
 	// MemberDrop 是成员连接被摘掉的次数（含主动摘除与对端断开）。
 	MemberDrop atomic.Int64
+	// StaleBatch 是连接已替换或会话已关闭而丢弃的旧批次。
+	StaleBatch atomic.Int64
 	// UplinkBytes 是上述各类原因丢弃的上行字节总数。包数按原因分，字节数只记总量：
 	// 量级够判断「丢的是零头还是大头」，再细就得看包数分布了。
 	UplinkBytes atomic.Int64
@@ -268,6 +271,22 @@ func (t *Tunnel) SlotDepthReport() (current, peak []int64) {
 		peak[i] = t.slotDepthPeak[i].Swap(c)
 	}
 	return current, peak
+}
+
+// SlotPendingReport 返回每槽「队列中 + 正在写」的字节数和槽级丢批累计，供 10 分钟
+// 状态行输出。
+func (t *Tunnel) SlotPendingReport() (pendingBytes, drops []int64) {
+	sess := t.activeSession.Load()
+	pendingBytes = make([]int64, len(t.slotDepth))
+	drops = make([]int64, len(t.slotDepth))
+	if sess == nil {
+		return pendingBytes, drops
+	}
+	for i := range sess.slotTx {
+		pendingBytes[i] = sess.slotPendingBytes[i].Load()
+		drops[i] = sess.slotQueueDrops[i].Load()
+	}
+	return pendingBytes, drops
 }
 
 // FlowSnapshot 返回当前会话的流表；没有活动会话时为 nil。
@@ -412,6 +431,9 @@ func (t *Tunnel) Run(ctx context.Context) error {
 
 	attempt := 0
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		// 读循环挂掉要优先处理，不能让「控制连接还在线」掩盖上行停摆
 		if rerr := t.takeReadError(); rerr != nil {
 			if t.RebuildDevice != nil {
@@ -628,6 +650,9 @@ func tuneTCPBuffers(conn net.Conn) {
 
 // session 建立一次完整会话并在其上搬运数据，返回是否成功握过手。
 func (t *Tunnel) session(ctx context.Context) (bool, error) {
+	if _, err := pki.ParseMode(string(t.inv.Mode)); err != nil {
+		return false, err
+	}
 	tlsCfg, err := pki.ClientTLSConfig(t.inv)
 	if err != nil {
 		return false, err
@@ -646,6 +671,7 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	}
 	tuneTCPBuffers(raw)
 	conn := tls.Client(raw, tlsCfg)
+	defer closeOnDone(ctx, conn)()
 
 	if err := conn.HandshakeContext(hctx); err != nil {
 		raw.Close()
@@ -658,13 +684,15 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 	sid := newSessionID()
 	// UDP 模式只要一条控制连接：数据包全走 UDP，成员连接没有意义
 	wantMembers := effectiveMembers(t.inv.Members)
+	mode := pki.ModeTCP
 	if t.inv.UseUDP() {
 		wantMembers = 1
+		mode = pki.ModeUDP
 	}
 
 	hello, err := json.Marshal(map[string]any{
 		"version": protoVersion, "client": t.inv.Name,
-		"sid": sid, "members": wantMembers, "member": 0,
+		"sid": sid, "members": wantMembers, "member": 0, "mode": mode,
 	})
 	if err != nil {
 		return false, err
@@ -715,7 +743,7 @@ func (t *Tunnel) session(ctx context.Context) (bool, error) {
 
 	// UDP 模式：数据包改走 UDP。控制连接继续跑心跳与保活，并负责把本地 UDP 端口报给
 	// 服务端（服务端按 TCP 远端 IP + 这个端口认人，不接受 UDP 包里自称的地址）。
-	// 启动失败不算致命 —— 退回 TCP 数据通道照样能用，只是慢。
+	// UDP 模式只允许 UDP 承载业务数据；启动失败必须结束本次会话。
 	if t.inv.UseUDP() {
 		u, uerr := startUDPChannel(ctx, t.inv, conn.ConnectionState(), sess.dev, t.log, sess.stats,
 			func(port int) error {
@@ -812,9 +840,9 @@ func newClientSession(t *Tunnel, conn net.Conn, sid string, tlsCfg *tls.Config, 
 		slotSeen: make([]atomic.Int64, n),
 		flow:     proto.NewFlowTable(),
 	}
-	sess.slotTx = make([]chan []byte, n)
+	sess.slotTx = make([]chan slotBatch, n)
 	for i := range sess.slotTx {
-		sess.slotTx[i] = make(chan []byte, slotTxLen)
+		sess.slotTx[i] = make(chan slotBatch, slotTxLen)
 	}
 	sess.slots[0] = conn
 	t.activeSession.Store(sess)
@@ -823,15 +851,48 @@ func newClientSession(t *Tunnel, conn net.Conn, sid string, tlsCfg *tls.Config, 
 }
 
 // slotTxLen 是每槽待写批的队列深度，和服务端的 slotQueueLen 对齐。
-// 一批最大约 MaxBatchBytes，4 槽满载约 640KB，可以接受。
-const slotTxLen = 8
+// 8 批只有约 128KB，按链路 BDP 不够吸收突发；16 批约 256KB，再深会放大排队时延。
+const slotTxLen = 16
 
 // enqueue 把一批上行投递给槽 k 的写协程，立即返回。
 //
 // 批缓冲由 pumpFromDevice 复用，投递后马上会被覆盖，所以必须在这里拷一份。
 // 队列满就丢这批：内层 TCP 会重传，比让网卡 reader 停下来等某一槽好得多。
 func (s *clientSession) enqueue(k int, batch []byte) {
+	_, conn, _ := s.writeSlotData(k)
+	s.enqueueOn(k, conn, batch)
+}
+
+func (s *clientSession) discardStaleBatch(n int) {
+	if n > 0 {
+		s.tunnel.Drops.StaleBatch.Add(1)
+		s.tunnel.Drops.UplinkBytes.Add(int64(n))
+	}
+}
+
+func (s *clientSession) discardQueuedBatches(k int) {
+	if k < 0 || k >= len(s.slotTx) {
+		return
+	}
+	for {
+		select {
+		case batch := <-s.slotTx[k]:
+			s.slotPendingBytes[k].Add(-int64(len(batch.data)))
+			s.discardStaleBatch(len(batch.data))
+		default:
+			return
+		}
+	}
+}
+
+func (s *clientSession) enqueueOn(k int, conn net.Conn, batch []byte) {
 	if len(batch) == 0 {
+		return
+	}
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if s.isClosed() {
+		s.discardStaleBatch(len(batch))
 		return
 	}
 	if k < 0 || k >= len(s.slotTx) {
@@ -847,19 +908,23 @@ func (s *clientSession) enqueue(k int, batch []byte) {
 	if len(s.slotTx[k]) >= cap(s.slotTx[k]) {
 		s.tunnel.recordSlotDepth(k, len(s.slotTx[k]))
 		s.tunnel.Drops.SlotQueueFull.Add(1)
+		s.slotQueueDrops[k].Add(1)
 		s.tunnel.Drops.UplinkBytes.Add(int64(len(batch)))
 		return
 	}
 	// 批缓冲由 pumpFromDevice 复用，投递后马上会被覆盖，所以必须在这里拷一份。
 	cp := make([]byte, len(batch))
 	copy(cp, batch)
+	s.slotPendingBytes[k].Add(int64(len(cp)))
 	select {
-	case s.slotTx[k] <- cp:
+	case s.slotTx[k] <- slotBatch{data: cp, conn: conn}:
 		s.tunnel.recordSlotDepth(k, len(s.slotTx[k]))
 		s.stats.TxQueued.Add(uint64(len(cp)))
 	default:
+		s.slotPendingBytes[k].Add(-int64(len(cp)))
 		s.tunnel.recordSlotDepth(k, len(s.slotTx[k]))
 		s.tunnel.Drops.UplinkBytes.Add(int64(len(batch)))
+		s.slotQueueDrops[k].Add(1)
 		// 只计数，不逐条记录：拥塞时每批都会触发，写日志会刷屏；「丢包统计」
 		// 那行按原因汇总了同样的数字。
 		s.tunnel.Drops.SlotQueueFull.Add(1)
@@ -874,9 +939,18 @@ func (s *clientSession) slotWriteLoop(ctx context.Context, k int, errCh chan<- e
 	for {
 		select {
 		case <-ctx.Done():
+			s.discardQueuedBatches(k)
 			return
 		case batch := <-s.slotTx[k]:
-			if err := flushBatch(s, k, batch); err != nil {
+			if ctx.Err() != nil {
+				s.slotPendingBytes[k].Add(-int64(len(batch.data)))
+				s.discardStaleBatch(len(batch.data))
+				s.discardQueuedBatches(k)
+				return
+			}
+			err := flushBatchOn(ctx, s, k, batch.conn, batch.data)
+			s.slotPendingBytes[k].Add(-int64(len(batch.data)))
+			if err != nil {
 				// 会话已在收尾时 errCh 可能没人收，用非阻塞投递免得协程卡死
 				select {
 				case errCh <- err:
@@ -886,6 +960,12 @@ func (s *clientSession) slotWriteLoop(ctx context.Context, k int, errCh chan<- e
 			}
 		}
 	}
+}
+
+// slotBatch 的连接身份在选槽时固定，成员补拨不能接管旧批次。
+type slotBatch struct {
+	data []byte
+	conn net.Conn
 }
 
 type clientSession struct {
@@ -919,6 +999,7 @@ type clientSession struct {
 	// 或正要往旧连接写包的 goroutine 能自己退出。设备跨会话复用、不能靠关设备来收尾。
 	closed    chan struct{}
 	closeOnce sync.Once
+	queueMu   sync.Mutex // 串行化批次入队与会话关闭时的队列清理
 
 	mu     sync.Mutex
 	slots  []net.Conn   // slots[0]=控制连接；成员槽位从 1 开始，nil=空
@@ -929,14 +1010,28 @@ type clientSession struct {
 	// 以前上行只有一个 pumpFromDevice 顺序 flushBatch：任意一条成员连接卡在重传上
 	// （单次写超时 20 秒），其他健康成员的上行也发不出去，64 个包的 pktCh 随即填满
 	// 开始丢包。服务端早就是每槽独立 writer（sc.writeLoop），客户端一直缺这一层。
-	slotTx []chan []byte
+	slotTx           []chan slotBatch
+	slotPendingBytes [maxMembers]atomic.Int64
+	slotQueueDrops   [maxMembers]atomic.Int64
 
-	// flow 决定上行包走哪个槽：已有流固定不变（保序），新流分给当前承载流数最少的槽。
+	// flow 决定上行包走哪个槽：已有流固定不变（保序），新流优先进入排队字节较少的槽。
 	// 纯哈希做不到均衡，一条大流会把某条成员连接塞到写超时被摘掉。
 	flow *proto.FlowTable
 
 	// udp 是 UDP 数据通道（mode=udp 且启动成功时才有）。非 nil 时上行数据不走槽位。
 	udp *udpChannel
+}
+
+func (s *clientSession) flowSlot(packet []byte) int {
+	var pendingBytes [maxMembers]int64
+	for k := 1; k < s.members && k < len(s.slotTx); k++ {
+		pendingBytes[k] = s.slotPendingBytes[k].Load()
+		// 满队列即使批次很小，也不能成为新流的低压候选。
+		if len(s.slotTx[k]) >= cap(s.slotTx[k]) {
+			pendingBytes[k] = math.MaxInt64
+		}
+	}
+	return s.flow.SlotWithPressure(packet, s.members, s.slotAlive, pendingBytes[:s.members])
 }
 
 // sessionEnded 报告会话是否已进入收尾（此时连接会随会话一起关，写失败是预期内的）。
@@ -950,9 +1045,13 @@ func (s *clientSession) sessionEnded() bool {
 // SetWriteDeadline 或 ReadFrame 会 panic；留一个已关闭的连接，读写一样立刻失败。
 func (s *clientSession) closeAll() {
 	s.closeOnce.Do(func() {
+		s.queueMu.Lock()
 		close(s.closed)
-		// 会话结束后队列里可能还留着没写出的批：把采样值清掉，别让下一次报告
-		// 读到上一会话的深度。
+		for k := range s.slotTx {
+			s.discardQueuedBatches(k)
+		}
+		s.queueMu.Unlock()
+		// 会话结束后把采样值清零，避免下一次报告读到上一会话的深度。
 		if s.tunnel.activeSession.CompareAndSwap(s, nil) {
 			for k := range s.tunnel.slotDepth {
 				s.tunnel.slotDepth[k].Store(0)
@@ -1000,7 +1099,7 @@ func (s *clientSession) isClosed() bool {
 //
 // 不能再缩：上行很满、链路实测有 30% 级别丢包时，5 秒不够把一批写完，成员连接
 // 会被反复误杀（这条是之前实测得出的，5 秒不可取）。
-var slotWriteTimeout = 10 * time.Second
+const slotWriteTimeout = 10 * time.Second
 
 // writeSlot 返回实际承载的连接、它的写锁与实际槽号。锁必须跟着落回控制连接，
 // 否则会和心跳的两次 Write 交错把帧撕开；实际槽号用来区分写不动的是成员还是会话命脉。
@@ -1096,7 +1195,14 @@ func (s *clientSession) memberHeartbeat(ctx context.Context, k int, conn net.Con
 				}
 			}
 			if err := s.pingMember(k); err != nil {
-				// 写失败不在这里收尾：读循环会摘槽、维护协程会补拨
+				// 单向写故障未必能唤醒 Read，必须主动关连接才能让维护协程补拨。
+				s.dropSlot(k, conn)
+				if ctx.Err() != nil || s.isClosed() {
+					return
+				}
+				n := s.tunnel.Drops.MemberDrop.Add(1)
+				s.log.Warn("成员连接心跳写失败，已摘除", "member", k,
+					"reason", connBrokenReason(err), "drops", n)
 				return
 			}
 		}
@@ -1274,7 +1380,10 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) (ti
 	t.log.Info(fmt.Sprintf("连接已就位 %d/%d", sess.liveCount(), sess.members))
 
 	// 这条连接要自己保活（理由见 memberPingInterval）：会话收尾或写不动时退出
-	go sess.memberHeartbeat(ctx, k, conn)
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+	heartbeatDone := make(chan struct{})
+	go func() { defer close(heartbeatDone); sess.memberHeartbeat(heartbeatCtx, k, conn) }()
+	defer func() { stopHeartbeat(); _ = conn.Close(); <-heartbeatDone }()
 
 	// 读循环：成员连接上来的包写网卡；断开摘槽（该槽流量落回控制连接）
 	for {
@@ -1308,6 +1417,10 @@ func (t *Tunnel) dialMember(ctx context.Context, sess *clientSession, k int) (ti
 		}
 		switch typ {
 		case proto.TypeIP:
+			if t.inv.UseUDP() || sess.udp != nil {
+				sess.dropSlot(k, conn)
+				return time.Since(joinedAt), fmt.Errorf("UDP 模式拒收 TCP 成员连接上的业务数据")
+			}
 			sess.trace.Record("rx", k, payload)
 			if _, err := sess.dev.Write(payload); err != nil {
 				// 这条读循环马上要退出，槽位必须跟着摘掉：留着的话分发仍会哈希到它，
@@ -1451,40 +1564,38 @@ func (s *clientSession) liveCount() int {
 
 func (s *clientSession) run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	var workers sync.WaitGroup
+	start := func(fn func()) { workers.Add(1); go func() { defer workers.Done(); fn() }() }
+	defer func() { cancel(); s.closeAll(); workers.Wait() }()
 	s.ctx = ctx
 	s.touchCtrl()
-
 	errCh := make(chan error, 4)
-	// 每槽一条独立写协程：一条成员连接卡在重传上不该拖住其他成员的上行。
-	for k := 0; k < s.members && k < len(s.slotTx); k++ {
-		go s.slotWriteLoop(ctx, k, errCh)
-	}
-	go func() { errCh <- s.pumpFromTunnel(ctx) }()
-	go func() { errCh <- s.pumpFromDevice(ctx) }()
-	go func() { errCh <- s.heartbeat(ctx) }()
-	go s.watchDataPath(ctx)
-	// UDP 模式下数据面可能先于控制连接失效：主动盯通道关闭，别等下一个上行包撞上去
-	go s.watchUDP(ctx, errCh)
-	// 到点主动结束会话，交给 Run 重开一次。只在真出错（到点）时投递：ctx 正常取消
-	// 时它返回 nil，把 nil 塞进 errCh 会被当成「某个协程正常收尾」，进而让 Run 走上
-	// 「runCtx 已取消 → 立即重连」那条路，形成无退避的重连风暴。
-	go func() {
-		if err := s.recycleAt(ctx); err != nil {
-			errCh <- err
+	report := func(err error) {
+		select {
+		case errCh <- err:
+		case <-ctx.Done():
 		}
-	}()
-	if s.members > 1 {
-		// 不单独打「多连接模式：目标 N 条，启动成员维护」—— 上面「已连接 … N 条并行连接」
-		// 已经说过了，用户不需要知道内部有个维护协程。
-		go maintainMembers(ctx, s.tunnel, s)
 	}
-
+	for k := 0; k < s.members && k < len(s.slotTx); k++ {
+		start(func() { s.slotWriteLoop(ctx, k, errCh) })
+	}
+	start(func() { report(s.pumpFromTunnel(ctx)) })
+	start(func() { report(s.pumpFromDevice(ctx)) })
+	start(func() { report(s.heartbeat(ctx)) })
+	start(func() { s.watchDataPath(ctx) })
+	start(func() { s.watchUDP(ctx, errCh) })
+	start(func() {
+		if err := s.recycleAt(ctx); err != nil {
+			report(err)
+		}
+	})
+	if s.members > 1 {
+		start(func() { maintainMembers(ctx, s.tunnel, s) })
+	}
 	select {
 	case <-ctx.Done():
 		return nil
 	case err := <-errCh:
-		cancel()
 		return err
 	}
 }
@@ -1589,7 +1700,8 @@ func (s *clientSession) recycleAt(ctx context.Context) error {
 	if recycleEvery <= 0 {
 		return nil
 	}
-	timer := time.NewTimer(recycleEvery)
+	dueAt := time.Now().Add(recycleEvery)
+	timer := time.NewTimer(time.Until(dueAt))
 	defer timer.Stop()
 
 	for {
@@ -1614,6 +1726,7 @@ func (s *clientSession) recycleAt(ctx context.Context) error {
 			s.log.Info("正在传输数据，推迟自动重建连接",
 				"deferrals", s.recycleDeferrals,
 				"sampled_mb", busy/(1<<20),
+				"deferred_for", time.Since(dueAt).Round(time.Second),
 				"rtt_ms", s.stats.RTT().Milliseconds())
 			timer.Reset(recycleRetry)
 			continue
@@ -1700,6 +1813,9 @@ func (s *clientSession) pumpFromTunnel(ctx context.Context) error {
 		s.touchCtrl()
 		switch typ {
 		case proto.TypeIP:
+			if s.tunnel.inv.UseUDP() || s.udp != nil {
+				return fmt.Errorf("UDP 模式拒收 TCP 控制连接上的业务数据，不回退 TCP")
+			}
 			s.trace.Record("rx", 0, payload)
 			if _, err := s.dev.Write(payload); err != nil {
 				return fmt.Errorf("写网卡: %w", err)
@@ -1729,7 +1845,11 @@ func (s *clientSession) pumpFromTunnel(ctx context.Context) error {
 // 写合并：首包选定槽位后，非阻塞地从 pktCh 继续收割同槽的现成包，拼成单缓冲一次
 // 写出——外层 TLS 记录数量减半。收不到就停，绝不等待。
 func (s *clientSession) pumpFromDevice(ctx context.Context) error {
+	if s.tunnel.inv.UseUDP() && s.udp == nil {
+		return fmt.Errorf("UDP 数据通道未就绪，不回退 TCP")
+	}
 	batch := make([]byte, 0, proto.MaxBatchBytes)
+	defer func() { s.discardStaleBatch(len(batch)) }()
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -1749,8 +1869,16 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 		if s.udp != nil {
 			s.trace.Record("tx", 0, pkt)
 			s.stats.TxBytes.Add(uint64(pktLen))
-			n, err := s.udp.send(pkt)
+			if ctx.Err() != nil || s.isClosed() {
+				s.discardStaleBatch(pktLen)
+				return nil
+			}
+			n, err := s.udp.send(ctx, pkt)
 			if err != nil {
+				if ctx.Err() != nil || s.isClosed() {
+					s.discardStaleBatch(pktLen)
+					return nil
+				}
 				if s.udp.isClosed() {
 					// keepalive 已经判定这条 UDP 通道失效并关掉了它。结束会话让 Run
 					// 重建 —— 重建出来的仍是 UDP 通道，不切 TCP。
@@ -1766,7 +1894,8 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 			}
 			continue
 		}
-		k := s.flow.Slot(pkt, s.members, s.slotAlive)
+		k := s.flowSlot(pkt)
+		_, conn, _ := s.writeSlotData(k)
 		s.trace.Record("tx", k, pkt)
 		s.stats.TxBytes.Add(uint64(pktLen))
 
@@ -1774,7 +1903,11 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 		batch = append(batch, pkt...)
 
 		// 收割同槽的现成包：不等待、批量不超上限
-		for len(batch) < proto.MaxBatchBytes-proto.HeaderSize-proto.MaxPayload {
+		processed := len(batch)
+		for processed < proto.MaxBatchBytes-proto.HeaderSize-proto.MaxPayload {
+			if ctx.Err() != nil || s.isClosed() {
+				return nil
+			}
 			var more []byte
 			select {
 			case more = <-s.tunnel.pktCh:
@@ -1783,27 +1916,40 @@ func (s *clientSession) pumpFromDevice(ctx context.Context) error {
 			if more == nil {
 				break
 			}
-			kk := s.flow.Slot(more, s.members, s.slotAlive)
+			kk := s.flowSlot(more)
+			_, nextConn, _ := s.writeSlotData(kk)
 			s.trace.Record("tx", kk, more)
-			if kk != k {
-				s.enqueue(k, batch)
-				k = kk
+			if kk != k || nextConn != conn {
+				s.enqueueOn(k, conn, batch)
+				k, conn = kk, nextConn
 				batch = batch[:0]
 			}
 			batch = proto.AppendHeader(batch, proto.TypeIP, len(more))
 			batch = append(batch, more...)
 			s.stats.TxBytes.Add(uint64(len(more)))
+			processed += proto.HeaderSize + len(more)
 		}
 
-		s.enqueue(k, batch)
+		if ctx.Err() != nil || s.isClosed() {
+			return nil
+		}
+		s.enqueueOn(k, conn, batch)
 		batch = batch[:0]
 	}
 }
 
-// flushBatch 把合并缓冲一次写出。写失败按实际落槽分流：成员连接只摘那一条并补拨，
-// 会话继续跑；只有控制连接写不动才算会话断了。
+// enqueue 把一批上行投递给槽 k 的写协程，立即返回。
 func flushBatch(s *clientSession, k int, batch []byte) error {
+	_, conn, _ := s.writeSlotData(k)
+	return flushBatchOn(context.Background(), s, k, conn, batch)
+}
+
+func flushBatchOn(ctx context.Context, s *clientSession, k int, expected net.Conn, batch []byte) error {
 	if len(batch) == 0 {
+		return nil
+	}
+	if ctx.Err() != nil {
+		s.discardStaleBatch(len(batch))
 		return nil
 	}
 	actual, conn, mu := s.writeSlotData(k)
@@ -1828,12 +1974,24 @@ func flushBatch(s *clientSession, k int, batch []byte) error {
 		}
 		return nil
 	}
+	if ctx.Err() != nil || s.isClosed() || conn != expected {
+		s.discardStaleBatch(len(batch))
+		return nil
+	}
 	mu.Lock()
 	defer mu.Unlock()
+	if ctx.Err() != nil || s.isClosed() || conn != expected || s.slotConn(actual) != expected {
+		s.discardStaleBatch(len(batch))
+		return nil
+	}
 	// SetWriteDeadline 在连接已关时就会失败，所以它和 Write 的失败要一起分流：
 	// 只处理 Write 的话，"对端已经关了"这条最常见的路径会绕过日志与摘槽。
 	werr := conn.SetWriteDeadline(time.Now().Add(slotWriteTimeout))
 	var wrote int
+	if ctx.Err() != nil {
+		s.discardStaleBatch(len(batch))
+		return nil
+	}
 	if werr == nil {
 		wrote, werr = conn.Write(batch)
 	}
