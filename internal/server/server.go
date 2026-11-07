@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"runtime"
@@ -126,11 +127,12 @@ func newInstanceID() string {
 }
 
 type helloPayload struct {
-	Version int    `json:"version"`
-	Client  string `json:"client"`
-	Sid     string `json:"sid,omitempty"`     // 逻辑会话 ID（多连接时同一伙连接共用）
-	Members int    `json:"members,omitempty"` // 客户端请求的连接总数
-	Member  int    `json:"member,omitempty"`  // 本连接槽位：0=控制连接，>0=成员
+	Version int            `json:"version"`
+	Client  string         `json:"client"`
+	Sid     string         `json:"sid,omitempty"`     // 逻辑会话 ID（多连接时同一伙连接共用）
+	Members int            `json:"members,omitempty"` // 客户端请求的连接总数
+	Member  int            `json:"member,omitempty"`  // 本连接槽位：0=控制连接，>0=成员
+	Mode    pki.TunnelMode `json:"mode,omitempty"`
 }
 
 type helloAckPayload struct {
@@ -143,10 +145,17 @@ type helloAckPayload struct {
 	Members  int      `json:"members,omitempty"` // 服务端批准的连接总数（0=单连接）
 }
 
+// tunIO 只暴露搬运所需的读写，便于在无 TUN 驱动的测试环境复现会话切换。
+type tunIO interface {
+	Read([]byte) (int, error)
+	TryRead([]byte) (int, error)
+	Write([]byte) (int, error)
+}
+
 // Server 是一条专线的服务端。同一时刻只服务一个客户端。
 type Server struct {
 	cfg    Config
-	tun    *TUN
+	tun    tunIO
 	tlsCfg *tls.Config
 	log    *slog.Logger
 
@@ -186,6 +195,9 @@ type relayState struct {
 
 // Run 阻塞运行隧道，直到 ctx 被取消。
 func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -340,6 +352,20 @@ func isResourceExhausted(err error) bool {
 	return false
 }
 
+// sendUDP 返回 true 时，即使尚未登记或发送失败，调用方也不能改走 TCP。
+func (s *Server) sendUDP(sess *session, packet []byte) bool {
+	u := sess.udpSession()
+	if u == nil && !sess.udpOnly.Load() {
+		return false
+	}
+	if u != nil && s.udp != nil {
+		if err := u.send(s.udp, packet); err != nil {
+			s.log.Debug("UDP 下行发送失败", "err", err)
+		}
+	}
+	return true
+}
+
 // pumpTun 把网卡上的包送往当前客户端。没有客户端时直接丢弃：云服自身的流量不会
 // 走这张网卡（默认路由还在原网卡上），所以丢包是安全且正确的。
 //
@@ -348,7 +374,11 @@ func isResourceExhausted(err error) bool {
 func (s *Server) pumpTun(ctx context.Context) {
 	buf := make([]byte, readBufferSize)
 	batch := make([]byte, 0, proto.MaxBatchBytes)
+readPacket:
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		n, err := s.tun.Read(buf)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -378,29 +408,43 @@ func (s *Server) pumpTun(ctx context.Context) {
 		if sess == nil {
 			continue
 		}
+		if !sessionAlive(sess) {
+			continue readPacket
+		}
 		// UDP 数据通道：不走槽位、不做写合并 —— 一个 IP 包就是一个 UDP 包。
 		// 丢包交给内层应用（TCP）重传，这是设计上的取舍，见设计文档。
-		if u := sess.udpSession(); u != nil && s.udp != nil {
-			if err := u.send(s.udp, buf[:n]); err != nil {
-				s.log.Debug("UDP 下行发送失败", "err", err)
-			}
+		if s.sendUDP(sess, buf[:n]) {
 			continue
 		}
-		k := sess.flow.Slot(buf[:n], sess.membersN(), sess.slotAlive)
+		k := sess.flowSlot(buf[:n])
 
 		batch = proto.AppendHeader(batch[:0], proto.TypeIP, n)
 		batch = append(batch, buf[:n]...)
 
-		for len(batch) < proto.MaxBatchBytes-proto.HeaderSize-proto.MaxPayload {
+		processed := len(batch)
+		for processed < proto.MaxBatchBytes-proto.HeaderSize-proto.MaxPayload {
+			if ctx.Err() != nil {
+				return
+			}
+			if !sessionAlive(sess) {
+				continue readPacket
+			}
 			m, rerr := s.tun.TryRead(buf)
 			if rerr != nil || m <= 0 {
 				break
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			if !sessionAlive(sess) {
+				continue readPacket
 			}
 			if m > proto.MaxPayload {
 				s.log.Warn("网卡读到的包超过帧上限，已丢弃", "len", m, "max", proto.MaxPayload)
 				break
 			}
-			kk := sess.flow.Slot(buf[:m], sess.membersN(), sess.slotAlive)
+			processed += proto.HeaderSize + m
+			kk := sess.flowSlot(buf[:m])
 			if kk != k {
 				sess.flushBatch(k, batch)
 				batch = batch[:0]
@@ -413,6 +457,12 @@ func (s *Server) pumpTun(ctx context.Context) {
 			batch = append(batch, buf[:m]...)
 		}
 
+		if ctx.Err() != nil {
+			return
+		}
+		if !sessionAlive(sess) {
+			continue readPacket
+		}
 		sess.flushBatch(k, batch)
 		batch = batch[:0]
 	}
@@ -576,6 +626,11 @@ func (s *Server) handshake(ctx context.Context, raw net.Conn) (*tls.Conn, string
 			[]byte(fmt.Sprintf("协议版本 %d 不受支持，本服务端为 %d", hello.Version, protoVersion)))
 		return nil, "", helloPayload{}, false
 	}
+	if hello.Mode != "" && hello.Mode != pki.ModeTCP && hello.Mode != pki.ModeUDP {
+		_ = tlsConn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
+		_ = proto.WriteFrame(tlsConn, proto.TypeBye, []byte("不支持的数据通道模式"))
+		return nil, "", helloPayload{}, false
+	}
 	return tlsConn, name, hello, true
 }
 
@@ -585,6 +640,11 @@ func (s *Server) handleMember(ctx context.Context, tlsConn *tls.Conn, name strin
 	sess := s.currentSession()
 	if sess == nil || sess.sid == "" || sess.sid != hello.Sid || sess.name != name {
 		_ = proto.WriteFrame(tlsConn, proto.TypeBye, []byte("没有匹配的逻辑会话（控制连接未建立或 sid 不符）"))
+		return
+	}
+	if sess.udpOnly.Load() {
+		_ = tlsConn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
+		_ = proto.WriteFrame(tlsConn, proto.TypeBye, []byte("UDP 会话不接受 TCP 数据成员"))
 		return
 	}
 	// 熔断：拒绝不等于结束会话，客户端退避后到窗口外边自然会重试成功
@@ -639,6 +699,9 @@ func (s *Server) handleMember(ctx context.Context, tlsConn *tls.Conn, name strin
 		}
 		switch typ {
 		case proto.TypeIP:
+			if sess.udpOnly.Load() {
+				return
+			}
 			if sl := sess.slotEntry(hello.Member); sl != nil {
 				sl.noteRx(len(payload))
 			}
@@ -811,6 +874,11 @@ func (s *Server) handleControl(ctx context.Context, tlsConn *tls.Conn, name stri
 		return
 	}
 
+	if hello.Mode == pki.ModeUDP && s.udp == nil {
+		_ = tlsConn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
+		_ = proto.WriteFrame(tlsConn, proto.TypeBye, []byte("服务端 UDP 数据通道不可用，不回退 TCP"))
+		return
+	}
 	approved := 1
 	// 按客户端请求的成员数批准。
 	//
@@ -820,10 +888,15 @@ func (s *Server) handleControl(ctx context.Context, tlsConn *tls.Conn, name stri
 	//
 	// UDP 客户端本来就不会多要：client/tunnel.go 里 UseUDP 时 wantMembers 直接置 1，
 	// 所以这里放开不会白建任何连接。
-	if hello.Members > 1 && s.cfg.Tunnel.MaxMembers > 1 {
+	if hello.Mode != pki.ModeUDP && hello.Members > 1 && s.cfg.Tunnel.MaxMembers > 1 {
 		approved = hello.Members
 		if approved > s.cfg.Tunnel.MaxMembers {
 			approved = s.cfg.Tunnel.MaxMembers
+		}
+		// 与 flowSlot 的定长快照上限对齐：配置校验已把 MaxMembers 限在 1-4，
+		// 这里再钳一次，避免将来放宽上限时静默截断选槽或越界。
+		if approved > maxServerMembers {
+			approved = maxServerMembers
 		}
 	}
 
@@ -850,6 +923,7 @@ func (s *Server) handleControl(ctx context.Context, tlsConn *tls.Conn, name stri
 		flow:        proto.NewFlowTable(),
 		tlsConn:     tlsConn,
 	}
+	sess.udpOnly.Store(hello.Mode == pki.ModeUDP)
 	sess.slots = make([]*slotConn, approved)
 	sess.slots[0] = newSlotConn(tlsConn)
 	if err := sess.write(proto.TypeHelloAck, ack); err != nil {
@@ -881,9 +955,19 @@ func (s *Server) serveSession(ctx context.Context, sess *session) {
 				sess.close()
 				return
 			}
+			// TLS 可能仍有缓存帧；连接关闭不等于逻辑会话还拥有交付权。
+			if ctx.Err() != nil || !sessionAlive(sess) || s.currentSession() != sess {
+				sess.close()
+				return
+			}
 			sess.slot(0).touch()
 			switch typ {
 			case proto.TypeIP:
+				if sess.udpOnly.Load() {
+					s.log.Warn("UDP 会话拒收 TCP 业务数据", "client", sess.name)
+					sess.close()
+					return
+				}
 				if sl := sess.slotEntry(0); sl != nil {
 					sl.noteRx(len(payload))
 				}
@@ -943,8 +1027,11 @@ func (s *Server) serveSession(ctx context.Context, sess *session) {
 // 不只是丢包。正常客户端每会话只报一次；换端口要重建会话（重新握手、重新导出密钥）。
 // 只在该会话的读循环里调用，所以「先查后设」不会和自己竞争。
 func (s *Server) registerUDP(sess *session, payload []byte) {
+	sess.udpOnly.Store(true)
 	if s.udp == nil {
-		s.log.Warn("收到 UDP 端口上报，但服务端不是 udp 模式，已忽略",
+		// 会话已经锁成 UDP-only：这里不回落到 TCP 数据面，数据会一直丢到客户端
+		// 按 UDP 重连为止。日志必须如实说明，别让排障的人以为只是「忽略了一个上报」。
+		s.log.Warn("收到 UDP 端口上报，但服务端没有启用 UDP 数据通道：本会话保持 UDP-only、不回落 TCP",
 			"client", sess.name)
 		return
 	}
@@ -1183,12 +1270,14 @@ type session struct {
 
 	mu    sync.Mutex
 	slots []*slotConn // slots[0] 恒为控制连接；成员槽位从 1 开始
-	// flow 决定下行包走哪个槽：已有流固定不变（保序），新流分给当前承载流数最少的槽。
+	// flow 决定下行包走哪个槽：已有流固定不变（保序），新流优先进入排队字节较少的槽。
 	// 纯哈希做不到均衡 —— 一条大流会把某条成员连接塞到写超时被摘掉，别的槽却闲着。
 	flow *proto.FlowTable
 
 	// udp 是 UDP 数据通道（mode=udp 时才有）。非 nil 时下行数据不走槽位，直接走它。
 	udp *udpSession
+	// 在 UDP 就绪前也禁止 TCP 承载数据；旧客户端上报 UDP 端口时同样锁定。
+	udpOnly atomic.Bool
 
 	// tlsConn 是控制连接本身。UDP 数据通道的密钥要从它的 TLS 会话导出（RFC 5705），
 	// 所以必须留着它 —— 槽位里存的是 net.Conn 接口，类型断言太脆。
@@ -1207,10 +1296,11 @@ type slotConn struct {
 	txBytes atomic.Uint64 // 写出的链路字节（含帧头）
 	rxBytes atomic.Uint64 // 读入的链路字节（含帧头）
 
-	out    chan []byte   // 待写数据批，队列满即丢，绝不阻塞 pumpTun
-	closed chan struct{} // 关闭后写协程退出
-	once   sync.Once
-	drops  atomic.Uint64 // 因队列满被丢弃的批数，排障时看这个
+	out          chan []byte   // 待写数据批，队列满即丢，绝不阻塞 pumpTun
+	closed       chan struct{} // 关闭后写协程退出
+	once         sync.Once
+	drops        atomic.Uint64 // 因队列满被丢弃的批数，排障时看这个
+	pendingBytes atomic.Int64
 
 	// lastSeen 是这条连接自己的活跃时刻。判掉线只能看控制连接（槽 0）的这个值：
 	// 会话级的 lastSeen 会被成员连接一起刷新，于是「控制连接半死（没有 FIN）但成员
@@ -1224,9 +1314,14 @@ func (s *slotConn) idleFor() time.Duration {
 	return time.Since(time.Unix(0, s.lastSeen.Load()))
 }
 
-// slotQueueLen 是每槽待写批的队列深度。批最大 MaxBatchBytes（约 20KB 量级），
-// 8 批约百来 KB，够吸收一个写超时周期内的突发，又不会让延迟长到难忍。
-const slotQueueLen = 8
+// maxServerMembers 是 flowSlot 压力快照的定长上限，与 config.Validate 的 1-4 对齐。
+// 单列常量而不是魔法数字：放宽 max_members 时这里必须先跟着改，否则切片越界 panic。
+const maxServerMembers = 4
+
+// slotQueueLen 是每槽待写批的队列深度。
+// 8 批只有约 128KB，按链路 BDP（跨境 200ms / 10Mbps 约 250KB）不够吸收突发，
+// 16 批约 256KB；再深会把排队时延和内存一起放大，所以停在 16。
+const slotQueueLen = 16
 
 func newSlotConn(conn net.Conn) *slotConn {
 	sc := &slotConn{
@@ -1245,11 +1340,27 @@ func (s *slotConn) writeLoop() {
 	for {
 		select {
 		case batch := <-s.out:
-			if err := s.writeRaw(batch); err != nil {
+			err := s.writeRaw(batch)
+			s.pendingBytes.Add(-int64(len(batch)))
+			if err != nil {
 				_ = s.conn.Close()
+				s.drainPending()
 				return
 			}
 		case <-s.closed:
+			s.drainPending()
+			return
+		}
+	}
+}
+
+// drainPending 扣掉队列里不会再写出的批，避免写协程退出后 pendingBytes 永久偏高。
+func (s *slotConn) drainPending() {
+	for {
+		select {
+		case batch := <-s.out:
+			s.pendingBytes.Add(-int64(len(batch)))
+		default:
 			return
 		}
 	}
@@ -1272,10 +1383,13 @@ func (s *slotConn) enqueue(batch []byte) {
 	}
 	cp := make([]byte, len(batch))
 	copy(cp, batch)
+	s.pendingBytes.Add(int64(len(cp)))
 	select {
 	case s.out <- cp:
 	case <-s.closed:
+		s.pendingBytes.Add(-int64(len(cp)))
 	default:
+		s.pendingBytes.Add(-int64(len(cp)))
 		s.drops.Add(1)
 	}
 }
@@ -1355,6 +1469,28 @@ func (s *session) slotAlive(k int) bool {
 	return s.slotEntry(k) != nil
 }
 
+// flowSlot 先取各槽压力快照，再进流表选槽。锁序固定为「先 session.mu 放开，再进
+// flow.mu」：SlotWithPressure 持流表锁时会回调 slotAlive（要 session.mu），所以
+// 绝不能在持有 session.mu 时调用 flow.Slot/Stats，否则就是 ABBA 死锁。
+func (s *session) flowSlot(packet []byte) int {
+	s.mu.Lock()
+	n := s.members
+	if n > maxServerMembers {
+		n = maxServerMembers
+	}
+	var pendingBytes [maxServerMembers]int64
+	for k := 1; k < n && k < len(s.slots); k++ {
+		if sl := s.slots[k]; sl != nil {
+			pendingBytes[k] = sl.pendingBytes.Load()
+			if len(sl.out) >= cap(sl.out) {
+				pendingBytes[k] = math.MaxInt64
+			}
+		}
+	}
+	s.mu.Unlock()
+	return s.flow.SlotWithPressure(packet, n, s.slotAlive, pendingBytes[:n])
+}
+
 // slotStats 快照各槽的收发字节（status 展示用）。
 func (s *session) slotStats() []SlotStatus {
 	s.mu.Lock()
@@ -1366,6 +1502,10 @@ func (s *session) slotStats() []SlotStatus {
 			st.RxBytes = sl.rxBytes.Load()
 			st.TxBytes = sl.txBytes.Load()
 			st.Drops = sl.drops.Load()
+			st.QueueDepth = len(sl.out)
+			if pending := sl.pendingBytes.Load(); pending > 0 {
+				st.PendingBytes = uint64(pending)
+			}
 		}
 		out = append(out, st)
 	}
@@ -1403,7 +1543,7 @@ func (s *session) commitSlot(k int, conn net.Conn) bool {
 // 而不是落回控制连接（那会把心跳挤到排队）。
 //
 // 必须先 closeWrite 再置 nil：写协程不属于任何列表，槽位一被摘掉，session.close()
-// 就再也遍历不到它 —— goroutine 和它那 8 格的队列会永久挂住，成员每断开/超时一次
+// 就再也遍历不到它 —— goroutine 和它的待写队列会永久挂住，成员每断开/超时一次
 // 漏一个（实测 20 次断开残留 19 个）。
 func (s *session) leave(k int, conn net.Conn) {
 	s.mu.Lock()
@@ -1449,7 +1589,7 @@ func (s *session) write(t proto.Type, payload []byte) error {
 // 入队不阻塞：pumpTun 是单个 goroutine 串行服务所有槽，在这里同步写任何一条，拥塞
 // 时都会把其余槽一起拖停（20 秒写超时意味着最坏 20 秒的全局停顿）。
 func (s *session) flushBatch(k int, batch []byte) {
-	if len(batch) == 0 {
+	if len(batch) == 0 || s.udpOnly.Load() || !sessionAlive(s) {
 		return
 	}
 	if sc := s.slotEntry(k); sc != nil {

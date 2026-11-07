@@ -3,12 +3,14 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -52,10 +54,48 @@ func Up(cfg Config, logger *slog.Logger, force bool) error {
 	// 对公网开着。记录由上一次 Up 写进 /run。
 	currentRange := fmt.Sprintf("%d:%d", cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
 	if prev := readForwardRange(); prev != "" && prev != currentRange {
-		removeInputRange(prev)
+		if err := removeInputRange(prev); err != nil {
+			return fmt.Errorf("清理旧转发端口段的放行规则: %w", err)
+		}
 		logger.Info("已清理旧转发端口段的放行规则", "range", prev)
 	}
-	for _, r := range Rules(cfg, wan) {
+	rules := Rules(cfg, wan)
+	// 按当前配置的**精确形态**清一遍旧版无标记规则：账本损坏或跨版本升级时，
+	// 旧规则既不带 marker、也不在账本里，只能靠形状认。只删与本次完全相同的形状
+	// （不忽略 -o），不会波及别的网卡或别的配置。删除失败忽略（规则可能本来就不在）。
+	for _, r := range rules {
+		args := append([]string{"-t", TableOrDefault(r.Table), "-D", r.Chain}, r.Args...)
+		_ = iptables(args...)
+	}
+	for i := range rules {
+		rules[i].Args = append(rules[i].Args, "-m", "comment", "--comment", "AntAppLink")
+	}
+	ledger, err := loadNetfilterLedger()
+	if err != nil {
+		// 账本损坏时重建：旧内容已经不可用，继续用空账本能让 Up 恢复服务，
+		// 否则会出现「规则删不掉也起不来」。旧配置留下的无标记规则会因此
+		// 失去账本归属，只能靠模板形状或 marker 认领，这里明确提示。
+		logger.Warn("防火墙恢复账本损坏，按空账本重建；旧配置留下的无标记规则可能无法自动清理", "err", err)
+		ledger = nil
+	}
+	for _, r := range rules {
+		found := false
+		for _, old := range ledger {
+			if sameRule(old, r, false) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			ledger = append(ledger, r)
+		}
+	}
+	if err := saveNetfilterLedger(ledger); err != nil {
+		// 账本只是 Down 的辅助线索：新规则都带 marker，账本写不了也能靠标记清理。
+		// 在只读 /run 的容器里，为此让 up 完全起不来代价更大。
+		logger.Warn("预写防火墙恢复账本失败，继续按注释标记铺规则", "err", err)
+	}
+	for _, r := range rules {
 		if err := ensureRule(r); err != nil {
 			return err
 		}
@@ -75,45 +115,126 @@ func Down(cfg Config, logger *slog.Logger) error {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	removeJumpsTo("nat", "PREROUTING", ChainName)
-	_ = iptables("-t", "nat", "-F", ChainName)
-	_ = iptables("-t", "nat", "-X", ChainName)
-
-	// 端口段放行按形状删：当前段 + 上一次记录过的段（换段后旧段规则还留着）。
-	currentRange := fmt.Sprintf("%d:%d", cfg.ForwardPorts.Start, cfg.ForwardPorts.End)
-	removeInputRange(currentRange)
-	if prev := readForwardRange(); prev != "" && prev != currentRange {
-		removeInputRange(prev)
-	}
-
-	wan, err := defaultInterface()
+	ledger, err := loadNetfilterLedger()
 	if err != nil {
-		// 拿不到出口网卡就拼不出 MASQUERADE / MSS clamp 的删除参数。如实报错，
-		// 不要静默跳过还宣称「已清理」—— 残留的 INPUT 放行/NAT 会无人察觉。
-		//
-		// 这里不能删 forward-range 记录：内置链规则还没清完，记录是下一次 Up/Down
-		// 定位旧端口段的唯一线索。
-		return fmt.Errorf("netfilter: 查不到默认出口网卡，内置链规则未清理（残留需手动处理）: %w", err)
+		// 账本坏了不能挡住清理：按标记和模板继续，清完再删账本。
+		logger.Warn("防火墙恢复账本损坏，按标记和模板清理", "err", err)
+		ledger = nil
 	}
-	for _, r := range Rules(cfg, wan) {
-		if r.Chain == ChainName {
-			continue // 已随自定义链一起删掉
+	templates := Rules(cfg, "")
+	if prev := readForwardRange(); prev != "" {
+		templates = append(templates, Rule{Chain: "INPUT", Args: []string{"-p", "tcp", "--dport", prev, "-j", "ACCEPT"}})
+	}
+	var errs []error
+	for _, tc := range [][2]string{{"nat", "PREROUTING"}, {"nat", "POSTROUTING"}, {"filter", "INPUT"}, {"filter", "FORWARD"}, {"mangle", "FORWARD"}} {
+		actual, err := listNetfilterRules(tc[0], tc[1])
+		if err != nil {
+			errs = append(errs, err)
+			continue
 		}
-		args := []string{"-t", TableOrDefault(r.Table), "-D", r.Chain}
-		// 去掉 -o：iptables -D 未给出的字段不参与匹配，这样网卡改名后也能删掉
-		// MASQUERADE / MSS clamp（Up 时写的是旧网卡名）。
-		args = append(args, stripOutIface(r.Args)...)
-		_ = iptables(args...)
+		for _, r := range actual {
+			// 账本丢失时靠注释标记认自己的规则；模板只对旧版无标记形态生效。
+			owned := ruleHasMarker(r) ||
+				(tc[0] == "nat" && tc[1] == "PREROUTING" && len(r.Args) == 2 && r.Args[0] == "-j" && r.Args[1] == ChainName)
+			for _, saved := range ledger {
+				if sameRule(r, saved, false) {
+					owned = true
+					break
+				}
+			}
+			for _, old := range templates {
+				if sameRule(r, old, true) {
+					owned = true
+					break
+				}
+			}
+			if !owned {
+				continue
+			}
+			args := append([]string{"-t", tc[0], "-D", r.Chain}, r.Args...)
+			if err := iptables(args...); err != nil {
+				errs = append(errs, err)
+			}
+		}
 	}
-	// 全部清理走完才删记录：中途失败时留着，下一次 Up/Down 还能按它定位旧段。
-	_ = os.Remove(forwardRangePath)
+	if _, err := listNetfilterRules("nat", ChainName); err == nil {
+		if err := iptables("-t", "nat", "-F", ChainName); err != nil {
+			errs = append(errs, err)
+		}
+		if err := iptables("-t", "nat", "-X", ChainName); err != nil {
+			errs = append(errs, err)
+		}
+	} else if !isMissingChainError(err.Error()) {
+		errs = append(errs, err)
+	}
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("netfilter 清理未完成，保留恢复账本: %w", err)
+	}
+	for _, file := range []string{forwardRangePath, forwardRangePath + ".rules.json"} {
+		if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	logger.Info("netfilter 规则已清理")
 	return nil
 }
 
-// removeInputRange 删除「转发端口段放行」的 INPUT 规则（-D 容忍不存在）。
-func removeInputRange(portRange string) {
-	_ = iptables("-D", "INPUT", "-p", "tcp", "--dport", portRange, "-j", "ACCEPT")
+func loadNetfilterLedger() ([]Rule, error) {
+	raw, err := os.ReadFile(forwardRangePath + ".rules.json")
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var rules []Rule
+	if err := json.Unmarshal(raw, &rules); err != nil {
+		return nil, fmt.Errorf("防火墙恢复账本损坏: %w", err)
+	}
+	return rules, nil
+}
+
+func saveNetfilterLedger(rules []Rule) error {
+	raw, err := json.Marshal(rules)
+	if err != nil {
+		return err
+	}
+	file := forwardRangePath + ".rules.json"
+	if err := os.MkdirAll(filepath.Dir(file), 0755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(file+".tmp", raw, 0600); err != nil {
+		return err
+	}
+	return os.Rename(file+".tmp", file)
+}
+
+func listNetfilterRules(table, chain string) ([]Rule, error) {
+	raw, err := exec.Command("iptables", "-w", "5", "-t", table, "-S", chain).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("读取 iptables %s/%s: %w: %s", table, chain, err, strings.TrimSpace(string(raw)))
+	}
+	return parseNetfilterRules(string(raw), table, chain), nil
+}
+
+// removeInputRange 按实际参数撤销新旧版本的放行规则，保留其他程序的注释规则。
+func removeInputRange(portRange string) error {
+	rules, err := listNetfilterRules("filter", "INPUT")
+	if err != nil {
+		return err
+	}
+	old := Rule{Chain: "INPUT", Args: []string{"-p", "tcp", "--dport", portRange, "-j", "ACCEPT"}}
+	marked := Rule{Chain: old.Chain, Args: append(append([]string(nil), old.Args...), "-m", "comment", "--comment", "AntAppLink")}
+	var errs []error
+	for _, r := range rules {
+		if sameRule(r, old, false) || sameRule(r, marked, false) {
+			args := append([]string{"-t", "filter", "-D", r.Chain}, r.Args...)
+			if err := iptables(args...); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func ensureRule(r Rule) error {
@@ -125,26 +246,6 @@ func ensureRule(r Rule) error {
 	add := []string{"-t", TableOrDefault(r.Table), "-A", r.Chain}
 	add = append(add, r.Args...)
 	return iptables(add...)
-}
-
-func removeJumpsTo(table, chain, target string) {
-	out, err := exec.Command("iptables", "-w", "5", "-t", table, "-S", chain).Output()
-	if err != nil {
-		return
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		prefix := "-A " + chain + " "
-		if !strings.HasPrefix(line, prefix) {
-			continue
-		}
-		args := strings.Fields(strings.TrimPrefix(line, prefix))
-		if len(args) == 0 || args[len(args)-1] != target {
-			continue
-		}
-		full := append([]string{"-w", "5", "-t", table, "-D", chain}, args...)
-		_ = exec.Command("iptables", full...).Run()
-	}
 }
 
 func iptables(args ...string) error {

@@ -34,11 +34,14 @@ type Status struct {
 	JoinFailures int          `json:"join_failures,omitempty"`
 	// 流表（下行选槽）：占用、回退、回收和每槽流数。服务端也跑同一套回收，
 	// 这几个数能看出下行流表有没有被短连接吃满。
-	FlowSize     int    `json:"flow_size,omitempty"`
-	FlowMax      int    `json:"flow_max,omitempty"`
-	FlowFallback uint64 `json:"flow_fallback,omitempty"`
-	FlowReclaim  uint64 `json:"flow_reclaim,omitempty"`
-	FlowPerSlot  []int  `json:"flow_per_slot,omitempty"`
+	FlowSize                   int    `json:"flow_size,omitempty"`
+	FlowMax                    int    `json:"flow_max,omitempty"`
+	FlowFallback               uint64 `json:"flow_fallback,omitempty"`
+	FlowReclaim                uint64 `json:"flow_reclaim,omitempty"`
+	FlowPerSlot                []int  `json:"flow_per_slot,omitempty"`
+	FlowFallbackSize           int    `json:"flow_fallback_size,omitempty"`
+	FlowOverflowed             bool   `json:"flow_overflowed,omitempty"`
+	FlowOverflowDeadSelections uint64 `json:"flow_overflow_dead_selections,omitempty"`
 	// 端口转发监听结果：多出来的 JSON 字段不影响旧版 status 子命令解析
 	ForwardReady bool   `json:"forward_ready"`
 	ForwardError string `json:"forward_error,omitempty"`
@@ -105,6 +108,9 @@ func fillFlowStatus(st *Status, ft *proto.FlowTable) {
 	st.FlowFallback = fs.Fallbacks
 	st.FlowReclaim = fs.Reclaimed
 	st.FlowPerSlot = fs.PerSlot
+	st.FlowFallbackSize = fs.FallbackSize
+	st.FlowOverflowed = fs.Overflowed
+	st.FlowOverflowDeadSelections = fs.OverflowDeadSelections
 }
 
 // reportStatus 每 5 秒刷新一次状态文件，超过这个阈值就说明写它的进程已经不在了。
@@ -117,15 +123,17 @@ func (st Status) Fresh() bool {
 	return err == nil && time.Since(t) <= statusStaleAfter
 }
 
-// SlotStatus 是一条连接的收发字节，按链路上的字节算（含帧头）。
-// 空槽（成员连接断开待补）也会出现，字节数保持 0。
+// SlotStatus 是一条连接的收发字节，按链路上的字节算（含帧头），并报告队列深度和在途字节。
+// 空槽（成员连接断开待补）也会出现，数值保持 0。
 type SlotStatus struct {
-	Slot    int    `json:"slot"`
-	RxBytes uint64 `json:"rx_bytes"`
-	TxBytes uint64 `json:"tx_bytes"`
-	// Drops 是该槽写队列满、整批丢弃的次数。它的作用是给 slotQueueLen 定值提供依据：
-	// 队列深度该按链路 BDP 算（跨境 200ms / 10Mbps 约 250KB），不是按写超时周期，
-	// 而 8 批只有约 128KB —— 到底够不够要看真实丢包率，所以先让它可见。
+	Slot         int    `json:"slot"`
+	RxBytes      uint64 `json:"rx_bytes"`
+	TxBytes      uint64 `json:"tx_bytes"`
+	QueueDepth   int    `json:"queue_depth,omitempty"`
+	PendingBytes uint64 `json:"pending_bytes,omitempty"`
+	// Drops 是该槽写队列满、整批丢弃的累计次数。它给 slotQueueLen 定值提供依据：
+	// 队列深度该按链路 BDP 算（跨境 200ms / 10Mbps 约 250KB），现在 16 批约 256KB —
+	// 到底够不够看真实丢包率，所以先让它可见。
 	Drops uint64 `json:"drops"`
 }
 

@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/antapp-cc/antapp-link/internal/pki"
@@ -40,11 +41,7 @@ func writeForwardRange(r string) error {
 	return os.WriteFile(forwardRangePath, []byte(r+"\n"), 0o644)
 }
 
-// stripOutIface 去掉参数里的 "-o <网卡>"。
-//
-// iptables -D 按给定字段匹配：不写 -o 时，带任意 -o 的同规则也能删掉。Up 时的网卡名
-// 与 Down 时可能不同（dhcp 改名、云厂商换网卡），用 down 时刻的名字拼 -D 会删不掉，
-// 于是 MASQUERADE 和 MSS clamp 残留。
+// stripOutIface 仅用于比较旧版规则形态；删除时必须保留实际规则的全部字段。
 func stripOutIface(args []string) []string {
 	out := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
@@ -54,6 +51,106 @@ func stripOutIface(args []string) []string {
 		}
 		out = append(out, args[i])
 	}
+	return out
+}
+
+func normalizedRuleArgs(args []string) string {
+	var out []string
+	var comment string
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-m" && i+1 < len(args) && (args[i+1] == "tcp" || args[i+1] == "udp" || args[i+1] == "comment") {
+			i++
+			continue
+		}
+		if args[i] == "--ctstate" && i+1 < len(args) {
+			states := strings.Split(args[i+1], ",")
+			sort.Strings(states)
+			out = append(out, args[i], strings.Join(states, ","))
+			i++
+			continue
+		}
+		if args[i] == "--comment" && i+1 < len(args) {
+			comment = strings.Trim(args[i+1], "\"")
+			i++
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return strings.Join(out, " ") + "|comment=" + comment
+}
+
+func sameRule(a, b Rule, anyWAN bool) bool {
+	if TableOrDefault(a.Table) != TableOrDefault(b.Table) || a.Chain != b.Chain {
+		return false
+	}
+	aa, bb := a.Args, b.Args
+	if anyWAN {
+		aa, bb = stripOutIface(aa), stripOutIface(bb)
+	}
+	return normalizedRuleArgs(aa) == normalizedRuleArgs(bb)
+}
+
+// ruleHasMarker 判断一条规则是否带本项目的注释标记。账本丢失（/run 是 tmpfs，重启
+// 就没了）时，Down 只能靠这个标记认出自己铺过的规则。
+func ruleHasMarker(r Rule) bool {
+	for i := 0; i+1 < len(r.Args); i++ {
+		if r.Args[i] == "--comment" && strings.Trim(r.Args[i+1], "\"") == "AntAppLink" {
+			return true
+		}
+	}
+	return false
+}
+
+// isMissingChainError 判断 iptables 的报错是不是「链不存在」。不同版本的英文措辞
+// 不一致（No chain/target/match by that name、does not exist、No such file），
+// 统一按关键词判断，避免换个 iptables 实现就误判成清理失败。
+func isMissingChainError(msg string) bool {
+	m := strings.ToLower(msg)
+	for _, s := range []string{"no chain", "does not exist", "not exist", "no such", "不存在"} {
+		if strings.Contains(m, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseNetfilterRules 解析 `iptables -S <chain>` 的输出。抽成纯函数是为了能在
+// 非 Linux 上测：Down 的删除匹配完全依赖这里的字段切分。
+func parseNetfilterRules(raw, table, chain string) []Rule {
+	var rules []Rule
+	for _, line := range strings.Split(raw, "\n") {
+		fields := splitRuleFields(line)
+		if len(fields) < 3 || fields[0] != "-A" || fields[1] != chain {
+			continue
+		}
+		rules = append(rules, Rule{Table: table, Chain: chain, Args: fields[2:]})
+	}
+	return rules
+}
+
+// splitRuleFields 按空白切分，但保留双引号里的空格：`--comment "a b"` 是一个参数，
+// 用 strings.Fields 会切成两段，down 时匹配不到、规则删不掉。
+func splitRuleFields(line string) []string {
+	var out []string
+	var cur strings.Builder
+	inQuote := false
+	flush := func() {
+		if cur.Len() > 0 {
+			out = append(out, cur.String())
+			cur.Reset()
+		}
+	}
+	for _, r := range line {
+		switch {
+		case r == '"':
+			inQuote = !inQuote
+		case (r == ' ' || r == '\t') && !inQuote:
+			flush()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	flush()
 	return out
 }
 

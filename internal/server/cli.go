@@ -412,17 +412,7 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 		}
 		if st.Client != "" {
 			fmt.Fprintf(stdout, "已接入节点  : %s（自 %s）\n", st.Client, st.ConnectedAt)
-			if st.Members > 1 {
-				fmt.Fprintf(stdout, "并行连接    : %d/%d 条存活\n", st.LiveMembers, st.Members)
-				for _, sl := range st.Slots {
-					line := fmt.Sprintf("  槽 %d        : 收 %d 字节，发 %d 字节",
-						sl.Slot, sl.RxBytes, sl.TxBytes)
-					if sl.Drops > 0 {
-						line += fmt.Sprintf("，丢批 %d", sl.Drops)
-					}
-					fmt.Fprintln(stdout, line)
-				}
-			}
+			writeSlotStatus(stdout, st)
 			if st.JoinFailures > 0 {
 				fmt.Fprintf(stdout, "加入失败    : %d 次（达 %d 次会熔断 %v）\n",
 					st.JoinFailures, joinMaxFail, joinWindow)
@@ -431,10 +421,7 @@ func cmdStatus(stdout, stderr io.Writer, args []string) int {
 				fmt.Fprintf(stdout, "数据通道    : UDP（控制仍走 TCP），收 %d / 发 %d 字节\n",
 					st.UDPRxBytes, st.UDPTxBytes)
 			}
-			if st.FlowSize > 0 {
-				fmt.Fprintf(stdout, "流表        : %d/%d（回退 %d，回收 %d），每槽 %v\n",
-					st.FlowSize, st.FlowMax, st.FlowFallback, st.FlowReclaim, st.FlowPerSlot)
-			}
+			writeFlowStatus(stdout, st)
 			if st.Goroutines > 0 {
 				fmt.Fprintf(stdout, "goroutine   : %d\n", st.Goroutines)
 			}
@@ -513,4 +500,33 @@ func handshakeLine(st Status) string {
 	}
 	return fmt.Sprintf("TLS 握手    : 当前 %d，峰值 %d，拒绝 %d 次（并发上限 %d）",
 		st.HandshakeInFlight, st.HandshakePeak, st.HandshakeRefused, handshakeMaxConcurrent)
+}
+
+func writeFlowStatus(stdout io.Writer, st Status) {
+	if st.FlowSize == 0 && st.FlowFallbackSize == 0 && !st.FlowOverflowed && st.FlowOverflowDeadSelections == 0 {
+		return
+	}
+	fmt.Fprintf(stdout, "流表        : %d/%d（回退 %d 次含重复包，回收 %d），每槽 %v\n",
+		st.FlowSize, st.FlowMax, st.FlowFallback, st.FlowReclaim, st.FlowPerSlot)
+	// 只有真有旁路/溢出信息时才印第二行：健康会话每次 status 多一行恒零噪音没有意义。
+	if st.FlowFallbackSize != 0 || st.FlowOverflowed || st.FlowOverflowDeadSelections != 0 {
+		fmt.Fprintf(stdout, "流表旁路    : %d 条，溢出锁存 %t，固定哈希选中非存活槽 %d 次（非实际丢包数）\n",
+			st.FlowFallbackSize, st.FlowOverflowed, st.FlowOverflowDeadSelections)
+	}
+}
+
+func writeSlotStatus(w io.Writer, st Status) {
+	if st.Members > 1 {
+		fmt.Fprintf(w, "并行连接    : %d/%d 条存活\n", st.LiveMembers, st.Members)
+	}
+	for _, sl := range st.Slots {
+		line := fmt.Sprintf("  槽 %d        : 收 %d 字节，发 %d 字节", sl.Slot, sl.RxBytes, sl.TxBytes)
+		if sl.Drops > 0 {
+			line += fmt.Sprintf("，丢批 %d", sl.Drops)
+		}
+		if sl.QueueDepth > 0 || sl.PendingBytes > 0 {
+			line += fmt.Sprintf("，队列 %d 批，待写/写中 %d 字节", sl.QueueDepth, sl.PendingBytes)
+		}
+		fmt.Fprintln(w, line)
+	}
 }

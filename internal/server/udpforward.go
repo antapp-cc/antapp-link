@@ -8,8 +8,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/antapp-cc/antapp-link/internal/proto"
 )
 
 // UDP 端口转发：把转发端口段上的 UDP 流量经隧道送到节点机同端口。
@@ -127,7 +125,9 @@ func (f *udpForward) run(ctx context.Context) {
 	}()
 	go f.sweepLoop(ctx)
 
-	buf := make([]byte, proto.MaxUDPPacket)
+	// 转发的是节点机原生 UDP 数据报，上限 65507；不能用隧道包上限（1600）
+	// 当读缓冲，否则大包会被截断。
+	buf := make([]byte, 65535)
 	for {
 		n, from, err := f.listen.ReadFromUDP(buf)
 		if err != nil {
@@ -183,9 +183,53 @@ func (f *udpForward) dispatch(from *net.UDPAddr, pkt []byte) {
 	}
 }
 
+// udpForwardBufCount 是同时可用的会话读缓冲上限。每块 64KB，512 块约 32MB 常驻，
+// 这就是 UDP 转发的内存峰值上界：并发会话超过它时宁可丢回包，也不无限分配。
+const udpForwardBufCount = 512
+
+var (
+	udpForwardBufPoolOnce sync.Once
+	udpForwardBufPool     chan *[]byte
+)
+
+// udpForwardBufs 惰性预填缓冲池。服务端没启用 UDP 转发时不会为此分配 32MB。
+func udpForwardBufs() chan *[]byte {
+	udpForwardBufPoolOnce.Do(func() {
+		udpForwardBufPool = make(chan *[]byte, udpForwardBufCount)
+		for i := 0; i < udpForwardBufCount; i++ {
+			b := make([]byte, 65535)
+			udpForwardBufPool <- &b
+		}
+	})
+	return udpForwardBufPool
+}
+
+func getUDPForwardBuf() (*[]byte, bool) {
+	select {
+	case b := <-udpForwardBufs():
+		return b, true
+	default:
+		return nil, false
+	}
+}
+
+func putUDPForwardBuf(b *[]byte) {
+	select {
+	case udpForwardBufs() <- b:
+	default:
+	}
+}
+
 // sessionReadLoop 把节点机的回包转发回外部来源；连接出错即回收会话。
 func (f *udpForward) sessionReadLoop(key string, sess *udpForwardSession) {
-	buf := make([]byte, proto.MaxUDPPacket)
+	bufp, ok := getUDPForwardBuf()
+	if !ok {
+		// 并发会话已到缓冲上限：拒绝为这条会话服务，避免内存无界增长。
+		f.removeSession(key, sess)
+		return
+	}
+	defer putUDPForwardBuf(bufp)
+	buf := *bufp
 	for {
 		_ = sess.conn.SetReadDeadline(time.Now().Add(udpForwardIdleTimeout))
 		n, err := sess.conn.Read(buf)

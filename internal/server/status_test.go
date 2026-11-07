@@ -17,6 +17,7 @@ func TestStatusFlowFieldsJSON(t *testing.T) {
 		FlowFallback: 4,
 		FlowReclaim:  56,
 		FlowPerSlot:  []int{0, 1, 2, 3},
+		Slots:        []SlotStatus{{Slot: 1, QueueDepth: 3, PendingBytes: 4096}},
 	}
 	raw, err := json.Marshal(st)
 	if err != nil {
@@ -28,6 +29,8 @@ func TestStatusFlowFieldsJSON(t *testing.T) {
 		`"flow_fallback":4`,
 		`"flow_reclaim":56`,
 		`"flow_per_slot":[0,1,2,3]`,
+		`"queue_depth":3`,
+		`"pending_bytes":4096`,
 	} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("状态 JSON 缺少 %s：%s", want, raw)

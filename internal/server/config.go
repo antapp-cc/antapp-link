@@ -132,7 +132,7 @@ func (c *Config) ApplyOverrides(o Overrides) {
 		c.Listen = o.Listen
 	}
 	if o.Mode != "" {
-		c.Mode = o.Mode
+		c.Mode = strings.ToLower(strings.TrimSpace(o.Mode))
 	}
 	if o.ForwardStart > 0 && o.ForwardEnd > 0 {
 		c.ForwardPorts = PortRange{Start: o.ForwardStart, End: o.ForwardEnd}
@@ -157,13 +157,15 @@ func (c *Config) ApplyOverrides(o Overrides) {
 	}
 }
 
-func (c Config) Validate() error {
+func (c *Config) Validate() error {
 	// 两种数据通道都已实现：tcp（默认）与 udp（控制仍走 TCP，数据包走 AES-GCM 的 UDP）。
 	// udp 模式下大包会丢（实测 1400B 丢 38%），只对交互流量有收益 —— 见
 	// docs/superpowers/specs/2026-10-17-udp-data-channel-design.md
-	if _, err := pki.ParseMode(c.Mode); err != nil {
+	mode, err := pki.ParseMode(c.Mode)
+	if err != nil {
 		return err
 	}
+	c.Mode = string(mode)
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		return fmt.Errorf("listen %q 必须是 host:port 形式: %w", c.Listen, err)
 	}
