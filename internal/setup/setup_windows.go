@@ -5,6 +5,7 @@
 package setup
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -175,7 +176,7 @@ func Installed() (Options, bool) {
 	return Options{InstallDir: loc, DataDir: filepath.Join(loc, "data")}, true
 }
 
-func Install(opts Options, log func(string)) error {
+func Install(opts Options, log func(string)) (retErr error) {
 	// 客户端 exe 来源：单文件安装器走内嵌；内嵌为空（测试/旧布局）再找同目录文件
 	client := opts.ClientExe
 	if client == nil {
@@ -199,7 +200,14 @@ func Install(opts Options, log func(string)) error {
 	clientUp := false
 	defer func() {
 		if !clientUp {
-			restoreNetwork(opts, log)
+			if err := restoreNetwork(opts, log); err != nil {
+				log("网络还原失败，保留恢复资料：" + err.Error())
+				// 安装本身已经成功时不把安装判成失败：程序、注册表和快捷方式都已就位，
+				// 报成失败会让 UI 要求重试、静默部署返回非零。只有安装也失败才一起报。
+				if retErr != nil {
+					retErr = errors.Join(retErr, err)
+				}
+			}
 		}
 	}()
 
@@ -328,25 +336,86 @@ func rollbackClient(old, dst string, cause error) error {
 //
 // 传 -data 安装目录，是因为客户端默认就拿 exe 所在目录当工作根目录，
 // config\ 和 data\ 都挂在它下面。
-func restoreNetwork(opts Options, log func(string)) {
-	exe := filepath.Join(opts.InstallDir, AppExeName)
-	if _, err := os.Stat(exe); err != nil {
-		// 覆盖安装失败且回滚也没成时，安装目录里能跑的只剩那个备份
-		exe += ".old"
-		if _, err := os.Stat(exe); err != nil {
-			return
+func restoreNetwork(opts Options, log func(string)) error {
+	roots := []string{opts.InstallDir}
+	if fb := fallbackDataDir(); fb != "" && !strings.EqualFold(fb, opts.InstallDir) {
+		roots = append(roots, fb)
+	}
+	var recoveryRoots []string
+	var errs []error
+	for _, dir := range roots {
+		if _, err := os.Stat(filepath.Join(dir, "data", "state.json")); err == nil {
+			recoveryRoots = append(recoveryRoots, dir)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("检查网络恢复状态 %s: %w", dir, err))
 		}
 	}
-	log("还原网络配置")
-	_ = runHidden(exe, "-restore-network", "-data", opts.InstallDir)
+	if len(recoveryRoots) == 0 {
+		return errors.Join(errs...)
+	}
+	exe, err := findClientExe(opts.InstallDir)
+	if err != nil {
+		return errors.Join(append(errs, err)...)
+	}
+	// 每个根目录独立尝试：一个失败不能跳过另一个更关键的残留。
+	for _, dir := range recoveryRoots {
+		log("还原网络配置 " + dir)
+		// 客户端 -restore-network 拿不到单实例锁时会直接返回 1（旧进程还没退干净），
+		// 那不是还原失败；给进程退出留一点时间再试。
+		runErr := runHidden(exe, "-restore-network", "-data", dir)
+		for attempt := 0; attempt < 3 && runErr != nil; attempt++ {
+			time.Sleep(300 * time.Millisecond)
+			runErr = runHidden(exe, "-restore-network", "-data", dir)
+		}
+		stateFile := filepath.Join(dir, "data", "state.json")
+		_, statErr := os.Stat(stateFile)
+		stateGone := errors.Is(statErr, os.ErrNotExist)
+		switch {
+		case runErr == nil && stateGone:
+			// 正常收尾。
+		case runErr != nil && !stateGone:
+			errs = append(errs, fmt.Errorf("网络还原失败（%s），已保留客户端和恢复资料: %w", dir, runErr))
+		case runErr != nil && stateGone:
+			// 状态文件损坏时客户端会保守还原、清掉现场，但仍返回非零让用户确认。
+			// 现场已经不在，按已还原处理，只提示。
+			log("客户端报告还原错误但恢复状态已清理，按已还原处理: " + runErr.Error())
+		default:
+			// 客户端返回成功但现场还在（多半被占用）：留给下一次重试。
+			log("恢复状态文件仍存在，下次还原会重试: " + stateFile)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// findClientExe 找可用于 -restore-network 的客户端。安装目录（含更新时的 .old 备份）
+// 优先；数据目录里只可能是用户手动放进去的副本 —— 安装器从不往那里放 exe，
+// 所以找不到时如实报错，不要让人误以为一定能还原。
+func findClientExe(installDir string) (string, error) {
+	candidates := []string{
+		filepath.Join(installDir, AppExeName),
+		filepath.Join(installDir, AppExeName+".old"),
+	}
+	if fb := fallbackDataDir(); fb != "" && !strings.EqualFold(fb, installDir) {
+		candidates = append(candidates,
+			filepath.Join(fb, AppExeName),
+			filepath.Join(fb, AppExeName+".old"))
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("网络尚需还原，但找不到客户端（查过 %d 个位置）", len(candidates))
 }
 
 func Uninstall(opts Options, log func(string)) error {
 	log("停止客户端")
 	stopClient()
 
-	// 上面是 taskkill /F 硬停，客户端来不及自己还原网络，补一次（见 restoreNetwork）
-	restoreNetwork(opts, log)
+	// 上面是 taskkill /F 硬停，客户端来不及自己还原网络，补一次（见 restoreNetwork）。
+	// 还原失败不能中止卸载：否则计划任务、快捷方式、注册表和程序文件全都留着，
+	// 用户重试还卡在同一处。先记下来，清理完一起报。
+	restoreErr := restoreNetwork(opts, log)
 
 	// 计划任务留着的话，卸载后每次登录还会去启动一个已经不存在的程序
 	log("清理开机自启计划任务")
@@ -365,8 +434,15 @@ func Uninstall(opts Options, log func(string)) error {
 
 	log("删除程序文件")
 	if opts.RemoveData {
-		log("  删除 config / logs / data")
-		for _, name := range []string{"config", "logs", "data"} {
+		// 网络还没还原时保留 data/（里面是 state.json）：下次重试要靠它接着还原。
+		dirs := []string{"config", "logs"}
+		if restoreErr == nil {
+			dirs = append(dirs, "data")
+		} else {
+			log("  网络未还原，保留 data（含恢复现场）")
+		}
+		log("  删除 " + strings.Join(dirs, " / "))
+		for _, name := range dirs {
 			_ = os.RemoveAll(filepath.Join(opts.InstallDir, name))
 		}
 	} else {
@@ -380,6 +456,10 @@ func Uninstall(opts Options, log func(string)) error {
 	if entries, err := os.ReadDir(opts.InstallDir); err == nil {
 		for _, e := range entries {
 			if e.IsDir() {
+				continue
+			}
+			// 网络没还原时留着客户端：下一次卸载/重试要靠它执行 -restore-network。
+			if restoreErr != nil && strings.EqualFold(e.Name(), AppExeName) {
 				continue
 			}
 			_ = os.Remove(filepath.Join(opts.InstallDir, e.Name()))
@@ -397,8 +477,10 @@ func Uninstall(opts Options, log func(string)) error {
 	unregisterFileAssoc()
 
 	// 客户端在安装目录写不进去时会把数据退回到这里，顺手一起清掉
-	if fb := fallbackDataDir(); fb != "" {
-		if _, err := os.Stat(fb); err == nil {
+	if fb := fallbackDataDir(); opts.RemoveData && fb != "" {
+		if restoreErr != nil {
+			log("  网络未还原，保留回退数据目录 " + fb)
+		} else if _, err := os.Stat(fb); err == nil {
 			log("清理回退数据目录 " + fb)
 			_ = os.RemoveAll(fb)
 		}
@@ -406,11 +488,21 @@ func Uninstall(opts Options, log func(string)) error {
 
 	// 卸载器自己住在 %ProgramData%，而此刻跑的是它在临时目录里的副本 ——
 	// 所以这块能连卸载器一起删干净。这正是把它搬出安装目录的意义。
+	// 网络没还原时不删：用户要重试还原，还得有入口程序。
 	if dir := UninstallerDir(); dir != "" {
-		log("清理卸载器目录 " + dir)
-		if err := os.RemoveAll(dir); err != nil {
-			log("  删除失败（重启后可手动清理）：" + err.Error())
+		if restoreErr != nil {
+			log("  网络未还原，保留卸载器目录 " + dir)
+		} else {
+			log("清理卸载器目录 " + dir)
+			if err := os.RemoveAll(dir); err != nil {
+				log("  删除失败（重启后可手动清理）：" + err.Error())
+			}
 		}
+	}
+	if restoreErr != nil {
+		// 卸载本身已经完成，只是网络没还原干净：文案必须和事实一致，不能
+		// 让用户以为「什么都没卸载」。
+		return fmt.Errorf("卸载已完成，但网络配置未还原；客户端与恢复资料已保留，重试卸载可继续还原: %w", restoreErr)
 	}
 	return nil
 }
