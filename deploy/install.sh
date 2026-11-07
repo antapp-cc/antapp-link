@@ -38,8 +38,8 @@ while [[ $# -gt 0 ]]; do
       ;;
     --version)
       v="${2:-}"
-      [[ "$v" =~ ^v?[0-9] ]] || die "--version 需要形如 v0.4.8 的标签"
-      RELEASE_TAG="$v"
+      [[ "$v" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || die "--version 需要形如 v0.4.8 的完整标签"
+      RELEASE_TAG="v${v#v}"
       shift 2
       ;;
     --forward)
@@ -106,7 +106,9 @@ grep -q '^tcp_bbr$' /etc/modules-load.d/bbr.conf 2>/dev/null || echo tcp_bbr > /
 reset_apt_sources() {
   local src=/etc/apt/sources.list
   local codename
-  codename=$(grep -m1 -oP '(?<=^deb ).*? (?=main)' /etc/apt/sources.list 2>/dev/null | awk '{print $2}')
+  # pipefail 下 grep 无匹配会让整个赋值失败并直接退出；24.04 起 apt 改用 deb822，
+  # sources.list 为空是常态，必须让下面的 VERSION_CODENAME 回退有机会执行。
+  codename=$(grep -m1 -oP '(?<=^deb ).*? (?=main)' /etc/apt/sources.list 2>/dev/null | awk '{print $2}' || true)
   [[ "$codename" =~ ^[a-z]+$ ]] || codename=${VERSION_CODENAME:-}
   [[ "$codename" =~ ^[a-z]+$ ]] || die "认不出系统代号（codename），换源中止——请检查 /etc/apt/sources.list 或手动换源后重试"
 
@@ -176,43 +178,110 @@ if command -v apt-get >/dev/null; then
   strip_backports
 fi
 
-url="https://github.com/antapp-cc/antapp-link/releases/latest/download/antapp-linkd"
+# 首次安装也用脚本内置公钥验签，禁止执行下载来的未验证校验器。
+release_base="https://github.com/antapp-cc/antapp-link/releases/latest/download"
 if [[ -n "$RELEASE_TAG" ]]; then
-  url="https://github.com/antapp-cc/antapp-link/releases/download/$RELEASE_TAG/antapp-linkd"
-  log "指定版本：$RELEASE_TAG"
+  release_base="https://github.com/antapp-cc/antapp-link/releases/download/$RELEASE_TAG"
 fi
-downloaded=0
-if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
-  log "没有 wget 也没有 curl，先装 wget"
-  DEBIAN_FRONTEND=noninteractive apt-get update || die "apt 更新失败：请检查 /etc/apt/sources.list 里的软件源是否可用"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y wget
+[[ "$(uname -m)" == "x86_64" ]] || die "当前发布包只支持 Linux amd64"
+missing_verify=()
+command -v openssl >/dev/null || missing_verify+=(openssl)
+command -v python3 >/dev/null || missing_verify+=(python3)
+if ! command -v wget >/dev/null && ! command -v curl >/dev/null; then missing_verify+=(wget); fi
+if [[ ${#missing_verify[@]} -gt 0 ]]; then
+  DEBIAN_FRONTEND=noninteractive apt-get update || die "无法安装可信验签工具"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_verify[@]}" || die "无法安装验签工具（openssl/python3/wget）"
 fi
-if command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1; then
-  log "从 GitHub Release 下载 antapp-linkd（约 7 MB）……"
-  tmp_dl="$SRC_DIR/antapp-linkd.download"
-  rm -f "$tmp_dl"
-  if command -v wget >/dev/null 2>&1; then
-    wget -qO "$tmp_dl" "$url" || true
+
+fetch_release_file() {
+  local target="$1" source="$2"
+  rm -f -- "$target"
+  if command -v wget >/dev/null; then
+    if timeout 180 wget --timeout=30 --tries=2 -qO "$target" "$source"; then return 0; fi
   else
-    curl -fsSL --max-time 180 -o "$tmp_dl" "$url" || true
+    if curl -fsSL --connect-timeout 30 --max-time 180 -o "$target" "$source"; then return 0; fi
   fi
-  if [[ -f "$tmp_dl" ]] && [[ "$(head -c 4 "$tmp_dl")" == $'\x7fELF' ]]; then
-    mv -f "$tmp_dl" "$SRC_DIR/antapp-linkd"
-    downloaded=1
-    log "下载完成（$(du -h "$SRC_DIR/antapp-linkd" | cut -f1)）"
+  rm -f -- "$target"
+  return 1
+}
+
+verify_release() {
+  python3 - "$1" "$2" "$RELEASE_TAG" <<'PY'
+import base64, hashlib, json, pathlib, re, struct, subprocess, sys
+folder, phase, requested = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+try:
+    raw = (folder / "latest.json").read_bytes()
+    text = (folder / "latest.json.sig").read_text().strip()
+    sig = bytes.fromhex(text) if re.fullmatch(r"[0-9a-fA-F]{128}", text) else base64.b64decode(text, validate=True)
+    if len(sig) != 64:
+        raise ValueError("签名长度错误")
+    (folder / "release.pub.der").write_bytes(base64.b64decode("MCowBQYDK2VwAyEALbDBj1bBCEUnEKLbNXgM4vxEDr3t8pEc2ot11tUz2lc="))
+    (folder / "release.sig").write_bytes(sig)
+    subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-keyform", "DER", "-inkey", str(folder / "release.pub.der"), "-rawin", "-in", str(folder / "latest.json"), "-sigfile", str(folder / "release.sig")], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    manifest = json.loads(raw)
+    version = manifest["version"]
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+[.][0-9]+[.][0-9]+(?:[-+][0-9A-Za-z.-]+)?", version):
+        raise ValueError("版本号不合法")
+    if requested and requested != "v" + version:
+        raise ValueError("清单版本与指定版本不符")
+    asset = manifest["server"]
+    url = "https://github.com/antapp-cc/antapp-link/releases/download/v" + version + "/antapp-linkd"
+    if asset["url"] != url or not re.fullmatch(r"[0-9a-fA-F]{64}", asset["sha256"]):
+        raise ValueError("清单下载地址或摘要无效")
+    if type(asset["size"]) is not int or not 64 <= asset["size"] <= 128 * 1024 * 1024:
+        raise ValueError("清单大小无效")
+    if phase == "metadata":
+        print(url)
+    else:
+        binary = (folder / "antapp-linkd").read_bytes()
+        if len(binary) != asset["size"] or hashlib.sha256(binary).hexdigest() != asset["sha256"].lower():
+            raise ValueError("程序大小或 SHA-256 不符")
+        if binary[:7] != bytes.fromhex("7f454c46020101") or struct.unpack_from("<HHI", binary, 16) not in ((2, 62, 1), (3, 62, 1)):
+            raise ValueError("程序不是 Linux amd64 ELF")
+        print(version)
+except Exception as error:
+    print("发布包验证失败: " + str(error), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+stage="$(mktemp -d /tmp/antapp-install.XXXXXX)"
+trap 'rm -f -- "$BIN.probe.$$"; rm -rf -- "$stage"' EXIT
+online=0
+if fetch_release_file "$stage/latest.json" "$release_base/latest.json" &&
+   fetch_release_file "$stage/latest.json.sig" "$release_base/latest.json.sig"; then
+  if asset_url="$(verify_release "$stage" metadata)"; then
+    if fetch_release_file "$stage/antapp-linkd" "$asset_url"; then
+      online=1
+    else
+      log "在线二进制下载失败，检查同目录离线签名包"
+      rm -f -- "$stage/antapp-linkd"
+    fi
   else
-    rm -f "$tmp_dl"
-    log "下载失败或拿到的不是有效二进制（网络 / CDN 异常）"
+    log "在线清单验证失败，检查同目录离线签名包"
+    rm -f -- "$stage/latest.json" "$stage/latest.json.sig"
   fi
 fi
-if [[ "$downloaded" -eq 0 ]]; then
-  if [[ -f "$SRC_DIR/antapp-linkd" ]]; then
-    log "警告: 改用同目录现成的 antapp-linkd —— 它不一定是最新版，想确保最新请让网络可用后重跑"
-  else
-    die "下载失败，同目录也没有 antapp-linkd。请检查网络，或手动上传 antapp-linkd 到 $SRC_DIR"
-  fi
+if [[ "$online" -eq 0 ]]; then
+  for name in latest.json latest.json.sig antapp-linkd; do
+    [[ -f "$SRC_DIR/$name" ]] || die "缺少离线签名包 $name；请把同版本 antapp-linkd、latest.json、latest.json.sig 放到脚本目录，或恢复联网；保留旧程序"
+    cp -- "$SRC_DIR/$name" "$stage/$name"
+  done
 fi
-chmod +x "$SRC_DIR/antapp-linkd"
+verified_version="$(verify_release "$stage" binary)" || die "程序校验失败，保留旧程序"
+chmod 0755 "$stage/antapp-linkd"
+# 不在 /tmp 里执行：挂 noexec 的加固主机会把合法发布包判成「不可执行」。
+# 先落到安装目录旁边的探测文件，验完即删；带 PID 是为了两个并发安装不互相覆盖。
+probe="$BIN.probe.$$"
+if ! install -m 0755 "$stage/antapp-linkd" "$probe"; then
+  die "无法写入 $probe，检查 $BIN 所在目录权限"
+fi
+if [[ "$(timeout 15 "$probe" version)" != "antapp-linkd $verified_version" ]]; then
+  rm -f -- "$probe"
+  die "程序版本或可执行性检查失败，保留旧程序"
+fi
+rm -f -- "$probe"
+log "签名、大小、SHA-256、平台和版本校验通过：$verified_version"
 
 log "检查系统依赖"
 missing=()
@@ -223,7 +292,7 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   log "缺少 ${missing[*]}，开始安装——软件源慢时需要一两分钟，请看下面的 apt 进度"
   if command -v apt-get >/dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get update || die "apt 更新失败：请检查 /etc/apt/sources.list 里的软件源是否可用"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" || die "系统依赖安装失败：${missing[*]}"
   elif command -v dnf >/dev/null; then
     dnf install -y "${missing[@]}"
   elif command -v yum >/dev/null; then
@@ -238,9 +307,140 @@ command -v iptables >/dev/null || die "iptables 仍不可用"
 modprobe tun 2>/dev/null || true
 [[ -c /dev/net/tun ]] || die "/dev/net/tun 不可用 —— 这台机器不支持 TUN 设备（老式 OpenVZ 容器常见），换一台"
 
+# 与服务端自动更新共用锁，防止安装回退时另一个更新器又替换程序。
+command -v flock >/dev/null 2>&1 || die "缺少系统工具 flock，不能安全地与自动更新互斥"
+mkdir -p /run/antapp-link
+exec {install_lock}>/run/antapp-link/update.lock
+flock -n "$install_lock" || die "正在安装或自动更新，请稍后重试"
 log "安装二进制到 $BIN"
-install -m 0755 "$SRC_DIR/antapp-linkd" "$BIN.new"
-mv -f "$BIN.new" "$BIN"
+had_old=0
+was_active=0
+service_restart_attempted=0
+install_state_modified=0
+netfilter_attempted=0
+mkdir -p "$stage/rollback"
+state_files=("$CONF" "$CONF_DIR/sysctl-backup.txt"
+  /etc/sysctl.d/99-antapp-link.conf /etc/dnsmasq.d/antapp.conf
+  /etc/systemd/system/antapp-linkd.service /etc/systemd/system/antapp-link-up.service
+  /etc/systemd/system/antapp-link-update.service /etc/systemd/system/antapp-link-update.timer
+  /run/antapp-link/forward-range /run/antapp-link/forward-range.rules.json)
+# 先备份再注册事务；备份失败时尚未修改程序、配置或系统参数。
+for i in "${!state_files[@]}"; do
+  file="${state_files[$i]}"
+  if [[ -e "$file" || -L "$file" ]]; then cp -a -- "$file" "$stage/rollback/file-$i"; fi
+done
+sysctl_keys=(net.core.default_qdisc net.ipv4.tcp_congestion_control net.ipv4.ip_forward
+  net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+  net.core.rmem_max net.core.wmem_max net.ipv4.tcp_mtu_probing net.ipv4.tcp_fastopen)
+for key in "${sysctl_keys[@]}"; do
+  # 读不到就留占位：回滚时把这行原样 sysctl -w 会失败（记 rollback_ok=0），
+  # 但至少不会因为在 trap 安装前静默退出而卡住整个安装。
+  setting="$(sysctl -n "$key" 2>/dev/null || echo '(读取失败)')"
+  printf '%s=%s\n' "$key" "$setting" >> "$stage/rollback/sysctl"
+done
+services=(antapp-linkd antapp-link-up.service antapp-link-update.timer dnsmasq)
+for i in "${!services[@]}"; do
+  if systemctl is-active --quiet "${services[$i]}"; then touch "$stage/rollback/active-$i"; fi
+  systemctl is-enabled "${services[$i]}" > "$stage/rollback/enabled-$i" 2>/dev/null || true
+done
+[[ ! -f "$stage/rollback/active-0" ]] || was_active=1
+if [[ -f "$BIN" ]]; then cp -p -- "$BIN" "$stage/rollback/binary"; had_old=1; fi
+rollback_install() {
+  local result=$? restored=0 rollback_ok=1 core_ok=1 file i setting enabled
+  trap - EXIT
+  if [[ "$result" -ne 0 ]]; then
+    # 先停使用新配置的进程和定时器，再撤新规则、还原文件与旧程序。
+    # 停止旧进程/停用服务的失败不能阻断后续恢复：unit 可能压根没装上，
+    # 或本来就是 static，把 stop 失败算成回滚失败会让下面跳过重启、把链路留在 down。
+    if [[ "$service_restart_attempted" -eq 1 ]]; then
+      systemctl stop antapp-linkd || true
+    fi
+    if [[ "$install_state_modified" -eq 1 ]]; then
+      systemctl stop antapp-link-update.timer || true
+      for i in "${!services[@]}"; do
+        enabled="$(cat "$stage/rollback/enabled-$i" 2>/dev/null || true)"
+        case "$enabled" in
+          enabled|masked|masked-runtime) ;;
+          *) systemctl disable "${services[$i]}" >/dev/null 2>&1 || true ;;
+        esac
+      done
+    fi
+    if [[ "$netfilter_attempted" -eq 1 ]]; then
+      "$BIN" down -c "$CONF" || rollback_ok=0
+    fi
+    for i in "${!state_files[@]}"; do
+      file="${state_files[$i]}"
+      if [[ -e "$stage/rollback/file-$i" || -L "$stage/rollback/file-$i" ]]; then
+        if ! cp -a -- "$stage/rollback/file-$i" "$file.rollback" || ! mv -f -- "$file.rollback" "$file"; then
+          log "错误: 无法恢复 $file"; rollback_ok=0
+          # 主配置（下标 0）没恢复，旧服务起来也是错的配置；其余辅助文件失败不阻止重启。
+          [[ "$i" -eq 0 ]] && core_ok=0
+        fi
+      else
+        rm -f -- "$file" || rollback_ok=0
+      fi
+    done
+    if [[ "$had_old" -eq 1 ]]; then
+      if cp -p -- "$stage/rollback/binary" "$BIN.rollback" && mv -f -- "$BIN.rollback" "$BIN"; then
+        restored=1
+      else
+        log "错误: 程序文件回退失败"; rollback_ok=0; core_ok=0
+      fi
+    else
+      rm -f -- "$BIN" || { rollback_ok=0; core_ok=0; }
+    fi
+    while IFS= read -r setting; do
+      # 读不到原值时写的是占位符，回滚不出来是已知的，不算回滚失败。
+      [[ "$setting" == *"(读取失败)"* ]] && continue
+      sysctl -w "$setting" >/dev/null 2>&1 || true
+    done < "$stage/rollback/sysctl"
+    # 单元重载/自启状态失败不阻止旧服务重启：服务文件本身已经按备份还原，
+    # restart 读的是磁盘上的 unit。
+    if [[ "$install_state_modified" -eq 1 ]]; then
+      systemctl daemon-reload || true
+      for i in "${!services[@]}"; do
+        enabled="$(cat "$stage/rollback/enabled-$i" 2>/dev/null || true)"
+        case "$enabled" in
+          enabled) systemctl enable "${services[$i]}" >/dev/null 2>&1 || true ;;
+          enabled-runtime) systemctl enable --runtime "${services[$i]}" >/dev/null 2>&1 || true ;;
+        esac
+      done
+    fi
+    # 规则能重建就重建；up 失败只影响转发规则，不该阻止旧服务重启。
+    if [[ "$netfilter_attempted" -eq 1 && "$restored" -eq 1 && -f "$stage/rollback/file-0" ]]; then
+      "$BIN" up -c "$CONF" || log "警告: 重新应用 netfilter 失败，转发端口可能不可用"
+    fi
+    if [[ "$install_state_modified" -eq 1 ]]; then
+      for i in 1 2 3; do
+        if [[ -f "$stage/rollback/active-$i" ]]; then
+          systemctl restart "${services[$i]}" || true
+        else
+          systemctl stop "${services[$i]}" || true
+        fi
+      done
+    fi
+    # 重启只看「程序 + 主配置是否恢复」，不跟 sysctl/辅助服务/规则的小失败绑定：
+    # 那些失败已经记进 rollback_ok 会打印，但把服务留在停机状态代价更大。
+    if [[ "$service_restart_attempted" -eq 1 && "$was_active" -eq 1 && "$restored" -eq 1 && "$core_ok" -eq 1 ]]; then
+      if ! systemctl restart antapp-linkd || ! wait_install_service; then
+        log "警告: 旧服务未能稳定启动，请检查 journalctl -u antapp-linkd"
+        rollback_ok=0
+      fi
+    fi
+    rm -f -- "$BIN.new" "$BIN.rollback"
+    if [[ "$rollback_ok" -ne 1 ]]; then
+      log "错误: 回退未全部成功，恢复资料保留在 $stage/rollback；请修复后恢复配置、程序和服务"
+      exit "$result"
+    fi
+    log "安装未完成，原程序、配置和服务状态已恢复"
+  fi
+  rm -f -- "$BIN.probe.$$"
+  rm -rf -- "$stage"
+  exit "$result"
+}
+trap rollback_install EXIT
+install -m 0755 "$stage/antapp-linkd" "$BIN.new"
+mv -f -- "$BIN.new" "$BIN"
 
 log "初始化配置与 PKI（已存在的一律保留，只同步下面这几项）"
 init_args=(-c "$CONF")
@@ -260,18 +460,6 @@ fi
 [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ]] || die "BBR 启用失败——内核不支持且模块加载不了"
 log "BBR 已生效（$(sysctl -n net.ipv4.tcp_congestion_control) + $(sysctl -n net.core.default_qdisc)）"
 
-wan_iface="$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')" || true
-if [[ -n "$wan_iface" ]]; then
-  modprobe sch_fq 2>/dev/null || true
-  if tc qdisc replace dev "$wan_iface" root fq 2>/dev/null &&
-     tc qdisc show dev "$wan_iface" 2>/dev/null | head -1 | grep -q 'qdisc fq '; then
-    log "出口 qdisc 已切换：$wan_iface -> fq"
-  else
-    log "警告: $wan_iface 的 qdisc 切不到 fq（继续用现有 qdisc，不影响功能）"
-  fi
-else
-  log "警告: 找不到默认出口网卡，跳过 qdisc 切换"
-fi
 
 log "调优内核缓冲（多连接数据面）"
 apply_sysctl() {
@@ -311,21 +499,61 @@ apply_sysctl "net.ipv4.tcp_fastopen=3"
 log "内核缓冲调优完成（rmem/wmem 上限 16MB，空闲不重新起步；持久化见 /etc/sysctl.d/99-antapp-link.conf）"
 
 log "安装 systemd 服务"
+install_state_modified=1
 "$BIN" install -c "$CONF"
 
 systemctl enable dnsmasq >/dev/null 2>&1 || true
 systemctl restart dnsmasq >/dev/null 2>&1 || log "警告: dnsmasq 未启动，隧道 DNS 中继不可用"
 
 log "配置 netfilter（幂等）"
+netfilter_attempted=1
 "$BIN" down -c "$CONF" >/dev/null 2>&1 || true
 "$BIN" up -c "$CONF"
 
+# Type=simple 的 restart 成功只表示进程已派生，连续检查同一进程且未自动重启。
+# NRestarts 只比较 restart 后的基线是否增长：不同 systemd 版本对它的清零行为不一致，
+# 要求绝对 0 会把健康的升级判成失败（update_linux.go 用的是同一套判据）。
+wait_install_service() {
+  local pid="" current restarts base="" check
+  for check in 1 2 3; do
+    sleep 2
+    systemctl is-active --quiet antapp-linkd || return 1
+    current="$(systemctl show -p MainPID --value antapp-linkd)" || return 1
+    restarts="$(systemctl show -p NRestarts --value antapp-linkd)" || return 1
+    [[ "$current" =~ ^[1-9][0-9]*$ ]] || return 1
+    # 读不到/非数字时按失败处理（fail-closed），别让空输出把比较变成恒真。
+    [[ "$restarts" =~ ^[0-9]+$ ]] || return 1
+    [[ -n "$base" ]] || base="$restarts"
+    [[ "$restarts" == "$base" ]] || return 1
+    [[ -z "$pid" || "$current" == "$pid" ]] || return 1
+    pid="$current"
+  done
+}
+
 log "启动隧道"
+service_restart_attempted=1
 systemctl restart antapp-linkd
-sleep 2
+wait_install_service || die "隧道服务未稳定启动，执行回退"
 
 log "当前状态"
 "$BIN" status -c "$CONF" || true
+
+# 关键初始化和服务启动成功后才结束回滚窗口。
+trap 'rm -f -- "$BIN.probe.$$"; rm -rf -- "$stage"' EXIT
+
+wan_iface="$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')" || true
+if [[ -n "$wan_iface" ]]; then
+  modprobe sch_fq 2>/dev/null || true
+  if tc qdisc replace dev "$wan_iface" root fq 2>/dev/null &&
+     tc qdisc show dev "$wan_iface" 2>/dev/null | head -1 | grep -q 'qdisc fq '; then
+    log "出口 qdisc 已切换：$wan_iface -> fq"
+  else
+    log "警告: $wan_iface 的 qdisc 切不到 fq（继续用现有 qdisc，不影响功能）"
+  fi
+else
+  log "警告: 找不到默认出口网卡，跳过 qdisc 切换"
+fi
+
 
 log "重新签发连接码到 /root（覆盖旧文件，让里面的参数跟上当前配置）"
 "$BIN" invite pi-node-01 -c "$CONF" -o /root || log "警告: 签发失败，可手动执行: $BIN invite pi-node-01 -c $CONF -o /root"

@@ -132,6 +132,9 @@ func run() int {
 		}
 	}
 	if !first {
+		if *restoreNet {
+			return 1
+		}
 		// 已经有实例在跑。如果这次是双击连接码文件进来的，先把码写进 config\，
 		// 那个实例会发现文件变了并自动重载 —— 否则用户双击了却什么都没发生。
 		if inviteArg != "" {
@@ -244,6 +247,9 @@ func run() int {
 	if !*noNetCfg {
 		if err := app.HealIfNeeded(); err != nil {
 			logger.Warn("自愈未完全成功", "err", err)
+			if *restoreNet {
+				return 1
+			}
 		}
 	}
 	// 卸载器把客户端硬停之后借这个入口还原网络：上面那步自愈已经干完了活，

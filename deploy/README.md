@@ -10,16 +10,25 @@ wget -qO install.sh "https://raw.githubusercontent.com/antapp-cc/antapp-link/mai
 
 **方式二：离线部署**（云服访问 GitHub 不便时）
 
-```bash
-# 1. 本机交叉编译并上传（两个文件放同一目录）
-pwsh -File build.ps1
-#   dist/antapp-linkd        -> 云服
-#   deploy/install.sh        -> 云服
+从同一个正式 Release（或发布脚本生成的最终 `dist/release-<版本>/`）取得下面三个文件：
 
-# 2. 云服上执行
-bash install.sh                    # 默认转发端口段 31400-31409
+- `antapp-linkd`
+- `latest.json`
+- `latest.json.sig`
+
+再取**同一版本**的 `deploy/install.sh`（从仓库对应 `v<版本>` 标签拿；Release 资产里不含它，上传后名为 `install.sh`），四个文件一起放到云服同一目录。
+
+```bash
+# 云服上执行；下面的版本仅为示例，应替换为三件套实际版本。
+bash install.sh --version v1.2.3   # 默认转发端口段 31400-31409
+# --version 1.2.3 也会规范化为 v1.2.3；可省略 --version 以选择 latest。
 ```
 
+脚本先尝试联网，下载失败才检查上述同目录离线三件套。离线不会绕过验签：签名、版本、URL、大小、摘要、ELF 平台及可执行版本都必须匹配；缺文件或校验失败会停止替换并保留旧程序。不要把临时编译的二进制与另一版本的清单/签名混用。仅执行 `build.ps1` 不会生成对应新版本与摘要的发布清单。
+
+安装与服务端自动更新共用 `/run/antapp-link/update.lock`，另一操作进行中时会停止本次安装。系统需有 `flock`（常见发行版由 util-linux 提供）。替换前备份配置、派生服务文件和原内核参数；失败时先恢复配置，再恢复程序、规则和服务。任何恢复步骤失败都会保留临时 `rollback/` 资料，并在日志给出路径，不能把“程序已回退”当作“整机已恢复”。已有 PKI/CA 不删除。
+
+仅 `tools/release.ps1` 为最终产物生成并签署更新清单；`build.ps1` 构建前会把旧清单及签名移到输出目录的 `previous-manifests/`，不会再给旧清单重新签名。正式发布门禁检查版本、URL、大小、摘要、Go 工具链和目标平台，并运行双端只显示版本的入口；Windows 发布环境需有 WSL 来执行 Linux 服务端 `--version`。发布只使用最终 `release-<版本>/`，本地未签名维修候选不能上传。
 脚本会：装二进制到 `/usr/local/bin/antapp-linkd` → 生成 CA 与服务端证书 → 写 systemd unit 并 enable → 安装并配置 dnsmasq（隧道 DNS 中继）→ 配置 netfilter → 启动隧道。
 
 **每台 VPS 的 PKI 密钥在首次安装时现场随机生成**，互不相同、互不通用——一台泄露不影响其他台。
@@ -70,11 +79,14 @@ antapp-linkd down -c /etc/antapp-link/server.json      # 清理 netfilter
 go run ./cmd/antapp-sign -genkey -key $env:USERPROFILE\.antapp-release\release.key
 # 把打印出来的公钥填进 internal/update/pubkey.go 的 releasePubKey，然后重新构建两端
 
-# 每次发布：给 dist/latest.json 生成 dist/latest.json.sig（build.ps1 已自动做这一步）
-go run ./cmd/antapp-sign -key $env:USERPROFILE\.antapp-release\release.key -in dist/latest.json
+# 正式发布（会构建和签名；版本仅为示例）：
+pwsh -File tools/release.ps1 -Version 1.2.3
+# 最终产物位于 dist/release-1.2.3/，包含 latest.json 和 latest.json.sig。
 ```
 
 发布资产要包含 **`latest.json` 和 `latest.json.sig` 两个文件**（连同 `antapp-link.exe`、`antapp-linkd`）。
+
+`tools/release.ps1` 已自动生成含 `server` URL、大小、SHA-256 的最终清单，并对它签名、再用内置公钥验签。`build.ps1` 不再签名，只把旧清单及签名移到 `previous-manifests/`；它不能代替最终发布目录的清单生成与验签。
 
 > ⚠ **别弄丢私钥，也别轻易换密钥对。** 私钥丢了就再也签不出节点会接受的清单（只能全部重装）；
 > 换密钥对意味着所有已部署节点要先升级一次 —— 它们内置的是旧公钥。
@@ -158,3 +170,21 @@ bash install.sh --forward 31400-31409
 | 端口从外面连不上 | `ss -tlnp | grep antapp-linkd` 确认转发器在监听 31400-31409；再确认节点确实在线 —— 客户端没连上时隧道转发不可达，外部表现为超时 |
 | 节点显示已连接但上不了网 | 客户端日志里的「出网自检」结论。自检失败时客户端会自动断开并还原网络，日志里会有原因（多半是云服出口的 DNS 查不通） |
 | 改了端口段没生效 | `antapp-linkd down` 再 `up`，或直接重跑 `install.sh --forward <段>` |
+
+## 安装脚本隔离回归
+
+测试只提取安装脚本片段，在临时目录使用测试密钥及模拟 `systemctl`/下载命令，不执行真实安装、服务重启或防火墙修改。需要 Linux/WSL、Python 3、bash 和支持 Ed25519 的 openssl。
+
+```bash
+# Linux，项目根目录
+bash -n deploy/install.sh
+python3 deploy/install_test.py -v
+```
+
+```powershell
+# Windows，项目根目录（需先配置 WSL 及上述依赖）
+wsl --exec bash -n deploy/install.sh
+wsl --exec python3 deploy/install_test.py -v
+```
+
+原生 Windows 直接执行测试会明确提示使用 WSL 并返回非零；依赖缺失同样失败，不会将全部用例跳过后报告通过。源码与测试文本读写显式使用 UTF-8；验签片段使用当前 Python 解释器运行。

@@ -23,6 +23,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
+. (Join-Path $PSScriptRoot 'release-check.ps1')
 
 # 版本号格式：和 internal/update 的 versionPattern、build.ps1 同一套规则。
 # 后缀只允许 SemVer 安全字符（字母/数字/点/连字符）：路径分隔符、盘符和 .. 段
@@ -96,6 +97,7 @@ $releaseKey = Join-Path $env:USERPROFILE '.antapp-release\release.key'
 if (-not (Test-Path $releaseKey)) {
     throw "缺发布私钥 $releaseKey —— 没有它签不出节点会接受的清单。"
 }
+Assert-ReleaseContents -Directory $out -Version $Version -Repo $Repo
 Write-Host '== 更新清单签名 ==' -ForegroundColor Cyan
 & go run ./cmd/antapp-sign -key $releaseKey -in $manifestPath
 if ($LASTEXITCODE -ne 0) { throw '清单签名失败' }
@@ -105,6 +107,7 @@ if (-not (Test-Path "$manifestPath.sig")) { throw "签名没有生成：$manifes
 Write-Host '== 更新清单验签（模拟节点端）==' -ForegroundColor Cyan
 & go run ./cmd/antapp-sign -verify -in $manifestPath
 if ($LASTEXITCODE -ne 0) { throw '清单验签失败 —— 发布后节点会拒绝更新' }
+Assert-ReleaseContents -Directory $out -Version $Version -Repo $Repo
 
 $guide = @"
 发布 $Version

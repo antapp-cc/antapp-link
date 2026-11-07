@@ -23,8 +23,29 @@ if ($Version -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$') {
     throw "版本号格式不对：$Version（只允许 主.次.修订 和 -/+ 安全后缀，例如 0.4.13）"
 }
 
+# go.mod 固定最低安全修订，拒绝用旧版工具链生成发行产物。
+# 只约束下界：未来 minor（1.28+）放行，否则每次升级 Go 都要改这个脚本。
+$goVersion = & go env GOVERSION
+if ($LASTEXITCODE -ne 0) { throw '无法加载 go.mod 要求的安全工具链' }
+if ($goVersion -notmatch '^go(\d+\.\d+\.\d+)$') { throw "无法识别正式 Go 工具链：$goVersion" }
+$compiler = [version]$Matches[1]
+$safeCompiler = $compiler.Major -gt 1 -or (
+    $compiler.Major -eq 1 -and (
+        $compiler.Minor -gt 27 -or
+        ($compiler.Minor -eq 27 -and $compiler.Build -ge 3) -or
+        ($compiler.Minor -eq 26 -and $compiler.Build -ge 10)))
+if (-not $safeCompiler) { throw "构建需要 Go 1.26.10+（1.27 需 1.27.3+）的安全修订，当前 $goVersion；可设置 GOTOOLCHAIN=go1.26.10" }
+
 $distDir = Join-Path $root $Dist
 New-Item -ItemType Directory -Force $distDir | Out-Null
+# 构建前隔离旧清单，失败构建也不能留下可被误当成新包的签名清单。
+$oldManifests = @('latest.json', 'latest.json.sig') | ForEach-Object { Join-Path $distDir $_ } |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+if ($oldManifests) {
+    $archiveDir = Join-Path $distDir ('previous-manifests\' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $archiveDir -Force | Out-Null
+    foreach ($file in $oldManifests) { Move-Item -LiteralPath $file -Destination $archiveDir }
+}
 
 function Build-Target {
     param(
@@ -111,25 +132,7 @@ Copy-Item (Join-Path $root 'THIRD-PARTY-NOTICES.md') (Join-Path $distDir 'README
 $setupDist = Join-Path $distDir "AntAppLink-安装-$Version.exe"
 Copy-Item (Join-Path $distDir 'antapp-setup.exe') $setupDist -Force
 
-# 更新清单签名：latest.json 必须带 .sig 一起发布，否则两端会拒绝自动更新。清单里的
-# 下载 URL 与 sha256 出自同一份文件，只校 sha256 挡不住能改 Release 的人，而更新链路
-# 以 root 运行 —— 一次投毒就是所有节点上的任意代码执行。私钥离线保管，不进仓库。
-$manifest = Join-Path $distDir 'latest.json'
-if (Test-Path $manifest) {
-    $releaseKey = Join-Path $env:USERPROFILE '.antapp-release\release.key'
-    if (-not (Test-Path $releaseKey)) {
-        throw "缺发布私钥 $releaseKey —— 没有它签不出节点会接受的清单。先跑 antapp-sign -genkey，或从离线备份恢复。"
-    }
-    Write-Host '== 更新清单签名 ==' -ForegroundColor Cyan
-    go run ./cmd/antapp-sign -key $releaseKey -in $manifest
-    if ($LASTEXITCODE -ne 0) { throw 'latest.json 签名失败' }
-    # 再用内置公钥验一遍（就是节点端会做的事）：私钥与 pubkey.go 不配对时签出来的
-    # 清单会被全网拒收，必须在发布前拦住，而不是等所有节点停止更新。
-    go run ./cmd/antapp-sign -verify -in $manifest
-    if ($LASTEXITCODE -ne 0) { throw 'latest.json 的签名与内置公钥不配对 —— 发布出去所有节点都会拒收' }
-} else {
-    Write-Warning 'dist 里没有 latest.json，跳过清单签名（发布自动更新时要手动补 .sig，否则新版本会拒绝更新）'
-}
+# 仅 tools/release.ps1 为本次最终产物生成并签名清单。
 
 Write-Host ''
 Write-Host '== 产物 ==' -ForegroundColor Green
