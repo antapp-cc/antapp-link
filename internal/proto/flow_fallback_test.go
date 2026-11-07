@@ -48,7 +48,7 @@ func TestFlowFallbackRejectsOutOfRangeSlot(t *testing.T) {
 	if !ok {
 		t.Fatal("构造的包应能解析出 flow key")
 	}
-	ft.fallback[key] = 9 // 人为写一个越界槽（n=4）
+	ft.fallback[key] = flowEntry{slot: 9, lastSeen: ft.now().UnixNano(), proto: 6} // 人为写一个越界槽（n=4）
 
 	got := ft.Slot(p, 4, nil)
 	if got <= 0 || got >= 4 {
@@ -56,8 +56,8 @@ func TestFlowFallbackRejectsOutOfRangeSlot(t *testing.T) {
 	}
 }
 
-// 流结束时（FIN）要把旁路表里的条目一起清掉，否则短连接会把 1024 容量吃满。
-func TestFlowFallbackClearedOnFIN(t *testing.T) {
+// RST 立即清掉旁路条目；FIN 保留亲和的行为由专用测试覆盖。
+func TestFlowFallbackClearedOnRST(t *testing.T) {
 	ft := NewFlowTable()
 	ft.max = 1
 	dst := [4]byte{8, 8, 8, 8}
@@ -74,10 +74,10 @@ func TestFlowFallbackClearedOnFIN(t *testing.T) {
 		t.Fatal("表满时的回退流应记进旁路表")
 	}
 
-	fin := buildTCPWithFlags(src, dst, 4444, 443, 0x11) // FIN|ACK
+	fin := buildTCPWithFlags(src, dst, 4444, 443, 0x14) // RST|ACK
 	ft.Slot(fin, 4, nil)
 	if _, exists := ft.fallback[key]; exists {
-		t.Fatal("FIN 之后旁路表里的条目应被清掉")
+		t.Fatal("RST 之后旁路表里的条目应被清掉")
 	}
 }
 
@@ -95,8 +95,8 @@ func TestFlowFallbackPromotesWhenTableHasRoom(t *testing.T) {
 	p := buildTCP(src, dst, 3333, 443)
 	first := ft.Slot(p, 4, nil) // 记进旁路表
 
-	// 用 FIN 回收一条，表降到不满
-	ft.Slot(buildTCPWithFlags(src, dst, 1111, 443, 0x11), 4, nil)
+	// 用 RST 回收一条，表降到不满
+	ft.Slot(buildTCPWithFlags(src, dst, 1111, 443, 0x14), 4, nil)
 	if len(ft.m) != 1 {
 		t.Fatalf("表应降到 1 条，实际 %d", len(ft.m))
 	}

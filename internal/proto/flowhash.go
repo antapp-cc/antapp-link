@@ -68,8 +68,8 @@ func flowKeyOf(payload []byte) (flowKey, bool) {
 	return k, ok
 }
 
-// TCP 标志位（IP 头之后 TCP 头的第 14 字节）。FIN/RST 是连接结束的明确信号，
-// 流表靠它回收映射，避免短连接把表吃满。
+// TCP 标志位（IP 头之后 TCP 头的第 14 字节）。RST 是连接立即结束的明确信号，
+// 流表收到就回收映射；FIN 只代表半关闭，映射按短宽限期保留亲和（见 flow.go）。
 const (
 	tcpFlagFIN = 0x01
 	tcpFlagRST = 0x04
@@ -83,6 +83,10 @@ func flowKeyMeta(payload []byte) (k flowKey, proto uint8, flags uint8, ok bool) 
 		return k, 0, 0, false
 	}
 
+	ihl := int(payload[0]&0x0f) * 4
+	if ihl < 20 || ihl > len(payload) {
+		return k, 0, 0, false
+	}
 	protocol := payload[9]
 	srcIP := payload[12:16]
 	dstIP := payload[16:20]
@@ -101,11 +105,11 @@ func flowKeyMeta(payload []byte) (k flowKey, proto uint8, flags uint8, ok bool) 
 		k.len = uint8(n + 2)
 
 	case protocol == 6 || protocol == 17:
-		if len(payload) < 24 {
+		if len(payload) < ihl+4 {
 			return k, 0, 0, false
 		}
-		sport := payload[20:22]
-		dport := payload[22:24]
+		sport := payload[ihl : ihl+2]
+		dport := payload[ihl+2 : ihl+4]
 		// 规范化端点对：字节序小者在前 → 方向无关
 		n := 0
 		if endpointLess(srcIP, sport, dstIP, dport) {
@@ -121,8 +125,8 @@ func flowKeyMeta(payload []byte) (k flowKey, proto uint8, flags uint8, ok bool) 
 		}
 		k.b[n] = protocol
 		k.len = uint8(n + 1)
-		if protocol == 6 && len(payload) >= 34 {
-			flags = payload[33]
+		if protocol == 6 && len(payload) >= ihl+14 {
+			flags = payload[ihl+13]
 		}
 
 	default:

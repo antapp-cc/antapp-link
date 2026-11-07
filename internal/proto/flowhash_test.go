@@ -9,7 +9,7 @@ import (
 // mkIPv4 构造一个最小合法 IPv4 头 + 传输层前 4 字节。
 func mkIPv4(src, dst [4]byte, protocol byte, sport, dport uint16, fragOff uint16, mf bool) []byte {
 	b := make([]byte, 24)
-	b[0] = 0x40 // v4
+	b[0] = 0x45 // v4，20 字节头
 	binary.BigEndian.PutUint16(b[2:4], 24)
 	binary.BigEndian.PutUint16(b[4:6], 0x1234) // ip_id
 	b[8] = 64                                  // ttl

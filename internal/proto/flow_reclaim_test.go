@@ -27,27 +27,25 @@ func buildUDPFlow(src, dst [4]byte, sport, dport uint16) []byte {
 	return p
 }
 
-// 短连接正常关闭靠 FIN 回收：本包仍走原槽（不制造这次乱序），随后删掉映射，
-// 后续同 key 的包重新分配。不回收的话长会话里表会被已关闭的连接吃满。
-func TestFlowTableReclaimsTCPOnFIN(t *testing.T) {
+// FIN 保留半关闭连接的亲和；静默达到原有TCP空闲期限后仍能回收。
+func TestFlowTableRetainsTCPAfterFINUntilIdle(t *testing.T) {
+	base := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 	ft := NewFlowTable()
-	p := buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 40000, 443, 0x10) // ACK
+	ft.clock = func() time.Time { return base }
+	p := buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, 40000, 443, 0x10)
 	first := ft.Slot(p, 4, nil)
-	if st := ft.Stats(); st.Size != 1 {
-		t.Fatalf("插入后 Size 应为 1，实际 %d", st.Size)
+	p[33] = 0x11
+	if got := ft.Slot(p, 4, nil); got != first {
+		t.Fatalf("FIN换槽: %d -> %d", first, got)
 	}
-
-	p[33] = 0x11 // FIN|ACK，同一条流
-	got := ft.Slot(p, 4, nil)
-	if got != first {
-		t.Fatalf("FIN 包换了槽：%d -> %d（本包不该乱序）", first, got)
+	if st := ft.Stats(); st.Size != 1 || st.Reclaimed != 0 {
+		t.Fatalf("FIN提前回收: %+v", st)
 	}
-	st := ft.Stats()
-	if st.Size != 0 {
-		t.Fatalf("FIN 后映射应被回收，Size=%d", st.Size)
-	}
-	if st.Reclaimed != 1 {
-		t.Fatalf("回收计数应为 1，实际 %d", st.Reclaimed)
+	ft.mu.Lock()
+	ft.sweepLocked(base.Add(tcpFlowIdle + time.Second))
+	ft.mu.Unlock()
+	if st := ft.Stats(); st.Size != 0 || st.Reclaimed != 1 {
+		t.Fatalf("FIN后空闲回收失败: %+v", st)
 	}
 }
 
@@ -139,8 +137,8 @@ func TestFlowTableReclaimKeepsCounts(t *testing.T) {
 	checkFlowCounts(t, ft)
 
 	for i := 0; i < 3; i++ {
-		p := buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, uint16(40000+i), 443, 0x11)
-		ft.Slot(p, 4, nil) // FIN 回收
+		p := buildTCPWithFlags([4]byte{10, 0, 0, 2}, [4]byte{8, 8, 8, 8}, uint16(40000+i), 443, 0x14)
+		ft.Slot(p, 4, nil) // RST 回收
 	}
 	checkFlowCounts(t, ft)
 	if st := ft.Stats(); st.Size != 3 || st.Reclaimed != 3 {
