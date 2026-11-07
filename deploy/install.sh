@@ -106,8 +106,6 @@ grep -q '^tcp_bbr$' /etc/modules-load.d/bbr.conf 2>/dev/null || echo tcp_bbr > /
 reset_apt_sources() {
   local src=/etc/apt/sources.list
   local codename
-  # pipefail 下 grep 无匹配会让整个赋值失败并直接退出；24.04 起 apt 改用 deb822，
-  # sources.list 为空是常态，必须让下面的 VERSION_CODENAME 回退有机会执行。
   codename=$(grep -m1 -oP '(?<=^deb ).*? (?=main)' /etc/apt/sources.list 2>/dev/null | awk '{print $2}' || true)
   [[ "$codename" =~ ^[a-z]+$ ]] || codename=${VERSION_CODENAME:-}
   [[ "$codename" =~ ^[a-z]+$ ]] || die "认不出系统代号（codename），换源中止——请检查 /etc/apt/sources.list 或手动换源后重试"
@@ -178,7 +176,6 @@ if command -v apt-get >/dev/null; then
   strip_backports
 fi
 
-# 首次安装也用脚本内置公钥验签，禁止执行下载来的未验证校验器。
 release_base="https://github.com/antapp-cc/antapp-link/releases/latest/download"
 if [[ -n "$RELEASE_TAG" ]]; then
   release_base="https://github.com/antapp-cc/antapp-link/releases/download/$RELEASE_TAG"
@@ -270,8 +267,6 @@ if [[ "$online" -eq 0 ]]; then
 fi
 verified_version="$(verify_release "$stage" binary)" || die "程序校验失败，保留旧程序"
 chmod 0755 "$stage/antapp-linkd"
-# 不在 /tmp 里执行：挂 noexec 的加固主机会把合法发布包判成「不可执行」。
-# 先落到安装目录旁边的探测文件，验完即删；带 PID 是为了两个并发安装不互相覆盖。
 probe="$BIN.probe.$$"
 if ! install -m 0755 "$stage/antapp-linkd" "$probe"; then
   die "无法写入 $probe，检查 $BIN 所在目录权限"
@@ -307,7 +302,6 @@ command -v iptables >/dev/null || die "iptables 仍不可用"
 modprobe tun 2>/dev/null || true
 [[ -c /dev/net/tun ]] || die "/dev/net/tun 不可用 —— 这台机器不支持 TUN 设备（老式 OpenVZ 容器常见），换一台"
 
-# 与服务端自动更新共用锁，防止安装回退时另一个更新器又替换程序。
 command -v flock >/dev/null 2>&1 || die "缺少系统工具 flock，不能安全地与自动更新互斥"
 mkdir -p /run/antapp-link
 exec {install_lock}>/run/antapp-link/update.lock
@@ -324,7 +318,6 @@ state_files=("$CONF" "$CONF_DIR/sysctl-backup.txt"
   /etc/systemd/system/antapp-linkd.service /etc/systemd/system/antapp-link-up.service
   /etc/systemd/system/antapp-link-update.service /etc/systemd/system/antapp-link-update.timer
   /run/antapp-link/forward-range /run/antapp-link/forward-range.rules.json)
-# 先备份再注册事务；备份失败时尚未修改程序、配置或系统参数。
 for i in "${!state_files[@]}"; do
   file="${state_files[$i]}"
   if [[ -e "$file" || -L "$file" ]]; then cp -a -- "$file" "$stage/rollback/file-$i"; fi
@@ -333,8 +326,6 @@ sysctl_keys=(net.core.default_qdisc net.ipv4.tcp_congestion_control net.ipv4.ip_
   net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_rmem net.ipv4.tcp_wmem
   net.core.rmem_max net.core.wmem_max net.ipv4.tcp_mtu_probing net.ipv4.tcp_fastopen)
 for key in "${sysctl_keys[@]}"; do
-  # 读不到就留占位：回滚时把这行原样 sysctl -w 会失败（记 rollback_ok=0），
-  # 但至少不会因为在 trap 安装前静默退出而卡住整个安装。
   setting="$(sysctl -n "$key" 2>/dev/null || echo '(读取失败)')"
   printf '%s=%s\n' "$key" "$setting" >> "$stage/rollback/sysctl"
 done
@@ -349,9 +340,6 @@ rollback_install() {
   local result=$? restored=0 rollback_ok=1 core_ok=1 file i setting enabled
   trap - EXIT
   if [[ "$result" -ne 0 ]]; then
-    # 先停使用新配置的进程和定时器，再撤新规则、还原文件与旧程序。
-    # 停止旧进程/停用服务的失败不能阻断后续恢复：unit 可能压根没装上，
-    # 或本来就是 static，把 stop 失败算成回滚失败会让下面跳过重启、把链路留在 down。
     if [[ "$service_restart_attempted" -eq 1 ]]; then
       systemctl stop antapp-linkd || true
     fi
@@ -373,7 +361,6 @@ rollback_install() {
       if [[ -e "$stage/rollback/file-$i" || -L "$stage/rollback/file-$i" ]]; then
         if ! cp -a -- "$stage/rollback/file-$i" "$file.rollback" || ! mv -f -- "$file.rollback" "$file"; then
           log "错误: 无法恢复 $file"; rollback_ok=0
-          # 主配置（下标 0）没恢复，旧服务起来也是错的配置；其余辅助文件失败不阻止重启。
           [[ "$i" -eq 0 ]] && core_ok=0
         fi
       else
@@ -390,12 +377,9 @@ rollback_install() {
       rm -f -- "$BIN" || { rollback_ok=0; core_ok=0; }
     fi
     while IFS= read -r setting; do
-      # 读不到原值时写的是占位符，回滚不出来是已知的，不算回滚失败。
       [[ "$setting" == *"(读取失败)"* ]] && continue
-      sysctl -w "$setting" >/dev/null 2>&1 || true
+      sysctl -w "$setting" >/dev/null 2>&1 || rollback_ok=0
     done < "$stage/rollback/sysctl"
-    # 单元重载/自启状态失败不阻止旧服务重启：服务文件本身已经按备份还原，
-    # restart 读的是磁盘上的 unit。
     if [[ "$install_state_modified" -eq 1 ]]; then
       systemctl daemon-reload || true
       for i in "${!services[@]}"; do
@@ -406,7 +390,6 @@ rollback_install() {
         esac
       done
     fi
-    # 规则能重建就重建；up 失败只影响转发规则，不该阻止旧服务重启。
     if [[ "$netfilter_attempted" -eq 1 && "$restored" -eq 1 && -f "$stage/rollback/file-0" ]]; then
       "$BIN" up -c "$CONF" || log "警告: 重新应用 netfilter 失败，转发端口可能不可用"
     fi
@@ -419,8 +402,6 @@ rollback_install() {
         fi
       done
     fi
-    # 重启只看「程序 + 主配置是否恢复」，不跟 sysctl/辅助服务/规则的小失败绑定：
-    # 那些失败已经记进 rollback_ok 会打印，但把服务留在停机状态代价更大。
     if [[ "$service_restart_attempted" -eq 1 && "$was_active" -eq 1 && "$restored" -eq 1 && "$core_ok" -eq 1 ]]; then
       if ! systemctl restart antapp-linkd || ! wait_install_service; then
         log "警告: 旧服务未能稳定启动，请检查 journalctl -u antapp-linkd"
@@ -510,9 +491,6 @@ netfilter_attempted=1
 "$BIN" down -c "$CONF" >/dev/null 2>&1 || true
 "$BIN" up -c "$CONF"
 
-# Type=simple 的 restart 成功只表示进程已派生，连续检查同一进程且未自动重启。
-# NRestarts 只比较 restart 后的基线是否增长：不同 systemd 版本对它的清零行为不一致，
-# 要求绝对 0 会把健康的升级判成失败（update_linux.go 用的是同一套判据）。
 wait_install_service() {
   local pid="" current restarts base="" check
   for check in 1 2 3; do
@@ -521,7 +499,6 @@ wait_install_service() {
     current="$(systemctl show -p MainPID --value antapp-linkd)" || return 1
     restarts="$(systemctl show -p NRestarts --value antapp-linkd)" || return 1
     [[ "$current" =~ ^[1-9][0-9]*$ ]] || return 1
-    # 读不到/非数字时按失败处理（fail-closed），别让空输出把比较变成恒真。
     [[ "$restarts" =~ ^[0-9]+$ ]] || return 1
     [[ -n "$base" ]] || base="$restarts"
     [[ "$restarts" == "$base" ]] || return 1
@@ -538,7 +515,6 @@ wait_install_service || die "隧道服务未稳定启动，执行回退"
 log "当前状态"
 "$BIN" status -c "$CONF" || true
 
-# 关键初始化和服务启动成功后才结束回滚窗口。
 trap 'rm -f -- "$BIN.probe.$$"; rm -rf -- "$stage"' EXIT
 
 wan_iface="$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')" || true

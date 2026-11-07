@@ -103,7 +103,7 @@ fetch_release_file "$1" https://example.invalid/file
         helper = ""
         if "wait_install_service() {" in SOURCE:
             helper = "wait_install_service() {" + SOURCE.split("wait_install_service() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
-        for scenario, expected in (("inactive", False), ("crashing", False), ("changing_pid", False), ("unreadable", False), ("stable", True)):
+        for scenario, expected in (("inactive", False), ("crashing", False), ("changing_pid", False), ("unreadable", False), ("restarted", True), ("stable", True)):
             with self.subTest(scenario=scenario):
                 script = r'''set -e
 log(){ :; }
@@ -124,7 +124,13 @@ systemctl(){
             [[ ! -f "$COUNTER" ]] || n=$(cat "$COUNTER")
             echo "$((n+1))" > "$COUNTER"; echo "$((100+n))"
           else echo 101; fi ;;
-        NRestarts) if [[ "$SCENARIO" == crashing ]]; then echo 1; else echo 0; fi ;;
+        NRestarts)
+          if [[ "$SCENARIO" == crashing ]]; then
+            local n=0
+            [[ ! -f "$COUNTER.nr" ]] || n=$(cat "$COUNTER.nr")
+            n=$((n+1)); echo "$n" > "$COUNTER.nr"; echo "$n"
+          elif [[ "$SCENARIO" == restarted ]]; then echo 3
+          else echo 0; fi ;;
       esac ;;
   esac
 }
@@ -243,7 +249,9 @@ sysctl(){ if [[ "$1" == -n ]]; then echo 1; else printf 'sysctl:%s\n' "$*" >> "$
 
     def test_failed_sysctl_restore_keeps_recovery_data(self):
         calls, _ = self.rollback_case(sysctl_failure=True)
-        self.assertNotIn("systemctl:restart antapp-linkd\n", calls)
+        # sysctl 恢复失败只说明调优参数没写回去，不影响旧程序功能；资料保留，
+        # 但仍要重启旧程序恢复业务，否则服务会一直停着。
+        self.assertIn("systemctl:restart antapp-linkd\n", calls)
     def test_fresh_install_failure_removes_only_created_config(self):
         self.rollback_case(had_old=False, active=False, existed=False, derived=True)
 
