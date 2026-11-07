@@ -79,7 +79,10 @@ type Invite struct {
 }
 
 // UseUDP 表示这条连接码要求走 UDP 数据通道。
-func (i Invite) UseUDP() bool { return i.Mode == ModeUDP }
+func (i Invite) UseUDP() bool {
+	mode, err := ParseMode(string(i.Mode))
+	return err == nil && mode == ModeUDP
+}
 
 // Issue 用现有 CA 给 name 签一张客户端证书，并组装出连接码。
 func Issue(dir, name, server string, tp TunnelParams) (Invite, error) {
@@ -135,7 +138,12 @@ func validateServerAddr(server string) error {
 	return nil
 }
 
-func (inv Invite) Validate() error {
+func (inv *Invite) Validate() error {
+	mode, err := ParseMode(string(inv.Mode))
+	if err != nil {
+		return err
+	}
+	inv.Mode = mode
 	if err := validateServerAddr(inv.Server); err != nil {
 		return err
 	}
