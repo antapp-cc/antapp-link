@@ -527,10 +527,20 @@ func defaultAdapter(s Snapshot) (adapterInfo, bool) {
 // 此时隧道多半已经拆掉（断开先关适配器），/1 路由和隧道地址会随适配器一起
 // 消失；这里只负责还 DNS、撤 NRPT、扫掉国内分流和绕行路由的残留。
 func (s Snapshot) Restore(cfg NetConfig) error {
+	return restoreSnapshots(s, cfg, restoreSnapshot)
+}
+
+func restoreSnapshot(s Snapshot, cfg NetConfig) error {
 	var errs []error
 	fail := func(err error) {
 		if err != nil {
 			errs = append(errs, err)
+		}
+	}
+
+	for _, own := range s.SplitLedgers {
+		if _, err := sweepOwnedSplitRoutes(own); err != nil {
+			fail(fmt.Errorf("清理迁移遗留分流: %w", err))
 		}
 	}
 

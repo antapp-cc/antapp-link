@@ -37,7 +37,10 @@ type App struct {
 	running       bool
 	connecting    bool
 	disconnecting bool
-	lastError     string
+	shuttingDown  bool
+	// rebuilding 只授权该源隧道完成一次自动重建，手动连接/断开会撤销它。
+	rebuilding *Tunnel
+	lastError  string
 
 	// connectCtx/connectCancel 是本次连接尝试的上下文，CancelConnect 取消它。
 	// 只覆盖到「接管网络之前」：一旦开始改路由就必须走完，否则会留下半接管状态。
@@ -69,6 +72,7 @@ type App struct {
 
 // pendingRestoreState 是一次没做完的网络还原。
 type pendingRestoreState struct {
+	reload   bool
 	snap     Snapshot
 	cfg      NetConfig
 	noNetCfg bool
@@ -168,7 +172,25 @@ func (a *App) HealIfNeeded() error {
 
 	snap, exists, err := LoadSnapshot(a.statePath)
 	if !exists {
-		return nil
+		if err == nil {
+			return nil
+		}
+		// 文件存在但读不到（被占用/ACL/IO 错误）：网络可能还被接管着，不能当没事发生。
+		// 与下面的"文件损坏"分支一样先做保守还原，再挡住新连接等用户确认；否则用户
+		// 只能手动删 state.json 才能再连。
+		a.log.Warn("状态文件无法读取，做一次保守还原", "err", err)
+		cfg := BuildNetConfig(inv)
+		restoreErr := restoreSnapshotFn(Snapshot{}, cfg)
+		a.mu.Lock()
+		// reload 留着：用户点断开重试时先从磁盘重读，文件恢复可读就按真实现场还原。
+		a.pendingRestore = &pendingRestoreState{snap: Snapshot{}, cfg: cfg, noNetCfg: a.noNetCfg, reload: true}
+		if restoreErr != nil {
+			a.lastError = "状态文件无法读取，保守还原未完成: " + restoreErr.Error()
+		} else {
+			a.lastError = "状态文件无法读取，DNS 可能没有恢复正确，请断开重试一次"
+		}
+		a.mu.Unlock()
+		return fmt.Errorf("读取网络恢复状态失败（已做保守还原）: %w", err)
 	}
 
 	// inv 在这里多半是零值：自愈跑在界面选中连接码之前（App 以「未配置」状态启动）。
@@ -180,7 +202,7 @@ func (a *App) HealIfNeeded() error {
 		// 快照本身坏了，DNS 原值已无从得知。至少把接管路由和隧道地址撤掉，
 		// 否则用户会一直卡在「所有流量都进了一条没人读的网卡」。
 		a.log.Warn("状态文件损坏，做一次保守还原（DNS 可能需要手动确认）", "err", err)
-		restoreErr := Snapshot{}.Restore(cfg)
+		restoreErr := restoreSnapshotFn(Snapshot{}, cfg)
 		_ = RemoveSnapshot(a.statePath)
 		// 保守还原不保证 DNS 恢复正确，所以仍然要挡住新连接：让用户先重试一次
 		// 断开（会走 restoreNetwork），而不是让 Connect 把半接管现场存成新快照。
@@ -196,7 +218,7 @@ func (a *App) HealIfNeeded() error {
 	}
 
 	a.log.Info("发现上次残留的网络配置，先还原", "captured_at", snap.CapturedAt)
-	if err := snap.Restore(cfg); err != nil {
+	if err := restoreSnapshotFn(snap, cfg); err != nil {
 		// 启动自愈失败同样必须设门禁：不设的话用户随后点连接，Capture 会把当前这个
 		// 「半接管」现场当成新快照存下来，把磁盘上正确的恢复信息覆盖掉 —— 之后
 		// 再自愈也还原不回去了。运行时的 Disconnect 失败已有同样的门禁，这里补齐。
@@ -217,9 +239,19 @@ func (a *App) HealIfNeeded() error {
 // 这里刻意只把「检查状态 / 置标志 / 拷贝出需要的字段」放在锁里，真正的连接过程
 // （探测服务端、抓网络现场、改路由）全在锁外做。早先整段都持锁，而界面每秒都会
 // 调 Status() 抢同一把锁 —— 结果点几下按钮界面就「未响应」。
-func (a *App) Connect() error {
+func (a *App) Connect() error { return a.connect(nil) }
+
+func (a *App) connect(source *Tunnel) error {
 	a.mu.Lock()
+	if source != nil && a.rebuilding != source {
+		a.mu.Unlock()
+		return nil
+	}
+	a.rebuilding = nil
 	switch {
+	case a.shuttingDown:
+		a.mu.Unlock()
+		return errors.New("正在退出程序，请稍候")
 	case a.updating:
 		// 旧版已经把单实例锁让给新版（或马上要让），这时再接管网络就可能两个进程
 		// 并发改 DNS/路由。等更新失败恢复所有权后才会放行。
@@ -261,12 +293,23 @@ func (a *App) Connect() error {
 	if err != nil && !errors.Is(err, errConnectCanceled) {
 		a.lastError = err.Error()
 	}
+	rebuild := a.rebuilding
+	if rebuild != nil && a.tunnel != rebuild {
+		rebuild = nil
+	}
 	a.mu.Unlock()
 	cancel()
+	if rebuild != nil {
+		go rebuild.RebuildDevice()
+	}
 	return err
 }
 
 // errConnectCanceled 表示这次连接尝试被用户主动取消。调用方据此把它与真正的故障区分开。
+// restoreSnapshotFn 是网络还原的注入点：真实实现会改 DNS 和路由，单测必须替换成
+// no-op，否则会动到跑测试的这台机器。
+var restoreSnapshotFn = func(s Snapshot, cfg NetConfig) error { return s.Restore(cfg) }
+
 var errConnectCanceled = errors.New("连接已取消")
 
 // CancelConnect 中断正在进行的连接尝试。
@@ -275,6 +318,7 @@ var errConnectCanceled = errors.New("连接已取消")
 // 就不再理会取消 —— 半接管状态比让用户多等几秒糟得多。
 func (a *App) CancelConnect() {
 	a.mu.Lock()
+	a.rebuilding = nil
 	cancel := a.connectCancel
 	a.mu.Unlock()
 	if cancel != nil {
@@ -365,7 +409,7 @@ func (a *App) connectSlow(inv pki.Invite, noNetCfg bool, statePath string) error
 	a.connectCancelable = false
 	a.mu.Unlock()
 	if err := a.takeOver(&snap, cfg, statePath,
-		(*Snapshot).Apply, SaveSnapshot, Snapshot.Restore); err != nil {
+		(*Snapshot).Apply, SaveSnapshot, restoreSnapshotFn); err != nil {
 		_ = dev.Close()
 		return err
 	}
@@ -435,12 +479,7 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 	// 适配器被外力干掉时，重拨 TCP 救不了，要走一次完整的断开+连接
 	// （重开设备、重新接管网络）。它是异步的：先 Disconnect 掉本循环，
 	// 再走一遍 connectSlow 的全流程。
-	tunnel.RebuildDevice = func() {
-		go func() {
-			a.Disconnect()
-			_ = a.Connect()
-		}()
-	}
+	tunnel.RebuildDevice = func() { a.rebuildTunnel(ctx, tunnel) }
 
 	a.mu.Lock()
 	a.cfg = cfg
@@ -510,14 +549,15 @@ func (a *App) startTunnel(cfg NetConfig, dev Device, inv pki.Invite, snap *Snaps
 // 返回 error 是给 watcher 用的：落盘失败时它不能把这次迁移当成已提交（否则下次出口
 // 变化就永远不会重试，磁盘上永远留着旧现场）。
 func (a *App) updateSnapshot(s Snapshot) error {
-	a.mu.Lock()
-	a.snapshot = s
-	a.mu.Unlock()
-
+	// 先落盘再改内存：写盘失败时迁移会中止，内存里不能留着这份「新出口恢复超集」，
+	// 否则下一次 Disconnect 会按一份从未接管过的现场做多余还原。
 	if err := SaveSnapshot(a.statePath, s); err != nil {
 		a.log.Error("迁移后的网络快照写盘失败，崩溃恢复可能用到旧现场", "err", err)
 		return err
 	}
+	a.mu.Lock()
+	a.snapshot = s
+	a.mu.Unlock()
 	// 迁移提交也是「网络状态变了」：热重铺可能正拿着旧出口排队，代际不前进
 	// 它就发现不了手里的现场已经过期，会把分流铺到已经换掉的网卡上。
 	netEpoch.Add(1)
@@ -574,7 +614,7 @@ func (a *App) hotApplyRouteTable() {
 	if afterHotSnapshot != nil {
 		afterHotSnapshot()
 	}
-	if !running || snap.DefaultGateway == "" || snap.DefaultIfIndex == 0 ||
+	if !running || len(snap.Pending) > 0 || len(snap.SplitLedgers) > 0 || snap.DefaultGateway == "" || snap.DefaultIfIndex == 0 ||
 		refreshSplitRoutesHook == nil {
 		return
 	}
@@ -1055,6 +1095,36 @@ func tunnelPortOf(inv pki.Invite) string {
 	return port
 }
 
+var errRebuildSuperseded = errors.New("设备重建已被后续操作取代")
+
+// rebuildTunnel 只重建仍归自己所有的隧道；失败或被手动操作取代后不再接管网络。
+func (a *App) rebuildTunnel(ctx context.Context, source *Tunnel) {
+	a.mu.Lock()
+	if ctx.Err() != nil || a.tunnel != source || !a.running || a.updating || a.shuttingDown {
+		a.mu.Unlock()
+		return
+	}
+	// 设备可在 startTunnel 登记后、Connect 收尾前失效，交给收尾处重试一次。
+	if a.connecting {
+		a.rebuilding = source
+		a.mu.Unlock()
+		return
+	}
+	a.mu.Unlock()
+	if err := a.disconnect(source); err != nil {
+		if errors.Is(err, errRebuildSuperseded) {
+			return
+		}
+		a.mu.Lock()
+		if a.rebuilding == source {
+			a.rebuilding = nil
+		}
+		a.mu.Unlock()
+		return
+	}
+	_ = a.connect(source)
+}
+
 // Disconnect 停隧道并把网络还原回去。幂等：没连上时直接返回。
 //
 // 跟 Connect 互斥：连接进行中点断开会被拒绝 —— 旧版这里存在竞态，断开的还原
@@ -1062,8 +1132,16 @@ func tunnelPortOf(inv pki.Invite) string {
 //
 // 先把内部状态清干净（界面立刻就能显示「未连接」），再在锁外慢慢还原。
 // 整段持锁的话，还原路由那几秒界面是死的。
-func (a *App) Disconnect() error {
+func (a *App) Disconnect() error { return a.disconnect(nil) }
+
+func (a *App) disconnect(source *Tunnel) error {
 	a.mu.Lock()
+	if source != nil && (a.tunnel != source || !a.running || a.connecting || a.disconnecting || a.updating || a.shuttingDown) {
+		a.mu.Unlock()
+		return errRebuildSuperseded
+	}
+	// 与下面摘除设备同一次持锁，避免检查后误断开新设备。
+	a.rebuilding = source
 	switch {
 	case a.connecting:
 		a.mu.Unlock()
@@ -1169,6 +1247,30 @@ func (a *App) Disconnect() error {
 // 网卡上的残留，再还原主快照。两件都完成才删状态文件 —— 只还原主快照就删的话，
 // 那张网卡上的隧道 DNS 还留在系统里，而 App 已经不再记得它。
 func (a *App) restorePending(p *pendingRestoreState) error {
+	if p.reload {
+		snap, exists, err := LoadSnapshot(a.statePath)
+		if err != nil {
+			if exists {
+				return fmt.Errorf("重新读取网络恢复状态失败: %w", err)
+			}
+			// 文件存在但读不到：现场已经不可用，但网络可能还被接管着。做一次保守还原
+			// 给用户一条出路，否则他会永远卡在「请再点一次断开连接」。
+			cfg := BuildNetConfig(a.inv)
+			if restoreErr := a.restoreNetwork(Snapshot{}, cfg, a.noNetCfg); restoreErr != nil {
+				return fmt.Errorf("无法读取恢复状态，保守还原失败: %w", restoreErr)
+			}
+			// 现场已经保守还原过，文件本身读不到也没有保留价值；删掉（必要时改名隔离），
+			// 否则下次启动会再命中同一个门禁，Connect 也可能把半接管现场当成新基线。
+			if !a.noNetCfg {
+				QuarantineSnapshot(a.statePath)
+			}
+			return nil
+		}
+		if !exists {
+			return nil
+		}
+		p.snap, p.cfg, p.noNetCfg, p.reload = snap, BuildNetConfig(a.inv), a.noNetCfg, false
+	}
 	var revertErr error
 	if p.watch != nil {
 		_, revertErr = revertPendingFn(p.watch)
@@ -1214,7 +1316,7 @@ func (a *App) restoreNetwork(snap Snapshot, cfg NetConfig, noNetCfg bool) error 
 	defer netTxnMu.Unlock()
 	netEpoch.Add(1)
 
-	if err := snap.Restore(cfg); err != nil {
+	if err := restoreSnapshotFn(snap, cfg); err != nil {
 		// 留着 state.json：下次启动自愈还会再试一次
 		return fmt.Errorf("还原网络配置失败: %w", err)
 	}
@@ -1243,6 +1345,10 @@ const shutdownWait = 45 * time.Second
 // 直接返回 nil，而调用方（托盘退出）拿到返回就会关窗口退进程，于是网络停在半接管
 // 状态，用户整机断网直到下次启动。退出这条路上，网络优先于速度。
 func (a *App) Shutdown() error {
+	a.mu.Lock()
+	a.shuttingDown = true
+	a.rebuilding = nil
+	a.mu.Unlock()
 	deadline := time.Now().Add(shutdownWait)
 	for time.Now().Before(deadline) {
 		a.mu.Lock()
@@ -1361,13 +1467,17 @@ func (a *App) watchRunStats(ctx context.Context, tun *Tunnel) {
 			// 两者差距会缩小 —— 丢弃量看 drop_mb，别拿两个总数硬减。UDP 模式下它是
 			// 密文长度，口径又不一样。
 			cur, peak := tun.SlotDepthReport()
+			pendingBytes, queueDrops := tun.SlotPendingReport()
 			flowSize, flowMax := 0, 0
-			var flowFallbacks, flowReclaimed uint64
+			var flowFallbacks, flowReclaimed, flowOverflowDeadSelections uint64
+			var flowOverflowed bool
+			var flowFallbackSize int
 			flowTCP, flowUDP, flowOther := 0, 0, 0
 			if ft := tun.FlowSnapshot(); ft != nil {
 				st := ft.Stats()
 				flowSize, flowMax, flowFallbacks, flowReclaimed = st.Size, st.Max, st.Fallbacks, st.Reclaimed
 				flowTCP, flowUDP, flowOther = st.TCPCount, st.UDPCount, st.OtherCount
+				flowFallbackSize, flowOverflowed, flowOverflowDeadSelections = st.FallbackSize, st.Overflowed, st.OverflowDeadSelections
 			}
 			a.log.Info("运行状态",
 				"goroutines", runtime.NumGoroutine(),
@@ -1382,6 +1492,8 @@ func (a *App) watchRunStats(ctx context.Context, tun *Tunnel) {
 				"rtt_ms", tun.Stats.RTT().Milliseconds(),
 				"slot_depth", fmt.Sprint(cur),
 				"slot_peak", fmt.Sprint(peak),
+				"slot_pending_bytes", fmt.Sprint(pendingBytes),
+				"slot_queue_drops", fmt.Sprint(queueDrops),
 				// 每槽距上次收到帧的秒数（-1=还没收到过）。故障后翻这行：某条槽的
 				// 静默时长一路涨到几百秒，就说明那条成员连接的下行早就死了。
 				"slot_silence", fmt.Sprint(tun.SlotSilenceReport()),
@@ -1390,21 +1502,26 @@ func (a *App) watchRunStats(ctx context.Context, tun *Tunnel) {
 				"flow_udp", flowUDP,
 				"flow_other", flowOther,
 				"flow_fallback", flowFallbacks,
+				"flow_fallback_size", flowFallbackSize,
+				"flow_overflowed", flowOverflowed,
+				"flow_overflow_dead_selections", flowOverflowDeadSelections,
 				"flow_reclaim", flowReclaimed)
 
-			// 四个分类只进 Debug：Pi 节点有 80 多个 peer，上行常态就是满的，
+			// 分类丢弃计数只进 Debug：Pi 节点有 80 多个 peer，上行常态就是满的，
 			// 这行会一直显示「槽队列=几万」—— 用户看不懂，也改变不了什么
 			// （需求本来就超过管道容量）。真要排障时开 Debug 就能看到。
 			dPkt := tun.Drops.PktChFull.Load()
 			dEmpty := tun.Drops.EmptySlot.Load()
 			dQueue := tun.Drops.SlotQueueFull.Load()
 			dMember := tun.Drops.MemberDrop.Load()
-			if dPkt > 0 || dEmpty > 0 || dQueue > 0 || dMember > 0 || tun.Drops.UplinkBytes.Load() > 0 {
+			dStale := tun.Drops.StaleBatch.Load()
+			if dPkt > 0 || dEmpty > 0 || dQueue > 0 || dMember > 0 || dStale > 0 || tun.Drops.UplinkBytes.Load() > 0 {
 				a.log.Debug("丢包统计",
 					"drop_pktch", dPkt,
 					"drop_empty", dEmpty,
 					"drop_queue", dQueue,
 					"drop_member", dMember,
+					"drop_stale", dStale,
 					"drop_mb", tun.Drops.UplinkBytes.Load()/1024/1024)
 			}
 		}

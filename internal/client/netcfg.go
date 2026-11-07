@@ -124,10 +124,12 @@ func pickAdapter(ref adapterRef, keys []adapterKey) (int, bool) {
 
 // Snapshot 是接管网络之前的现场。它必须能完整还原 —— 还原不了就是把用户搞断网。
 type Snapshot struct {
-	DefaultGateway string     `json:"default_gateway"`
-	DefaultIfIndex int        `json:"default_if_index"`
-	Interfaces     []IfaceDNS `json:"interfaces"`
-	CapturedAt     string     `json:"captured_at"`
+	Pending        []Snapshot        `json:"pending_recovery,omitempty"`
+	SplitLedgers   []*splitOwnership `json:"pending_split_ledgers,omitempty"`
+	DefaultGateway string            `json:"default_gateway"`
+	DefaultIfIndex int               `json:"default_if_index"`
+	Interfaces     []IfaceDNS        `json:"interfaces"`
+	CapturedAt     string            `json:"captured_at"`
 
 	// ServerNextHop 是到达云服所用的下一跳。
 	//
@@ -148,6 +150,21 @@ type Snapshot struct {
 	// Split 记录本次实际铺上的国内分流路由。旧快照没有它（nil），还原时只能
 	// 退回「下一跳 + metric」的形态扫描（会碰到同形态的用户路由）。
 	Split *splitOwnership `json:"split_routes,omitempty"`
+}
+
+// restoreSnapshots 按旧现场到当前现场恢复；任何一份失败都保留完整磁盘账本供幂等重试。
+func restoreSnapshots(s Snapshot, cfg NetConfig, restore func(Snapshot, NetConfig) error) error {
+	var errs []error
+	for _, old := range s.Pending {
+		if err := restoreSnapshots(old, cfg, restore); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	s.Pending = nil
+	if err := restore(s, cfg); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // NetConfig 是接管网络需要的参数。
@@ -687,8 +704,19 @@ func SaveSnapshot(path string, snap Snapshot) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(raw, '\n'), 0o600); err != nil {
+	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
+	}
+	if _, err = file.Write(append(raw, byte(10))); err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
 	}
 	return os.Rename(tmp, path)
 }
@@ -715,6 +743,15 @@ func RemoveSnapshot(path string) error {
 		return err
 	}
 	return nil
+}
+
+// QuarantineSnapshot 清掉一份不可读/已保守还原的状态文件。删不掉（权限/占用）就
+// 改名隔离：否则下次启动会再次命中同一个门禁，Connect 也可能把半接管现场当新基线。
+func QuarantineSnapshot(path string) {
+	if err := RemoveSnapshot(path); err == nil {
+		return
+	}
+	_ = os.Rename(path, path+".corrupt")
 }
 
 // newSnapshot 组装快照。

@@ -26,11 +26,18 @@ var (
 // 迁移路径上的系统入口。单测要构造「旧网卡清理失败」「新出口上已有同形状
 // 的用户路由」这两类真机上很难复现的场景，只能替换这些调用。
 var (
-	bestRouteToFn     = bestRouteTo
-	setAdapterDNSFn   = setAdapterDNS
-	sweepOwnedSplitFn = sweepOwnedSplitRoutes
-	addSplitRouteFn   = func(l winipcfg.LUID, dest netip.Prefix, gw netip.Addr) error {
+	existingSplitRoutesFn = existingSplitRoutes
+	bestRouteToFn         = bestRouteTo
+	setAdapterDNSFn       = setAdapterDNS
+	sweepOwnedSplitFn     = sweepOwnedSplitRoutes
+	addSplitRouteFn       = func(l winipcfg.LUID, dest netip.Prefix, gw netip.Addr) error {
 		return l.AddRoute(dest, gw, splitRouteMetric)
+	}
+	// 迁移失败后恢复旧云服绕行用。单测里网卡 GUID 是假的，defaultAdapter 查不到
+	// 真实网卡，只能替换成桩。
+	defaultAdapterFn = defaultAdapter
+	addServerRouteFn = func(l winipcfg.LUID, dest netip.Prefix, gw netip.Addr) error {
+		return l.AddRoute(dest, gw, 1)
 	}
 )
 
@@ -40,7 +47,7 @@ func init() {
 	revertPendingFn = func(w *sessionWatcher) (Snapshot, error) {
 		err := w.revertPending()
 		if w.pending != nil {
-			return w.pending.snap, err
+			return w.pending.recoverySnapshot(), err
 		}
 		return Snapshot{}, err
 	}
@@ -84,6 +91,15 @@ type pendingMigration struct {
 	// 产生的实时账本可能指向另一张网卡或另一个网关，必须单独记 —— 硬并进 old
 	// 会让失败的那一份在重试时被跳过，残留路由从此没有记录可查。
 	oldLedgers []*splitOwnership
+}
+
+func (p *pendingMigration) recoverySnapshot() Snapshot {
+	s := p.snap
+	if p.old != nil {
+		s.Pending = append(append([]Snapshot(nil), s.Pending...), *p.old)
+	}
+	s.SplitLedgers = append(append([]*splitOwnership(nil), s.SplitLedgers...), p.oldLedgers...)
+	return s
 }
 
 type sessionWatcher struct {
@@ -258,7 +274,7 @@ func (w *sessionWatcher) reconcile() {
 	if watcherDebug {
 		logf("对账：出口 %s（if %d），上次 %s（if %d）", gw, ifIndex, w.lastGw, w.lastIdx)
 	}
-	if ifIndex == w.lastIdx && gw.Unmap() == w.lastGw {
+	if w.pending == nil && ifIndex == w.lastIdx && gw.Unmap() == w.lastGw {
 		return // 出口没变
 	}
 
@@ -412,19 +428,47 @@ func (w *sessionWatcher) reconcile() {
 	hop, _, err := bestRouteToFn(w.srv, tunLUID)
 	if err != nil {
 		// 算不出来就把旧绕行原样装回去，别停在「旧绕行已删、新绕行没建」的状态
-		if oldSnap.ServerNextHop != "" && w.srv.IsValid() {
-			if a, ok := defaultAdapter(oldSnap); ok {
-				if oh, e := netip.ParseAddr(oldSnap.ServerNextHop); e == nil {
-					_ = a.LUID.AddRoute(netip.PrefixFrom(w.srv, 32), oh, 1)
-				}
-			}
+		if rerr := restoreOldServerRoute(oldSnap, w.srv); rerr != nil {
+			logf("迁移中止：算不出到云服 %s 的下一跳: %v（旧绕行未恢复: %v）", w.srv, err, rerr)
+		} else {
+			logf("迁移中止：算不出到云服 %s 的下一跳: %v（旧绕行已恢复）", w.srv, err)
 		}
-		logf("迁移中止：算不出到云服 %s 的下一跳: %v（旧绕行已恢复）", w.srv, err)
 		return
 	}
 	serverNextHop := ""
 	if !hop.IsUnspecified() && hop.Unmap() != w.srv {
 		serverNextHop = hop.Unmap().String()
+	}
+
+	// 新出口改写前预写完整恢复超集，写盘失败时不改新出口。
+	table := ActiveCNRoutes()
+	existing, err := existingSplitRoutesFn(newDef.key(), gw)
+	if err != nil {
+		// 旧绕行已经在 cleanOldExit 里撤掉了；这里失败必须原样装回去，
+		// 否则去云服的包会落进已经断掉的隧道。
+		if rerr := restoreOldServerRoute(oldSnap, w.srv); rerr != nil {
+			logf("迁移中止：读取新出口路由失败: %v（旧绕行未恢复: %v）", err, rerr)
+		} else {
+			logf("迁移中止：读取新出口路由失败: %v（旧绕行已恢复）", err)
+		}
+		return
+	}
+	snap := newSnapshot(gw.Unmap().String(), int(ifIndex), serverNextHop, w.srv.String(), []IfaceDNS{newIface}, w.cfg)
+	snap.Split = splitLedgerToPersist(newDef.key(), gw, nil, table, existing)
+	pending := &pendingMigration{snap: snap, old: &oldSnap, oldLedgers: withoutLedger(cleanupLeftover, oldSnap.Split)}
+	if live := currentLiveSplitOwnership(); live != nil && live != oldSnap.Split {
+		pending.oldLedgers = append(pending.oldLedgers, live)
+	}
+	if w.update != nil {
+		if err := w.update(pending.recoverySnapshot()); err != nil {
+			// 旧绕行已经在 cleanOldExit 里撤掉了，这里失败同样要装回去。
+			if rerr := restoreOldServerRoute(oldSnap, w.srv); rerr != nil {
+				logf("迁移中止：恢复现场预写失败: %v（旧绕行未恢复: %v）", err, rerr)
+			} else {
+				logf("迁移中止：恢复现场预写失败: %v（旧绕行已恢复）", err)
+			}
+			return
+		}
 	}
 
 	// 4) 新网卡接管：DNS、绕行、国内分流、动态 MTU
@@ -456,7 +500,7 @@ func (w *sessionWatcher) reconcile() {
 	if live := currentLiveSplitOwnership(); live != nil && live != oldSnap.Split {
 		previous = append(previous, live)
 	}
-	installed, failed := installSplitRoutes(ActiveCNRoutes(), func(p netip.Prefix) error {
+	installed, failed := installSplitRoutes(table, func(p netip.Prefix) error {
 		return addSplitRouteFn(newDef.LUID, p, gw)
 	}, newDef.key(), gw, previous)
 
@@ -465,8 +509,6 @@ func (w *sessionWatcher) reconcile() {
 	// 只有「旧出口清干净 + 关键配置都写上 + 快照落盘成功」才算提交。任一条件
 	// 不满足就保留待提交状态（pending），下一轮事件会重试同一份现场 —— 重试只
 	// 补写盘/补配置/补清理，不会重新读网卡 DNS（那已经被我们改过了）。
-	snap := newSnapshot(gw.Unmap().String(), int(ifIndex), serverNextHop,
-		w.srv.String(), []IfaceDNS{newIface}, w.cfg)
 	snap.Split = newSplitOwnership(newDef.key(), gw, installed)
 	setLiveSplitOwnership(snap.Split)
 	if !dnsApplied || !routeApplied || len(cleanupErrs) > 0 {
@@ -484,7 +526,7 @@ func (w *sessionWatcher) reconcile() {
 		// 否则进程在这里被结束，下次启动只能按旧快照自愈，新出口上的 DNS 和
 		// 路由就再没有记录可查（复审第 2 项）。
 		if w.update != nil {
-			if uerr := w.update(snap); uerr != nil {
+			if uerr := w.update(p.recoverySnapshot()); uerr != nil {
 				logf("迁移待办现场写盘失败（保留待办，下次重试）: %v", uerr)
 			}
 		}
@@ -513,6 +555,27 @@ func (w *sessionWatcher) reconcile() {
 	}
 	logf("网络出口变化，已迁移到 %s（网关 %s）%s",
 		newDef.Name, gw, migrationNote(failed))
+}
+
+// restoreOldServerRoute 把旧出口到云服的 /32 绕行装回去。返回失败原因：
+// 「旧绕行已恢复」是日志承诺，不能吞掉错误。
+func restoreOldServerRoute(oldSnap Snapshot, srv netip.Addr) error {
+	if oldSnap.ServerNextHop == "" || !srv.IsValid() {
+		return errors.New("旧快照没有可用的云服下一跳")
+	}
+	a, ok := defaultAdapterFn(oldSnap)
+	if !ok {
+		return errors.New("找不到旧出口网卡")
+	}
+	oh, err := netip.ParseAddr(oldSnap.ServerNextHop)
+	if err != nil {
+		return fmt.Errorf("旧下一跳地址无效: %w", err)
+	}
+	err = addServerRouteFn(a.LUID, netip.PrefixFrom(srv, 32), oh)
+	if err != nil && !errors.Is(err, windows.ERROR_OBJECT_ALREADY_EXISTS) {
+		return fmt.Errorf("恢复旧云服绕行: %w", err)
+	}
+	return nil
 }
 
 // cleanOldExit 把旧出口上的接管痕迹清掉，返回每一处没做成的清理和没清掉的账本。

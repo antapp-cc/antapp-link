@@ -6,7 +6,25 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 )
+
+func TestNextReconnectDelayCapsAtFiveMinutes(t *testing.T) {
+	cases := []struct {
+		current time.Duration
+		want    time.Duration
+	}{
+		{30 * time.Second, time.Minute},
+		{2 * time.Minute, 4 * time.Minute},
+		{4 * time.Minute, 5 * time.Minute},
+		{5 * time.Minute, 5 * time.Minute},
+	}
+	for _, tc := range cases {
+		if got := nextReconnectDelay(tc.current); got != tc.want {
+			t.Errorf("nextReconnectDelay(%v) = %v, want %v", tc.current, got, tc.want)
+		}
+	}
+}
 
 // 打开目录会真的弹一个资源管理器窗口，所以默认跳过。
 // 需要人工确认时：$env:ANTAPP_TEST_OPEN='1'; go test ./internal/client/ -run OpenInExplorer -v

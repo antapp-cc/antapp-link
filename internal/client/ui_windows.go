@@ -987,8 +987,8 @@ func (u *UI) keepConnected() {
 			// 上一次连接或断开还没结束，等它收尾，本轮不动退避。
 		case stepRecover:
 			// 上次断开没把网络还原干净：Connect 会被拒绝，只能重试 Disconnect。
-			if lastFailed && delay < 5*time.Minute {
-				delay *= 2
+			if lastFailed {
+				delay = nextReconnectDelay(delay)
 			}
 			u.app.Log().Warn(fmt.Sprintf("网络配置待恢复，%d 秒后重试还原", int(delay.Seconds())))
 			if err := u.app.Disconnect(); err != nil {
@@ -996,8 +996,8 @@ func (u *UI) keepConnected() {
 			}
 			lastFailed = true
 		case stepConnect:
-			if lastFailed && delay < 5*time.Minute {
-				delay *= 2
+			if lastFailed {
+				delay = nextReconnectDelay(delay)
 			}
 			u.app.Log().Info(fmt.Sprintf("隧道不在线，%d 秒后自动重连 %s",
 				int(delay.Seconds()), u.app.CurrentSource()))
@@ -1005,6 +1005,19 @@ func (u *UI) keepConnected() {
 			lastFailed = true // 下一轮若已 Online 会清零，否则继续退避
 		}
 	}
+}
+
+// nextReconnectDelay 把退避翻倍并钳在 5 分钟。非正值（零值或异常调用）退回 30 秒，
+// 避免一直传 0 永远不等待。
+func nextReconnectDelay(current time.Duration) time.Duration {
+	if current <= 0 {
+		return 30 * time.Second
+	}
+	next := current * 2
+	if next > 5*time.Minute {
+		return 5 * time.Minute
+	}
+	return next
 }
 
 // reconnectStep 是自动守护在某一轮该做什么。

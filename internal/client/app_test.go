@@ -150,8 +150,12 @@ func TestWatchHealthLoopRebuildsAfterConsecutiveFailures(t *testing.T) {
 
 	app := healthTestApp(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go app.watchHealthLoop(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		app.watchHealthLoop(ctx)
+	}()
+	defer func() { cancel(); <-done }()
 
 	select {
 	case <-rebuilt:
@@ -186,8 +190,12 @@ func TestWatchHealthLoopRecoversBeforeRebuild(t *testing.T) {
 
 	app := healthTestApp(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go app.watchHealthLoop(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		app.watchHealthLoop(ctx)
+	}()
+	defer func() { cancel(); <-done }()
 
 	select {
 	case <-rebuilt:

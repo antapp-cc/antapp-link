@@ -36,13 +36,16 @@ func newMigrationTestWatcher(t *testing.T, old Snapshot) (*sessionWatcher, *int,
 
 	oldBest, oldAdapter, oldHop := bestDefaultRouteFn, adapterByIndexFn, bestRouteToFn
 	oldDNS, oldAdd, oldSweep := setAdapterDNSFn, addSplitRouteFn, sweepOwnedSplitFn
+	oldExisting := existingSplitRoutesFn
 	t.Cleanup(func() {
 		bestDefaultRouteFn, adapterByIndexFn, bestRouteToFn = oldBest, oldAdapter, oldHop
 		setAdapterDNSFn, addSplitRouteFn, sweepOwnedSplitFn = oldDNS, oldAdd, oldSweep
+		existingSplitRoutesFn = oldExisting
 		clearLiveSplitOwnership()
 	})
 	clearLiveSplitOwnership()
 
+	existingSplitRoutesFn = func(adapterKey, netip.Addr) (map[string]struct{}, error) { return map[string]struct{}{}, nil }
 	newGw := netip.MustParseAddr("198.51.100.1")
 	bestDefaultRouteFn = func(winipcfg.LUID) (netip.Addr, uint32, error) {
 		return newGw, 42, nil
@@ -174,7 +177,7 @@ func TestMigrationDoesNotClaimForeignSplitRoutes(t *testing.T) {
 
 	w.reconcile()
 
-	if *updates != 1 {
+	if *updates != 2 {
 		t.Fatalf("迁移应当正常提交，实际提交 %d 次", *updates)
 	}
 	if w.snap.Split == nil {
@@ -226,7 +229,7 @@ func TestMigrationClaimsNewlyInstalledSplitRoutes(t *testing.T) {
 
 	w.reconcile()
 
-	if *updates != 1 {
+	if *updates != 2 {
 		t.Fatalf("迁移应当正常提交，实际提交 %d 次", *updates)
 	}
 	want := len(ActiveCNRoutes())
