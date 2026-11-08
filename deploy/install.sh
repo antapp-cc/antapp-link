@@ -192,9 +192,9 @@ if command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1; then
   tmp_dl="$SRC_DIR/antapp-linkd.download"
   rm -f "$tmp_dl"
   if command -v wget >/dev/null 2>&1; then
-    wget -qO "$tmp_dl" "$url" || true
+    wget -4 -qO "$tmp_dl" "$url" || true
   else
-    curl -fsSL --max-time 180 -o "$tmp_dl" "$url" || true
+    curl -4 -fsSL --max-time 180 -o "$tmp_dl" "$url" || true
   fi
   if [[ -f "$tmp_dl" ]] && [[ "$(head -c 4 "$tmp_dl")" == $'\x7fELF' ]]; then
     mv -f "$tmp_dl" "$SRC_DIR/antapp-linkd"
