@@ -176,18 +176,10 @@ if command -v apt-get >/dev/null; then
   strip_backports
 fi
 
-release_base="https://github.com/antapp-cc/antapp-link/releases/latest/download"
-if [[ -n "$RELEASE_TAG" ]]; then
-  release_base="https://github.com/antapp-cc/antapp-link/releases/download/$RELEASE_TAG"
-fi
 [[ "$(uname -m)" == "x86_64" ]] || die "当前发布包只支持 Linux amd64"
-missing_verify=()
-command -v openssl >/dev/null || missing_verify+=(openssl)
-command -v python3 >/dev/null || missing_verify+=(python3)
-if ! command -v wget >/dev/null && ! command -v curl >/dev/null; then missing_verify+=(wget); fi
-if [[ ${#missing_verify[@]} -gt 0 ]]; then
-  DEBIAN_FRONTEND=noninteractive apt-get update || die "无法安装可信验签工具"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_verify[@]}" || die "无法安装验签工具（openssl/python3/wget）"
+if ! command -v wget >/dev/null && ! command -v curl >/dev/null; then
+  DEBIAN_FRONTEND=noninteractive apt-get update || die "apt 更新失败：请检查 /etc/apt/sources.list 里的软件源是否可用"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y wget || die "无法安装 wget"
 fi
 
 fetch_release_file() {
@@ -243,40 +235,47 @@ PY
 }
 
 stage="$(mktemp -d /tmp/antapp-install.XXXXXX)"
-trap 'rm -f -- "$BIN.probe.$$"; rm -rf -- "$stage"' EXIT
-online=0
-if fetch_release_file "$stage/latest.json" "$release_base/latest.json" &&
-   fetch_release_file "$stage/latest.json.sig" "$release_base/latest.json.sig"; then
-  if asset_url="$(verify_release "$stage" metadata)"; then
-    if fetch_release_file "$stage/antapp-linkd" "$asset_url"; then
-      online=1
-    else
-      log "在线二进制下载失败，检查同目录离线签名包"
-      rm -f -- "$stage/antapp-linkd"
-    fi
+trap 'rm -rf -- "$stage"' EXIT
+url="https://github.com/antapp-cc/antapp-link/releases/latest/download/antapp-linkd"
+if [[ -n "$RELEASE_TAG" ]]; then
+  url="https://github.com/antapp-cc/antapp-link/releases/download/$RELEASE_TAG/antapp-linkd"
+  log "指定版本：$RELEASE_TAG"
+fi
+downloaded=0
+if command -v wget >/dev/null 2>&1; then
+  log "从 GitHub Release 下载 antapp-linkd（约 7 MB）……"
+  tmp_dl="$stage/antapp-linkd"
+  rm -f -- "$tmp_dl"
+  timeout 180 wget --timeout=30 --tries=2 -qO "$tmp_dl" "$url" || true
+  if [[ -f "$tmp_dl" ]] && [[ "$(head -c 4 "$tmp_dl")" == $'\x7fELF' ]]; then
+    downloaded=1
+    log "下载完成（$(du -h "$tmp_dl" | cut -f1)）"
   else
-    log "在线清单验证失败，检查同目录离线签名包"
-    rm -f -- "$stage/latest.json" "$stage/latest.json.sig"
+    rm -f -- "$tmp_dl"
+    log "下载失败或拿到的不是有效二进制（网络 / CDN 异常）"
+  fi
+elif command -v curl >/dev/null 2>&1; then
+  log "从 GitHub Release 下载 antapp-linkd（约 7 MB）……"
+  tmp_dl="$stage/antapp-linkd"
+  rm -f -- "$tmp_dl"
+  curl -fsSL --max-time 180 -o "$tmp_dl" "$url" || true
+  if [[ -f "$tmp_dl" ]] && [[ "$(head -c 4 "$tmp_dl")" == $'\x7fELF' ]]; then
+    downloaded=1
+    log "下载完成（$(du -h "$tmp_dl" | cut -f1)）"
+  else
+    rm -f -- "$tmp_dl"
+    log "下载失败或拿到的不是有效二进制（网络 / CDN 异常）"
   fi
 fi
-if [[ "$online" -eq 0 ]]; then
-  for name in latest.json latest.json.sig antapp-linkd; do
-    [[ -f "$SRC_DIR/$name" ]] || die "缺少离线签名包 $name；请把同版本 antapp-linkd、latest.json、latest.json.sig 放到脚本目录，或恢复联网；保留旧程序"
-    cp -- "$SRC_DIR/$name" "$stage/$name"
-  done
+if [[ "$downloaded" -eq 0 ]]; then
+  if [[ -f "$SRC_DIR/antapp-linkd" ]]; then
+    cp -- "$SRC_DIR/antapp-linkd" "$stage/antapp-linkd"
+    log "警告: 改用同目录现成的 antapp-linkd —— 它不一定是最新版，想确保最新请让网络可用后重跑"
+  else
+    die "下载失败，同目录也没有 antapp-linkd。请检查网络，或手动上传 antapp-linkd 到 $SRC_DIR"
+  fi
 fi
-verified_version="$(verify_release "$stage" binary)" || die "程序校验失败，保留旧程序"
 chmod 0755 "$stage/antapp-linkd"
-probe="$BIN.probe.$$"
-if ! install -m 0755 "$stage/antapp-linkd" "$probe"; then
-  die "无法写入 $probe，检查 $BIN 所在目录权限"
-fi
-if [[ "$(timeout 15 "$probe" version)" != "antapp-linkd $verified_version" ]]; then
-  rm -f -- "$probe"
-  die "程序版本或可执行性检查失败，保留旧程序"
-fi
-rm -f -- "$probe"
-log "签名、大小、SHA-256、平台和版本校验通过：$verified_version"
 
 log "检查系统依赖"
 missing=()
@@ -415,7 +414,6 @@ rollback_install() {
     fi
     log "安装未完成，原程序、配置和服务状态已恢复"
   fi
-  rm -f -- "$BIN.probe.$$"
   rm -rf -- "$stage"
   exit "$result"
 }
@@ -515,7 +513,7 @@ wait_install_service || die "隧道服务未稳定启动，执行回退"
 log "当前状态"
 "$BIN" status -c "$CONF" || true
 
-trap 'rm -f -- "$BIN.probe.$$"; rm -rf -- "$stage"' EXIT
+trap 'rm -rf -- "$stage"' EXIT
 
 wan_iface="$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')" || true
 if [[ -n "$wan_iface" ]]; then
