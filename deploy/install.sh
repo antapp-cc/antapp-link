@@ -106,7 +106,10 @@ grep -q '^tcp_bbr$' /etc/modules-load.d/bbr.conf 2>/dev/null || echo tcp_bbr > /
 reset_apt_sources() {
   local src=/etc/apt/sources.list
   local codename
-  codename=$(grep -m1 -oP '(?<=^deb ).*? (?=main)' /etc/apt/sources.list 2>/dev/null | awk '{print $2}')
+  # Ubuntu 24.04 起 sources.list 只剩注释（源在 sources.list.d/*.sources 里），
+  # grep 匹配不到就返回 1，配合 set -o pipefail 会让整条赋值失败并静默退出，
+  # 所以必须显式吞掉，交给下面的 VERSION_CODENAME 兜底。
+  codename=$(grep -m1 -oP '(?<=^deb ).*? (?=main)' /etc/apt/sources.list 2>/dev/null | awk '{print $2}') || true
   [[ "$codename" =~ ^[a-z]+$ ]] || codename=${VERSION_CODENAME:-}
   [[ "$codename" =~ ^[a-z]+$ ]] || die "认不出系统代号（codename），换源中止——请检查 /etc/apt/sources.list 或手动换源后重试"
 
