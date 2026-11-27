@@ -112,6 +112,9 @@ func TestNRPTConstants(t *testing.T) {
 			t.Errorf("NRPT 作用域缺少 %q", ns)
 		}
 	}
+	if len(nrptNamespaces) != len(want) {
+		t.Errorf("NRPT 作用域有重复项: %v", nrptNamespaces)
+	}
 	if nrptRuleComment == "" || !strings.HasPrefix(nrptRuleComment, "AntApp") {
 		t.Errorf("nrptRuleComment = %q，应能标识本软件", nrptRuleComment)
 	}

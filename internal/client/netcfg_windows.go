@@ -408,8 +408,8 @@ func (s *Snapshot) applyOnce(cfg NetConfig) error {
 	}
 	flushResolverCache()
 
-	// 3) NRPT：把被污染的 Pi 域名强制指到隧道网关解析；写不进去时回退 DNS，
-	//    否则 .minepi.com 会在公共递归上拿到污染答案（见 applyNRPT 的取舍）。
+	// 3) NRPT：把被污染的域名（Pi / Docker Hub）强制指到隧道网关解析；写不进去时
+	//    回退 DNS，否则它们在公共递归上会拿到污染答案（见 applyNRPT 的取舍）。
 	if fallback := applyNRPT(cfg, nrptApply); len(fallback) > 0 {
 		for _, iface := range s.Interfaces {
 			a, ok, err := adapterForIface(iface)
@@ -673,7 +673,7 @@ func restoreSnapshot(s Snapshot, cfg NetConfig) error {
 
 // ---------- NRPT（注册表直写，Dnscache 动态生效）----------
 
-// nrptApply 写入 Pi 域名的解析规则。规则本体是 DnsPolicyConfig 下一个固定
+// nrptApply 写入被污染域名的解析规则。规则本体是 DnsPolicyConfig 下一个固定
 // GUID 的注册表键（实测 Dnscache 无需重启即时生效），重写即覆盖，天然幂等。
 // 旧版用 PowerShell WMI 创建的规则 GUID 随机，由 nrptRemove 按标记扫除。
 func nrptApply(gateway string) error {

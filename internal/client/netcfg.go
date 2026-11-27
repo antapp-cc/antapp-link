@@ -262,13 +262,13 @@ func isTunnelDNS(servers []string, gateway string) bool {
 	return ip.Unmap() == gw.Unmap()
 }
 
-// applyNRPT 写入 Pi 域名的解析规则，失败时返回应当改用的隧道 DNS（nil 表示不用改）。
+// applyNRPT 写入被污染域名的解析规则，失败时返回应当改用的隧道 DNS（nil 表示不用改）。
 //
-// 选「回退隧道 DNS」而不是「取消接管」：NRPT 只管 .minepi.com 的解析路径，写不
+// 选「回退隧道 DNS」而不是「取消接管」：NRPT 只管 nrptNamespaces 这几个域名，写不
 // 进去（常见于权限不足或注册表被安全软件拦）时其它功能仍然可用，为它作废整次
-// 连接代价太大；而留在公共 DNS 上，这个域名在国内递归上必然拿到污染答案，
-// 结果就是「连上了但 Pi 用不了」。退到隧道网关上的 dnsmasq 是唯一能拿到干净
-// 答案的解析器，全部查询多走一趟跨境隧道是性能降级，功能仍然完整。
+// 连接代价太大；而留在公共 DNS 上，这些域名在国内递归上必然拿到污染答案，
+// 结果就是「连上了但 Pi / Docker 用不了」。退到隧道网关上的 dnsmasq 是唯一能拿到
+// 干净答案的解析器，全部查询多走一趟跨境隧道是性能降级，功能仍然完整。
 func applyNRPT(cfg NetConfig, apply func(string) error) []string {
 	if cfg.Gateway == "" {
 		return nil
