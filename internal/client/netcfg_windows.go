@@ -686,7 +686,7 @@ func nrptApply(gateway string) error {
 	if err := k.SetDWordValue("Version", 2); err != nil {
 		return err
 	}
-	if err := k.SetStringsValue("Name", []string{nrptNamespace}); err != nil {
+	if err := k.SetStringsValue("Name", nrptNamespaces); err != nil {
 		return err
 	}
 	if err := k.SetStringValue("GenericDNSServers", gateway); err != nil {

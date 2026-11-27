@@ -208,9 +208,9 @@ func BuildNetConfig(inv pki.Invite) NetConfig {
 // 连接码里带的是 10.10.0.1 —— 隧道内的 dnsmasq。用它意味着每个查询都要多走一趟
 // 跨境隧道，实测解析平均 578ms（223.5.5.5 只要 93ms），网页打开速度差 40%。
 //
-// Pi 自己的域名不依赖这个：.minepi.com 由 NRPT 强制指到隧道网关解析（那个作用域
-// 在国内所有递归上都会被污染，见 nrptNamespace 的注释）。所以系统 DNS 交给公共的
-// 更快，Pi 解析不受影响。
+// 被污染的域名不依赖这个：它们由 NRPT 强制指到隧道网关解析（在国内所有递归上
+// 都会拿到污染答案，见 nrptNamespaces 的注释）。所以系统 DNS 交给公共的更快，
+// 这些域名的解析不受影响。
 var defaultClientDNS = []string{"223.5.5.5", "119.29.29.29"}
 
 // resolveClientDNS 决定接管时给系统配哪些 DNS。
@@ -629,7 +629,7 @@ func refreshSplitRoutes(ref adapterKey, gw netip.Addr, previous *splitOwnership,
 // nrptRuleComment 是 NRPT 规则的识别标记，增删都按它筛，不碰别人的规则。
 const nrptRuleComment = "AntApp Link DNS"
 
-// nrptNamespace 是被污染、必须走隧道解析的域名作用域。
+// nrptNamespaces 是被污染、必须走隧道解析的域名作用域。
 //
 // api.minepi.com 在国内所有递归上都是被污染的假答案（实测路由器 DNS、AliDNS、
 // DNSPod 给的全是 Twitter/Facebook 地址段的 IP），唯一干净的来源是隧道出口的
@@ -637,9 +637,14 @@ const nrptRuleComment = "AntApp Link DNS"
 // 删不掉，所以用 NRPT（名称解析策略表）按域名作用域直接规定解析去向 ——
 // 它的优先级高于一切网卡 DNS 配置，且不加防火墙规则。
 //
-// 只圈 Pi 自己的域名，刻意不扩大干预面：其它域照常走系统默认（快），规则万一
-// 成为孤儿（崩溃后又卸载）也只影响 Pi 域名，不影响整机上网。
-const nrptNamespace = ".minepi.com"
+// Docker Hub 是同一类问题：registry-1.docker.io 经国内递归会解析到 Dropbox /
+// Twitter 的地址段，拉镜像必然超时，而隧道出口能拿到正常的 AWS 地址。只圈这两
+// 家，刻意不扩大干预面：其它域照常走系统默认（快），规则万一成为孤儿（崩溃后
+// 又卸载）也只影响这些域名。
+//
+// 后缀写法（前导点）匹配所有子域，所以 .docker.io 覆盖 registry-1 / auth，
+// .docker.com 覆盖 production.cloudflare / hub。
+var nrptNamespaces = []string{".minepi.com", ".docker.io", ".docker.com"}
 
 // nrptKeyPath / nrptRuleGUID 是 NRPT 规则在注册表的落脚点。
 // GUID 固定不变：重写即覆盖（幂等），删除按标记扫时也认得出自己。

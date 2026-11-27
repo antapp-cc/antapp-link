@@ -95,11 +95,22 @@ func TestRoutePlanWithoutGateway(t *testing.T) {
 // ---------- NRPT ----------
 
 // Pi 域名在境内所有递归上都被污染（实测路由器 DNS、AliDNS、DNSPod 全是假 IP），
-// 唯一干净来源是隧道出口。规则的作用域、标记和 GUID 必须准确：
-// 作用域只圈 Pi 域名（孤儿规则最坏只影响 Pi），GUID 固定才能幂等覆盖。
+// 唯一干净来源是隧道出口；Docker Hub 是同一类污染（解析到 Dropbox/Twitter 段，
+// 拉镜像必超时）。规则的作用域、标记和 GUID 必须准确：作用域只圈这几家（孤儿
+// 规则最坏只影响这些域名），GUID 固定才能幂等覆盖。
 func TestNRPTConstants(t *testing.T) {
-	if nrptNamespace != ".minepi.com" {
-		t.Errorf("nrptNamespace = %q", nrptNamespace)
+	want := map[string]bool{".minepi.com": false, ".docker.io": false, ".docker.com": false}
+	for _, ns := range nrptNamespaces {
+		if _, ok := want[ns]; !ok {
+			t.Errorf("出现了预期外的 NRPT 作用域 %q", ns)
+			continue
+		}
+		want[ns] = true
+	}
+	for ns, seen := range want {
+		if !seen {
+			t.Errorf("NRPT 作用域缺少 %q", ns)
+		}
 	}
 	if nrptRuleComment == "" || !strings.HasPrefix(nrptRuleComment, "AntApp") {
 		t.Errorf("nrptRuleComment = %q，应能标识本软件", nrptRuleComment)
